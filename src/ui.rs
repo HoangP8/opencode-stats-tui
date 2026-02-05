@@ -1,0 +1,2303 @@
+use crate::live_watcher::LiveWatcher;
+use crate::session::SessionModal;
+use crate::stats::{
+    format_number, format_number_full, load_session_chat, ChatMessage, DayStat, MessageContent,
+    ModelUsage, ToolUsage, Totals,
+};
+use crate::stats_cache::StatsCache;
+use chrono::Datelike;
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use parking_lot::Mutex;
+use ratatui::{
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph},
+    Frame,
+};
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+// Constants for optimized mouse handling
+
+/// Cached chat session data including pre-calculated scroll info
+struct CachedChat {
+    messages: Vec<ChatMessage>,
+    total_lines: u16,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Focus {
+    Left,
+    Right,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum LeftPanel {
+    Stats,
+    Days,
+    Models,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum RightPanel {
+    Detail,
+    List,
+    Tools,
+}
+
+/// Cached panel rectangles for efficient mouse hit-testing
+/// Updated during render to match exactly what's displayed
+#[derive(Default, Clone)]
+struct PanelRects {
+    // Left panels
+    stats: Option<Rect>,
+    days: Option<Rect>,
+    models: Option<Rect>,
+    // Right panels (context-dependent based on left_panel)
+    detail: Option<Rect>, // SESSION INFO or MODEL INFO
+    list: Option<Rect>,   // SESSIONS or MODEL RANKING
+    tools: Option<Rect>,  // TOOLS USED (only in Models view)
+}
+
+impl PanelRects {
+    /// Optimized hit-test that returns early once a match is found
+    #[inline(always)]
+    fn find_panel(&self, x: u16, y: u16) -> Option<&'static str> {
+        // Check in order of most common usage for early return
+        if Self::contains_point(self.list, x, y) {
+            return Some("list");
+        }
+        if Self::contains_point(self.days, x, y) {
+            return Some("days");
+        }
+        if Self::contains_point(self.models, x, y) {
+            return Some("models");
+        }
+        if Self::contains_point(self.detail, x, y) {
+            return Some("detail");
+        }
+        if Self::contains_point(self.tools, x, y) {
+            return Some("tools");
+        }
+        if Self::contains_point(self.stats, x, y) {
+            return Some("stats");
+        }
+        None
+    }
+
+    #[inline(always)]
+    fn contains_point(rect: Option<Rect>, x: u16, y: u16) -> bool {
+        rect.is_some_and(|r| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+    }
+}
+
+pub struct App {
+    totals: Totals,
+    per_day: HashMap<String, DayStat>,
+    session_titles: HashMap<String, String>,
+    day_list: Vec<String>,
+    day_list_state: ListState,
+    session_list: Vec<Arc<crate::stats::SessionStat>>,
+    session_list_state: ListState,
+    cached_session_items: Vec<ListItem<'static>>, // Cached rendered list items
+    chat_cache: HashMap<String, CachedChat>,
+    chat_cache_order: Vec<String>,
+    chat_scroll: u16,
+    model_usage: Vec<ModelUsage>,
+    model_list_state: ListState,
+    tool_usage: Vec<ToolUsage>,
+    ranking_scroll: usize,
+
+    // Phase 2: Render Caching
+    cached_day_strings: HashMap<String, String>, // Pre-formatted day strings with weekday names
+    session_lookup: HashMap<Box<str>, Arc<crate::stats::SessionStat>>, // O(1) session lookup (Phase 3: Box<str> for memory efficiency)
+
+    chat_max_scroll: u16,
+    focus: Focus,
+    left_panel: LeftPanel,
+    right_panel: RightPanel,
+    is_active: bool,
+    models_active: bool,
+    exit: bool,
+    selected_model_index: Option<usize>,
+    current_chat_session_id: Option<String>,
+
+    modal: SessionModal,
+
+    // Optimized mouse tracking
+    last_mouse_panel: Option<&'static str>, // Cache last panel for faster hit-testing
+
+    // Cached panel rectangles for optimized mouse hit-testing
+    cached_rects: PanelRects,
+
+    // Live stats: Cache and file watching
+    stats_cache: Option<StatsCache>,
+    _storage_path: PathBuf,
+    live_watcher: Option<LiveWatcher>,
+    needs_refresh: Arc<Mutex<Vec<PathBuf>>>,
+    pending_refresh_paths: Vec<PathBuf>,
+    last_refresh: Option<std::time::Instant>,
+    should_redraw: bool,
+}
+
+/// Helper: Create a stat paragraph with label and value
+fn stat_widget(label: &str, value: String, color: Color) -> Paragraph<'static> {
+    Paragraph::new(vec![
+        Line::from(Span::styled(
+            label.to_string(),
+            Style::default().fg(Color::Rgb(180, 180, 180)),
+        )),
+        Line::from(Span::styled(
+            value,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )),
+    ])
+    .alignment(Alignment::Center)
+}
+
+/// Helper: Create a list row with consistent formatting for usage lists
+/// Optimized with pre-allocated Vec capacity
+fn usage_list_row(
+    name: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost: f64,
+    session_count: usize,
+) -> Line<'static> {
+    let in_val = format_number(input_tokens);
+    let out_val = format_number(output_tokens);
+
+    // Optimized: use format! with padding instead of manual loop
+    let name_display = format!("{:<17}", name.chars().take(17).collect::<String>());
+
+    // Optimized: combine nested format! calls into single format
+    let spans = vec![
+        Span::styled(name_display, Style::default().fg(Color::White)),
+        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+        Span::styled(format!("{:>7}", in_val), Style::default().fg(Color::Blue)),
+        Span::styled(" in ", Style::default().fg(Color::Rgb(180, 180, 180))),
+        Span::styled(
+            format!("{:>7}", out_val),
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::styled(" out", Style::default().fg(Color::Rgb(180, 180, 180))),
+        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+        Span::styled(
+            format!("${:>7.2}", cost),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+        Span::styled(
+            format!("{:>4} sess", session_count),
+            Style::default().fg(Color::Cyan),
+        ),
+    ];
+    Line::from(spans)
+}
+
+/// Helper: Safely truncate a string to max characters without breaking UTF-8 (no ellipsis)
+/// Returns Cow to avoid allocation when no truncation needed
+fn safe_truncate_plain(s: &str, max_chars: usize) -> Cow<'_, str> {
+    if s.chars().count() <= max_chars {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(s.chars().take(max_chars).collect())
+    }
+}
+
+/// Helper: Truncate a string to max characters and add ellipsis if truncated
+fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
+    // Optimized: early return without allocation if already short enough
+    if s.chars().count() <= max_chars {
+        return s.into();
+    }
+    // Reserve space for "..."
+    let visible_chars = max_chars.saturating_sub(3);
+    let truncated: String = s.chars().take(visible_chars).collect();
+    format!("{}...", truncated)
+}
+
+/// Calculate the actual number of rendered lines for a chat message
+fn calculate_message_rendered_lines(msg: &ChatMessage) -> u16 {
+    let mut lines = 1u16; // Header line
+
+    for part in &msg.parts {
+        match part {
+            MessageContent::Text(text) => {
+                let (_max_line_chars, max_lines) = match &*msg.role {
+                    "user" => (150, 5),
+                    "assistant" => (250, 8),
+                    _ => (200, 6),
+                };
+
+                let line_count = text.lines().count();
+                lines += line_count.min(max_lines) as u16;
+
+                // Add indicator if truncated
+                if line_count > max_lines {
+                    lines += 1;
+                }
+            }
+            MessageContent::ToolCall(_) => {
+                lines += 1;
+            }
+            MessageContent::Thinking(_) => {
+                lines += 1;
+            }
+        }
+    }
+
+    lines
+}
+
+impl App {
+    pub fn new() -> Self {
+        // Initialize logger
+        // env_logger::init();
+
+        // Get storage path
+        let storage_path = std::env::var("XDG_DATA_HOME")
+            .unwrap_or_else(|_| format!("{}/.local/share", std::env::var("HOME").unwrap()))
+            .to_string();
+        let storage_path = PathBuf::from(storage_path).join("opencode").join("storage");
+
+        // Initialize cache
+        let stats_cache = StatsCache::new(storage_path.clone()).ok();
+        log::info!("Initialized stats cache for: {}", storage_path.display());
+
+        let (totals, per_day, session_titles, model_usage) = if let Some(cache) = &stats_cache {
+            cache.load_or_compute().into_tuple()
+        } else {
+            crate::stats::collect_stats().into_tuple()
+        };
+
+        // Set up live watcher for real-time updates
+        let needs_refresh = Arc::new(Mutex::new(Vec::new()));
+        let needs_refresh_clone = needs_refresh.clone();
+        let mut live_watcher = LiveWatcher::new(
+            storage_path.clone(),
+            Arc::new(move |files| {
+                needs_refresh_clone.lock().extend(files);
+            }),
+        )
+        .ok();
+
+        if let Some(watcher) = &mut live_watcher {
+            if let Err(e) = watcher.start() {
+                log::error!("Failed to start live watcher: {}", e);
+            }
+        }
+
+        let mut day_list: Vec<String> = per_day.keys().cloned().collect();
+        day_list.sort_unstable_by(|a, b| b.cmp(a));
+
+        let mut day_list_state = ListState::default();
+        if !day_list.is_empty() {
+            day_list_state.select(Some(0));
+        }
+
+        let mut model_list_state = ListState::default();
+        let mut selected_model_index = None;
+        if !model_usage.is_empty() {
+            model_list_state.select(Some(0));
+            selected_model_index = Some(0);
+        }
+
+        let mut tool_usage: Vec<ToolUsage> = totals
+            .tools
+            .iter()
+            .map(|(name, count)| ToolUsage {
+                name: name.clone(),
+                count: *count,
+            })
+            .collect();
+        tool_usage.sort_unstable_by(|a, b| b.count.cmp(&a.count));
+
+        let mut app = Self {
+            totals,
+            per_day,
+            session_titles,
+            day_list,
+            day_list_state,
+            session_list: Vec::new(),
+            session_list_state: ListState::default(),
+            chat_cache: HashMap::new(),
+            chat_cache_order: Vec::new(),
+            chat_scroll: 0,
+            model_usage,
+            model_list_state,
+            tool_usage,
+            ranking_scroll: 0,
+            cached_session_items: Vec::new(),
+            cached_day_strings: HashMap::with_capacity(32),
+            session_lookup: HashMap::with_capacity(256),
+
+            chat_max_scroll: 0,
+            focus: Focus::Left,
+            left_panel: LeftPanel::Days,
+            right_panel: RightPanel::List,
+            is_active: false,
+            models_active: false,
+            exit: false,
+            selected_model_index,
+            current_chat_session_id: None,
+
+            modal: SessionModal::new(),
+
+            last_mouse_panel: None,
+
+            cached_rects: PanelRects::default(),
+
+            stats_cache,
+            _storage_path: storage_path,
+            live_watcher,
+            needs_refresh,
+            pending_refresh_paths: Vec::new(),
+            last_refresh: None,
+            should_redraw: true,
+        };
+        app.update_session_list();
+        app.rebuild_session_lookup();
+        app.precompute_day_strings();
+        app
+    }
+
+    fn update_session_list(&mut self) {
+        self.session_list.clear();
+        if let Some(day) = self.selected_day() {
+            if let Some(stat) = self.per_day.get(&day) {
+                // Optimized: pre-allocate with known capacity for sorting
+                let mut sessions: Vec<_> = stat.sessions.values().cloned().collect();
+                sessions.sort_unstable_by(|a, b| b.last_activity.cmp(&a.last_activity));
+                self.session_list = sessions;
+            }
+        }
+        if !self.session_list.is_empty() {
+            self.session_list_state.select(Some(0));
+        } else {
+            self.session_list_state.select(None);
+        }
+        // Clear cached chat session since session list changed
+        self.current_chat_session_id = None;
+        // Rebuild cached session items to avoid recomputing on every render
+        self.rebuild_cached_session_items();
+        // Rebuild session lookup map (Phase 2 optimization)
+        self.rebuild_session_lookup();
+    }
+
+    /// Rebuild cached session list items to avoid heavy computation on every render
+    fn rebuild_cached_session_items(&mut self) {
+        self.cached_session_items = self
+            .session_list
+            .iter()
+            .map(|s| {
+                let title = self
+                    .session_titles
+                    .get(&s.id.to_string())
+                    .map(|t| t.replace("New session - ", ""))
+                    .unwrap_or_else(|| s.id.chars().take(14).collect());
+                let model_count = s.models.len();
+                let model_text = if model_count == 1 {
+                    "1 model".into()
+                } else {
+                    format!("{} models", model_count)
+                };
+                let additions = s.diffs.additions;
+                let deletions = s.diffs.deletions;
+
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<18}", title.chars().take(18).collect::<String>()),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled(
+                        format!("{}{:>7}", "+", format_number(additions)),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled(
+                        format!("{}{:>7}", "-", format_number(deletions)),
+                        Style::default().fg(Color::Red),
+                    ),
+                    Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled(
+                        format!("${:>7.2}", s.display_cost()),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled(
+                        format!("{:>4} msg", s.messages),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled(model_text, Style::default().fg(Color::Magenta)),
+                ]))
+            })
+            .collect();
+    }
+
+    /// Rebuild session lookup map for O(1) session access (Phase 2 optimization)
+    fn rebuild_session_lookup(&mut self) {
+        self.session_lookup.clear();
+        let total_sessions: usize = self.per_day.values().map(|d| d.sessions.len()).sum();
+        self.session_lookup.reserve(total_sessions);
+        for day_stat in self.per_day.values() {
+            for (id, session) in &day_stat.sessions {
+                self.session_lookup
+                    .insert(id.clone().into_boxed_str(), session.clone());
+            }
+        }
+    }
+
+    /// Partial update of session lookup for improved performance
+    #[allow(dead_code)]
+    fn partial_update_session_lookup(&mut self, session_id: &str) {
+        // Find the session in per_day and update it in session_lookup
+        for day_stat in self.per_day.values() {
+            if let Some(session) = day_stat.sessions.get(session_id) {
+                self.session_lookup
+                    .insert(session_id.to_string().into_boxed_str(), session.clone());
+                return;
+            }
+        }
+    }
+
+    /// Precompute formatted day strings with weekday names (Phase 2 optimization)
+    fn precompute_day_strings(&mut self) {
+        // Only compute if not already cached
+        for day in &self.day_list {
+            if self.cached_day_strings.contains_key(day) {
+                continue;
+            }
+            if let Ok(parsed) = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d") {
+                let weekday = parsed.weekday();
+                let day_abbr = match weekday {
+                    chrono::Weekday::Mon => "Mon",
+                    chrono::Weekday::Tue => "Tue",
+                    chrono::Weekday::Wed => "Wed",
+                    chrono::Weekday::Thu => "Thu",
+                    chrono::Weekday::Fri => "Fri",
+                    chrono::Weekday::Sat => "Sat",
+                    chrono::Weekday::Sun => "Sun",
+                };
+                let formatted = format!("{} ({})", day, day_abbr);
+                self.cached_day_strings.insert(day.clone(), formatted);
+            } else {
+                self.cached_day_strings.insert(day.clone(), day.clone());
+            }
+        }
+    }
+
+    fn open_session_modal(&mut self, area_height: u16) {
+        let session_id = match self.session_list_state.selected() {
+            Some(i) => match self.session_list.get(i) {
+                Some(s) => s.id.clone(),
+                None => return,
+            },
+            None => return,
+        };
+
+        // Find the session_stat for this session_id - use session_lookup for O(1) access (Phase 2 optimization)
+        let session_stat = self
+            .session_lookup
+            .get(&*session_id)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(crate::stats::SessionStat::new(session_id.clone())));
+
+        self.chat_scroll = 0;
+        let session_id_str = session_id.to_string();
+        self.current_chat_session_id = Some(session_id_str.clone());
+
+        let total_lines = if let Some(cached) = self.chat_cache.get(&session_id_str) {
+            let messages = cached.messages.clone();
+            if let Some(pos) = self
+                .chat_cache_order
+                .iter()
+                .position(|s| s == &session_id_str)
+            {
+                self.chat_cache_order.remove(pos);
+            }
+            self.chat_cache_order.push(session_id_str.clone());
+
+            // Open modal with cached messages and session stat
+            self.modal
+                .open_session(&session_id_str, messages, &session_stat);
+            cached.total_lines
+        } else {
+            let messages = load_session_chat(&session_id_str);
+            let total_lines: u16 = messages.iter().map(calculate_message_rendered_lines).sum();
+            let blank_lines = if !messages.is_empty() {
+                messages.len() - 1
+            } else {
+                0
+            };
+            let total_lines = total_lines + blank_lines as u16;
+
+            // Implement LRU cache eviction if cache is too large
+            const MAX_CACHE_SIZE: usize = 5;
+            if self.chat_cache.len() >= MAX_CACHE_SIZE {
+                if let Some(oldest) = self.chat_cache_order.first() {
+                    self.chat_cache.remove(oldest);
+                    self.chat_cache_order.remove(0);
+                }
+            }
+
+            self.chat_cache.insert(
+                session_id_str.clone(),
+                CachedChat {
+                    messages: messages.clone(),
+                    total_lines,
+                },
+            );
+            self.chat_cache_order.push(session_id_str.clone());
+
+            // Open modal with loaded messages and session stat
+            self.modal
+                .open_session(&session_id_str, messages, &session_stat);
+            total_lines
+        };
+
+        self.chat_max_scroll = total_lines.saturating_sub(area_height.saturating_sub(4));
+    }
+
+    fn day_next(&mut self) {
+        if self.day_list.is_empty() {
+            return;
+        }
+        let i = self.day_list_state.selected().unwrap_or(0);
+        self.day_list_state
+            .select(Some((i + 1).min(self.day_list.len() - 1)));
+    }
+
+    fn day_previous(&mut self) {
+        let i = self.day_list_state.selected().unwrap_or(0);
+        self.day_list_state.select(Some(i.saturating_sub(1)));
+    }
+
+    fn model_next(&mut self) {
+        if self.model_usage.is_empty() {
+            return;
+        }
+        let i = self.model_list_state.selected().unwrap_or(0);
+        self.model_list_state
+            .select(Some((i + 1).min(self.model_usage.len() - 1)));
+    }
+
+    fn model_previous(&mut self) {
+        let i = self.model_list_state.selected().unwrap_or(0);
+        self.model_list_state.select(Some(i.saturating_sub(1)));
+    }
+
+    fn session_next(&mut self) {
+        if self.session_list.is_empty() {
+            return;
+        }
+        let i = self.session_list_state.selected().unwrap_or(0);
+        self.session_list_state
+            .select(Some((i + 1).min(self.session_list.len() - 1)));
+        // Clear cached chat session since selection changed
+        self.current_chat_session_id = None;
+    }
+
+    fn session_previous(&mut self) {
+        let i = self.session_list_state.selected().unwrap_or(0);
+        self.session_list_state.select(Some(i.saturating_sub(1)));
+        // Clear cached chat session since selection changed
+        self.current_chat_session_id = None;
+    }
+
+    fn selected_day(&self) -> Option<String> {
+        self.day_list_state
+            .selected()
+            .and_then(|i| self.day_list.get(i).cloned())
+    }
+
+    fn selected_session(&self) -> Option<&crate::stats::SessionStat> {
+        self.session_list_state
+            .selected()
+            .and_then(|i| self.session_list.get(i))
+            .map(|s| &**s)
+    }
+
+    /// Refresh stats from cache (for live updates)
+    pub fn refresh_stats(&mut self, changed_files: Vec<PathBuf>) {
+        if let Some(cache) = &self.stats_cache {
+            let is_full_refresh = changed_files.is_empty();
+            let (totals, per_day, session_titles, model_usage) = if is_full_refresh {
+                cache.load_or_compute().into_tuple()
+            } else {
+                // Optimized: avoid double to_string() call
+                let files: Vec<String> = changed_files
+                    .iter()
+                    .filter_map(|p| p.to_str().map(ToString::to_string))
+                    .collect();
+                cache.update_files(files);
+                cache.get_stats().into_tuple()
+            };
+
+            // Update all stats
+            self.totals = totals;
+            self.per_day = per_day;
+            self.session_titles = session_titles;
+            self.model_usage = model_usage;
+
+            // Rebuild derived data if full refresh, otherwise partial
+            if is_full_refresh {
+                self.day_list.clear();
+                self.day_list.extend(self.per_day.keys().cloned());
+                self.day_list.sort_unstable_by(|a, b| b.cmp(a));
+                if !self.day_list.is_empty() && self.day_list_state.selected().is_none() {
+                    self.day_list_state.select(Some(0));
+                }
+                self.rebuild_session_lookup();
+            } else {
+                // For incremental updates, we don't need to rebuild the entire day_list
+                // just ensure it contains any new days (though messages usually arrive on existing days)
+                let mut day_list_changed = false;
+                for day in self.per_day.keys() {
+                    if !self.day_list.contains(day) {
+                        self.day_list.push(day.clone());
+                        day_list_changed = true;
+                    }
+                }
+                if day_list_changed {
+                    self.day_list.sort_unstable_by(|a, b| b.cmp(a));
+                }
+
+                // Partially update session_lookup for changed sessions
+                for path in changed_files {
+                    if let Some(path_str) = path.to_str() {
+                        if path_str.contains("message/") {
+                            // Extract session ID from message file if possible
+                            // Or just rebuild the lookup for the last few days
+                            // For simplicity and correctness, rebuild lookup if it's not too big
+                            // but here we can be smarter.
+                            // However, we don't easily know which session changed without parsing.
+                            // Let's at least rebuild it incrementally if we can.
+                        }
+                    }
+                }
+                // If the number of sessions is small, full rebuild is fine.
+                // If it's large, we might need a more targeted approach.
+                // Let's rebuild it for now but with reserve to avoid reallocs.
+                self.rebuild_session_lookup();
+            }
+
+            // Update tool usage
+            let mut tool_usage: Vec<ToolUsage> = self
+                .totals
+                .tools
+                .iter()
+                .map(|(name, count)| ToolUsage {
+                    name: name.clone(),
+                    count: *count,
+                })
+                .collect();
+            tool_usage.sort_unstable_by(|a, b| b.count.cmp(&a.count));
+            self.tool_usage = tool_usage;
+
+            // Update model list state if needed
+            if !self.model_usage.is_empty() && self.model_list_state.selected().is_none() {
+                self.model_list_state.select(Some(0));
+                self.selected_model_index = Some(0);
+            }
+
+            // Rebuild caches
+            self.update_session_list();
+            self.precompute_day_strings();
+
+            log::debug!("Stats refreshed successfully (live update)");
+        }
+    }
+
+    pub fn run(&mut self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
+        // Render immediately on startup
+        self.should_redraw = true;
+
+        while !self.exit {
+            // Wait for events with a timeout
+            // This parks the thread and keeps it responsive to OS signals and new input
+            if event::poll(std::time::Duration::from_millis(250))? {
+                // DRAIN ALL EVENTS first to ensure keyboard input (like 'q') is handled immediately
+                while event::poll(std::time::Duration::from_millis(0))? {
+                    match event::read()? {
+                        Event::Key(key) => {
+                            if key.kind == KeyEventKind::Press {
+                                self.handle_key_event(key, terminal.size()?.height)?;
+                                self.should_redraw = true;
+                                if self.exit {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Event::Resize(_, _) => {
+                            self.should_redraw = true;
+                        }
+                        Event::Mouse(mouse) => {
+                            let size = terminal.size()?;
+                            let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+
+                            if self.modal.open {
+                                if self.modal.handle_mouse_event(mouse, area) {
+                                    self.chat_scroll = self.modal.chat_scroll;
+                                    self.should_redraw = true;
+                                }
+                            } else if self.handle_mouse_event(mouse, area) {
+                                self.should_redraw = true;
+                            }
+                        }
+                        Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+                    }
+                }
+            }
+
+            // Check for live updates regardless of user input
+            // This ensures background file changes are processed even if the user is idle
+            if let Some(watcher) = &self.live_watcher {
+                watcher.process_changes();
+            }
+
+            // Check if refresh is needed from files collected by watcher
+            let pending_files = {
+                let mut lock = self.needs_refresh.lock();
+                if lock.is_empty() {
+                    Vec::new()
+                } else {
+                    let files = lock.clone();
+                    lock.clear();
+                    files
+                }
+            };
+
+            if !pending_files.is_empty() {
+                self.pending_refresh_paths.extend(pending_files);
+            }
+
+            let should_refresh = !self.pending_refresh_paths.is_empty()
+                && self
+                    .last_refresh
+                    .map(|t| t.elapsed() >= std::time::Duration::from_millis(100))
+                    .unwrap_or(true);
+
+            if should_refresh {
+                let paths = std::mem::take(&mut self.pending_refresh_paths);
+                self.refresh_stats(paths);
+                self.last_refresh = Some(std::time::Instant::now());
+                self.should_redraw = true;
+            }
+
+            // Draw only if needed
+            if self.should_redraw {
+                terminal.draw(|frame| self.render(frame))?;
+                self.should_redraw = false;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_key_event(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        term_height: u16,
+    ) -> io::Result<()> {
+        // Global quit commands
+        if (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+            || (key.code == KeyCode::Char('q')
+                && !self.is_active
+                && !self.models_active
+                && !self.modal.open)
+        {
+            self.exit = true;
+            return Ok(());
+        }
+
+        if self.modal.open {
+            if self.modal.handle_key_event(key.code, term_height) {
+                self.chat_scroll = self.modal.chat_scroll;
+            }
+            return Ok(());
+        }
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                if self.is_active || self.models_active {
+                    self.is_active = false;
+                    self.models_active = false;
+                } else {
+                    self.exit = true;
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if self.focus == Focus::Right && self.left_panel == LeftPanel::Models {
+                    match self.right_panel {
+                        RightPanel::List => self.right_panel = RightPanel::Tools,
+                        _ => self.focus = Focus::Left,
+                    }
+                } else {
+                    self.focus = Focus::Left;
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if self.focus == Focus::Right && self.left_panel == LeftPanel::Models {
+                    if self.right_panel == RightPanel::Tools {
+                        self.right_panel = RightPanel::List;
+                    }
+                } else {
+                    self.focus = Focus::Right;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.is_active || self.models_active {
+                    // Active mode: Scroll within the focused panel
+                    match self.focus {
+                        Focus::Left => match self.left_panel {
+                            LeftPanel::Stats => {} // Not interactive
+                            LeftPanel::Days => {
+                                self.day_previous();
+                                self.update_session_list(); // Auto-update preview
+                            }
+                            LeftPanel::Models => {
+                                self.model_previous();
+                                self.selected_model_index = self.model_list_state.selected();
+                                // Auto-update preview
+                            }
+                        },
+                        Focus::Right => match self.left_panel {
+                            LeftPanel::Days => match self.right_panel {
+                                RightPanel::Detail => {}
+                                RightPanel::List => {
+                                    if self.session_list_state.selected() == Some(0) {
+                                        self.right_panel = RightPanel::Detail;
+                                    } else {
+                                        self.session_previous();
+                                    }
+                                }
+                                _ => {}
+                            },
+                            LeftPanel::Models => match self.right_panel {
+                                RightPanel::Detail => {}
+                                RightPanel::Tools => self.right_panel = RightPanel::Detail,
+                                RightPanel::List => {
+                                    if self.ranking_scroll == 0 {
+                                        self.right_panel = RightPanel::Detail;
+                                    } else {
+                                        self.ranking_scroll = self.ranking_scroll.saturating_sub(1);
+                                    }
+                                }
+                            },
+                            _ => {}
+                        },
+                    }
+                } else {
+                    match self.focus {
+                        Focus::Left => match self.left_panel {
+                            LeftPanel::Stats => {}
+                            LeftPanel::Days => self.left_panel = LeftPanel::Stats,
+                            LeftPanel::Models => self.left_panel = LeftPanel::Days,
+                        },
+                        Focus::Right => match self.left_panel {
+                            LeftPanel::Models => match self.right_panel {
+                                RightPanel::Detail => {}
+                                RightPanel::Tools | RightPanel::List => {
+                                    self.right_panel = RightPanel::Detail
+                                }
+                            },
+                            _ => match self.right_panel {
+                                RightPanel::Detail => {}
+                                _ => self.right_panel = RightPanel::Detail,
+                            },
+                        },
+                    }
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.is_active || self.models_active {
+                    // Active mode: Scroll within the focused panel
+                    match self.focus {
+                        Focus::Left => match self.left_panel {
+                            LeftPanel::Stats => {}
+                            LeftPanel::Days => {
+                                self.day_next();
+                                self.update_session_list(); // Auto-update preview
+                            }
+                            LeftPanel::Models => {
+                                self.model_next();
+                                self.selected_model_index = self.model_list_state.selected();
+                                // Auto-update preview
+                            }
+                        },
+                        Focus::Right => match self.left_panel {
+                            LeftPanel::Days => match self.right_panel {
+                                RightPanel::Detail => self.right_panel = RightPanel::List,
+                                RightPanel::List => self.session_next(),
+                                _ => {}
+                            },
+                            LeftPanel::Models => match self.right_panel {
+                                RightPanel::Detail => self.right_panel = RightPanel::Tools,
+                                RightPanel::Tools => {}
+                                RightPanel::List => {
+                                    let max_scroll = self.model_usage.len().saturating_sub(1);
+                                    if self.ranking_scroll < max_scroll {
+                                        self.ranking_scroll += 1;
+                                    }
+                                }
+                            },
+                            _ => {}
+                        },
+                    }
+                } else {
+                    match self.focus {
+                        Focus::Left => match self.left_panel {
+                            LeftPanel::Stats => self.left_panel = LeftPanel::Days,
+                            LeftPanel::Days => self.left_panel = LeftPanel::Models,
+                            LeftPanel::Models => {}
+                        },
+                        Focus::Right => match self.left_panel {
+                            LeftPanel::Models => {
+                                if self.right_panel == RightPanel::Detail {
+                                    self.right_panel = RightPanel::Tools;
+                                }
+                            }
+                            _ => match self.right_panel {
+                                RightPanel::Detail => self.right_panel = RightPanel::List,
+                                RightPanel::List => {}
+                                _ => {}
+                            },
+                        },
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                if !self.is_active && !self.models_active {
+                    match self.focus {
+                        Focus::Left => match self.left_panel {
+                            LeftPanel::Stats => {}
+                            LeftPanel::Days => {
+                                self.is_active = true;
+                                self.models_active = false;
+                            }
+                            LeftPanel::Models => {
+                                self.models_active = true;
+                                self.is_active = false;
+                            }
+                        },
+                        Focus::Right => {
+                            if self.left_panel == LeftPanel::Days
+                                && self.right_panel == RightPanel::List
+                            {
+                                self.is_active = true;
+                            }
+                        }
+                    }
+                } else if self.focus == Focus::Right
+                    && self.left_panel == LeftPanel::Days
+                    && self.right_panel == RightPanel::List
+                {
+                    self.open_session_modal(term_height);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_mouse_event(&mut self, mouse: MouseEvent, _area: Rect) -> bool {
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let (x, y) = (mouse.column, mouse.row);
+
+                // Use optimized hit-testing with cached panel
+                let panel = self.cached_rects.find_panel(x, y);
+                self.last_mouse_panel = panel;
+
+                match panel {
+                    Some("days") => {
+                        // Only allow scrolling when panel is active (after Enter)
+                        if self.is_active {
+                            if mouse.kind == MouseEventKind::ScrollUp {
+                                self.day_previous();
+                            } else {
+                                self.day_next();
+                            }
+                            self.update_session_list();
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    Some("models") => {
+                        // Only allow scrolling when panel is active (after Enter)
+                        if self.models_active {
+                            if mouse.kind == MouseEventKind::ScrollUp {
+                                self.model_previous();
+                            } else {
+                                self.model_next();
+                            }
+                            self.selected_model_index = self.model_list_state.selected();
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    Some("list") => {
+                        // Only allow scrolling when panel is active (after Enter)
+                        if self.is_active {
+                            if mouse.kind == MouseEventKind::ScrollUp {
+                                self.session_previous();
+                            } else {
+                                self.session_next();
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pos = (mouse.column, mouse.row);
+                self.handle_mouse_single_click_optimized(pos)
+            }
+            _ => false,
+        }
+    }
+
+    /// Optimized single-click handler using efficient hit-testing
+    #[inline(always)]
+    fn handle_mouse_single_click_optimized(&mut self, pos: (u16, u16)) -> bool {
+        let (x, y) = pos;
+
+        // Use optimized panel finder
+        if let Some(panel) = self.cached_rects.find_panel(x, y) {
+            self.last_mouse_panel = Some(panel);
+            match panel {
+                "stats" => {
+                    self.focus = Focus::Left;
+                    self.left_panel = LeftPanel::Stats;
+                    self.is_active = false;
+                    self.models_active = false;
+                }
+                "days" => {
+                    self.focus = Focus::Left;
+                    self.left_panel = LeftPanel::Days;
+                    self.is_active = false;
+                    self.models_active = false;
+                }
+                "models" => {
+                    self.focus = Focus::Left;
+                    self.left_panel = LeftPanel::Models;
+                    self.is_active = false;
+                    self.models_active = false;
+                    self.selected_model_index = self.model_list_state.selected();
+                }
+                "detail" => {
+                    self.focus = Focus::Right;
+                    self.right_panel = RightPanel::Detail;
+                }
+                "tools" => {
+                    self.focus = Focus::Right;
+                    self.right_panel = RightPanel::Tools;
+                }
+                "list" => {
+                    self.focus = Focus::Right;
+                    self.right_panel = RightPanel::List;
+                }
+                _ => return false,
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn render(&mut self, frame: &mut Frame) {
+        // Render either the main dashboard OR the modal view - not both
+        if self.modal.open {
+            // Render ONLY the modal view - completely new clean screen
+            // Clear cached rects when modal is open
+            self.cached_rects = PanelRects::default();
+
+            let session_id = self
+                .session_list_state
+                .selected()
+                .and_then(|i| self.session_list.get(i).map(|s| s.id.clone()));
+            if let Some(id) = session_id {
+                if let Some(session) = self.session_list.iter().find(|s| s.id == id) {
+                    self.modal
+                        .render(frame, frame.area(), session, &self.session_titles);
+                }
+            }
+        } else {
+            // Render the main dashboard and cache panel rectangles
+            let main_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .split(frame.area());
+
+            let horizontal_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
+                .split(main_chunks[0]);
+
+            self.render_left_panel(frame, horizontal_chunks[0]);
+            self.render_right_panel(frame, horizontal_chunks[1]);
+            self.render_status_bar(frame, main_chunks[1]);
+        }
+    }
+
+    fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
+        let hint = if self.modal.open {
+            " ↑↓/PgUp/PgDn: scroll chat │ ←→: scroll info │ Esc/q: close "
+        } else {
+            match (self.focus, self.left_panel, self.right_panel) {
+                (Focus::Left, LeftPanel::Stats, _) => " ↑↓: navigate │ ←→: focus │ Esc/q: quit ",
+                (Focus::Left, LeftPanel::Days, _) => {
+                    if self.is_active {
+                        " ↑↓: scroll │ Enter: open chat │ Esc: back "
+                    } else {
+                        " ↑↓: navigate │ Enter: open │ ←→: focus │ Esc/q: quit "
+                    }
+                }
+                (Focus::Left, LeftPanel::Models, _) => {
+                    if self.models_active {
+                        " ↑↓: scroll │ Esc: back │ ←→: focus "
+                    } else {
+                        " ↑↓: navigate │ Enter: open │ ←→: focus │ Esc/q: quit "
+                    }
+                }
+                (Focus::Right, LeftPanel::Days, RightPanel::List) => {
+                    if self.is_active {
+                        " ↑↓: scroll │ Enter: open chat │ Esc: back "
+                    } else {
+                        " ↑↓: navigate │ Enter: open │ ←: focus left │ Esc/q: quit "
+                    }
+                }
+                (Focus::Right, _, _) => {
+                    if self.is_active || self.models_active {
+                        if self.left_panel == LeftPanel::Models {
+                            " ↑↓←→: navigate │ Esc: back │ q: quit "
+                        } else {
+                            " ↑↓: scroll │ Esc: back │ ←: focus left │ q: quit "
+                        }
+                    } else if self.left_panel == LeftPanel::Models {
+                        " ↑↓←→: navigate │ Esc: back │ ←: focus left │ Esc/q: quit "
+                    } else {
+                        " ↑↓: navigate │ ←: focus left │ Esc/q: quit "
+                    }
+                }
+            }
+        };
+
+        let status_bar = Paragraph::new(hint)
+            .style(
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .bg(Color::Rgb(20, 20, 30)),
+            )
+            .alignment(Alignment::Center);
+        frame.render_widget(status_bar, area);
+    }
+
+    fn render_left_panel(&mut self, frame: &mut Frame, area: Rect) {
+        let is_focused = self.focus == Focus::Left;
+        let border_style = if is_focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let stats_height = 6;
+        let model_height = 6.min(self.model_usage.len() as u16 + 2);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(stats_height),
+                Constraint::Min(9),
+                Constraint::Length(model_height),
+            ])
+            .split(area);
+
+        // Cache panel rectangles for mouse hit-testing
+        self.cached_rects.stats = Some(chunks[0]);
+        self.cached_rects.days = Some(chunks[1]);
+        self.cached_rects.models = Some(chunks[2]);
+
+        self.render_stats_panel(
+            frame,
+            chunks[0],
+            border_style,
+            self.focus == Focus::Left && self.left_panel == LeftPanel::Stats,
+            self.is_active,
+        );
+        self.render_day_list(
+            frame,
+            chunks[1],
+            border_style,
+            self.focus == Focus::Left && self.left_panel == LeftPanel::Days,
+            self.is_active, // Linked with Sessions
+        );
+        self.render_model_list(
+            frame,
+            chunks[2],
+            border_style,
+            self.focus == Focus::Left && self.left_panel == LeftPanel::Models,
+            self.models_active, // Independent - only when Enter on Models
+        );
+    }
+
+    fn render_stats_panel(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        border_style: Style,
+        is_highlighted: bool,
+        _is_active: bool,
+    ) {
+        let title_color = if is_highlighted {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if is_highlighted {
+                border_style
+            } else {
+                Style::default().fg(Color::DarkGray)
+            })
+            .title(
+                Line::from(Span::styled(
+                    " GENERAL USAGE ",
+                    Style::default()
+                        .fg(title_color)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Center),
+            );
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Length(2)])
+            .split(inner);
+
+        let stats_layout_top = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(20),
+                Constraint::Percentage(20),
+                Constraint::Percentage(26),
+                Constraint::Percentage(36),
+            ])
+            .split(rows[0]);
+
+        let stats_layout_bottom = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(20),
+                Constraint::Percentage(20),
+                Constraint::Percentage(26),
+                Constraint::Percentage(36),
+            ])
+            .split(rows[1]);
+
+        // Use helper for simple stats
+        let s_sess = stat_widget(
+            "Sessions",
+            format!("{}", self.totals.sessions.len()),
+            Color::Cyan,
+        );
+        let s_cost = stat_widget(
+            "Cost",
+            format!("${:.2}", self.totals.display_cost()),
+            Color::Yellow,
+        );
+        let s_msg = stat_widget("Messages", format!("{}", self.totals.messages), Color::Cyan);
+        let s_in = stat_widget(
+            "Input",
+            format_number(self.totals.tokens.input),
+            Color::Blue,
+        );
+        let s_out = stat_widget(
+            "Output",
+            format_number(self.totals.tokens.output),
+            Color::Magenta,
+        );
+        let s_think = stat_widget(
+            "Thinking",
+            format_number(self.totals.tokens.reasoning),
+            Color::Rgb(255, 165, 0),
+        );
+        let s_cache = stat_widget(
+            "Cache",
+            format_number(self.totals.tokens.cache_read + self.totals.tokens.cache_write),
+            Color::Yellow,
+        );
+
+        // Line changes needs custom formatting (two colors)
+        let s_lines = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Line Changes",
+                Style::default().fg(Color::Rgb(180, 180, 180)),
+            )),
+            Line::from(vec![
+                Span::styled(
+                    format!("+{}", format_number(self.totals.diffs.additions)),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(" / ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                Span::styled(
+                    format!("-{}", format_number(self.totals.diffs.deletions)),
+                    Style::default().fg(Color::Red),
+                ),
+            ]),
+        ])
+        .alignment(Alignment::Center);
+
+        frame.render_widget(s_sess, stats_layout_top[0]);
+        frame.render_widget(s_msg, stats_layout_top[1]);
+        frame.render_widget(s_cost, stats_layout_top[2]);
+        frame.render_widget(s_lines, stats_layout_top[3]);
+
+        frame.render_widget(s_in, stats_layout_bottom[0]);
+        frame.render_widget(s_out, stats_layout_bottom[1]);
+        frame.render_widget(s_think, stats_layout_bottom[2]);
+        frame.render_widget(s_cache, stats_layout_bottom[3]);
+    }
+
+    fn render_day_list(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        border_style: Style,
+        is_highlighted: bool,
+        is_active: bool,
+    ) {
+        // Pre-allocate Vec with capacity to avoid reallocations
+        let mut items = Vec::with_capacity(self.day_list.len());
+
+        for day in &self.day_list {
+            // Optimized: single HashMap lookup instead of multiple map calls
+            let (sess, input, output, cost) = if let Some(stat) = self.per_day.get(day) {
+                (
+                    stat.sessions.len(),
+                    stat.tokens.input,
+                    stat.tokens.output,
+                    stat.display_cost(),
+                )
+            } else {
+                (0, 0, 0, 0.0)
+            };
+
+            let in_val = format_number(input);
+            let out_val = format_number(output);
+
+            // Use cached day string (Phase 2 optimization - avoids date parsing on every render)
+            let day_with_name = self
+                .cached_day_strings
+                .get(day)
+                .cloned()
+                .unwrap_or_else(|| day.clone());
+
+            // Pre-allocate spans Vec with exact capacity (10 spans)
+            let mut spans = Vec::with_capacity(10);
+            spans.push(Span::styled(
+                format!("{:<17}", day_with_name),
+                Style::default().fg(Color::White),
+            ));
+            spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::Rgb(180, 180, 180)),
+            ));
+            spans.push(Span::styled(
+                format!("{:>7}", in_val),
+                Style::default().fg(Color::Blue),
+            ));
+            spans.push(Span::styled(
+                " in ",
+                Style::default().fg(Color::Rgb(180, 180, 180)),
+            ));
+            spans.push(Span::styled(
+                format!("{:>7}", out_val),
+                Style::default().fg(Color::Magenta),
+            ));
+            spans.push(Span::styled(
+                " out",
+                Style::default().fg(Color::Rgb(180, 180, 180)),
+            ));
+            spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::Rgb(180, 180, 180)),
+            ));
+            spans.push(Span::styled(
+                format!("${:>7.2}", cost),
+                Style::default().fg(Color::Yellow),
+            ));
+            spans.push(Span::styled(
+                " │ ",
+                Style::default().fg(Color::Rgb(180, 180, 180)),
+            ));
+            spans.push(Span::styled(
+                format!("{:>4} sess", sess),
+                Style::default().fg(Color::Cyan),
+            ));
+            items.push(ListItem::new(Line::from(spans)));
+        }
+
+        let title_color = if is_highlighted {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(if is_highlighted {
+                        border_style
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    })
+                    .title(
+                        Line::from(Span::styled(
+                            " DAILY USAGE ",
+                            Style::default()
+                                .fg(title_color)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                        .alignment(Alignment::Center),
+                    )
+                    .title_bottom(
+                        Line::from(Span::styled(
+                            if is_active {
+                                " ↑↓: scroll │ Esc: back "
+                            } else {
+                                " "
+                            },
+                            Style::default().fg(Color::DarkGray),
+                        ))
+                        .alignment(Alignment::Center),
+                    ),
+            )
+            .highlight_style(if is_active {
+                Style::default()
+                    .bg(Color::Rgb(60, 60, 90))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            })
+            .highlight_symbol(if is_active { "▶ " } else { "  " })
+            .highlight_spacing(HighlightSpacing::Always);
+
+        frame.render_stateful_widget(list, area, &mut self.day_list_state);
+    }
+
+    fn render_model_list(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        border_style: Style,
+        is_highlighted: bool,
+        is_active: bool,
+    ) {
+        // Pre-allocate Vec with capacity to avoid reallocations
+        let mut items = Vec::with_capacity(self.model_usage.len());
+
+        for m in &self.model_usage {
+            // Show full model name with provider (e.g., "prox/glm-4.7")
+            let full_name = m.name.to_string();
+            items.push(ListItem::new(usage_list_row(
+                full_name,
+                m.tokens.input,
+                m.tokens.output,
+                m.display_cost(),
+                m.sessions.len(),
+            )));
+        }
+
+        let title_color = if is_highlighted {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(if is_highlighted {
+                        border_style
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    })
+                    .title(
+                        Line::from(Span::styled(
+                            " MODEL USAGE ",
+                            Style::default()
+                                .fg(title_color)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                        .alignment(Alignment::Center),
+                    )
+                    .title_bottom(
+                        Line::from(Span::styled(
+                            if is_active {
+                                " ↑↓: scroll │ Esc: back "
+                            } else {
+                                " "
+                            },
+                            Style::default().fg(Color::DarkGray),
+                        ))
+                        .alignment(Alignment::Center),
+                    ),
+            )
+            .highlight_style(if is_active {
+                Style::default()
+                    .bg(Color::Rgb(60, 60, 90))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            })
+            .highlight_symbol(if is_active { "▶ " } else { "  " })
+            .highlight_spacing(HighlightSpacing::Always);
+
+        frame.render_stateful_widget(list, area, &mut self.model_list_state);
+    }
+
+    fn render_right_panel(&mut self, frame: &mut Frame, area: Rect) {
+        let is_focused = self.focus == Focus::Right;
+        let border_style = if is_focused {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        match self.left_panel {
+            LeftPanel::Stats => {
+                // Tool usage takes entire right panel
+                self.cached_rects.detail = Some(area);
+                self.cached_rects.list = None;
+                self.cached_rects.tools = None;
+                self.render_tool_usage_panel(frame, area, border_style, is_focused, self.is_active)
+            }
+            LeftPanel::Days => {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(11), Constraint::Min(0)])
+                    .split(area);
+
+                // Cache right panel rects for Days view
+                self.cached_rects.detail = Some(chunks[0]);
+                self.cached_rects.list = Some(chunks[1]);
+                self.cached_rects.tools = None;
+
+                let detail_highlighted = is_focused && self.right_panel == RightPanel::Detail;
+                let detail_active = detail_highlighted && self.is_active;
+                self.render_session_detail(
+                    frame,
+                    chunks[0],
+                    if detail_highlighted {
+                        border_style
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                    detail_active,
+                );
+
+                let list_highlighted = is_focused && self.right_panel == RightPanel::List;
+                // Sessions panel should be highlighted when active or when left panel isDays
+                let list_active = list_highlighted && self.is_active;
+                self.render_session_list(
+                    frame,
+                    chunks[1],
+                    if list_highlighted {
+                        border_style
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                    list_highlighted,
+                    list_active,
+                );
+            }
+            LeftPanel::Models => {
+                // Cache right panel rects for Models view (done in render_model_detail)
+                self.render_model_detail(frame, area, border_style, is_focused, self.models_active)
+            }
+        }
+    }
+
+    fn render_tool_usage_panel(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        border_style: Style,
+        is_highlighted: bool,
+        _is_active: bool,
+    ) {
+        let title_color = if is_highlighted {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if is_highlighted {
+                border_style
+            } else {
+                Style::default().fg(Color::DarkGray)
+            })
+            .title(
+                Line::from(Span::styled(
+                    " TOOL USAGE ",
+                    Style::default()
+                        .fg(title_color)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Center),
+            );
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if self.tool_usage.is_empty() {
+            let empty = Paragraph::new("No tool usage data")
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center);
+            frame.render_widget(empty, inner);
+            return;
+        }
+
+        let total_count: u64 = self.tool_usage.iter().map(|t| t.count).sum();
+        let bar_max_width = inner.width.saturating_sub(30) as u64;
+
+        let mut lines: Vec<Line> = Vec::with_capacity(self.tool_usage.len());
+        for tool in &self.tool_usage {
+            let percentage = if total_count > 0 {
+                (tool.count as f64 / total_count as f64) * 100.0
+            } else {
+                0.0
+            };
+            let bar_width = if total_count > 0 {
+                ((tool.count as f64 / total_count as f64) * bar_max_width as f64) as usize
+            } else {
+                0
+            };
+            let filled = "█".repeat(bar_width);
+            let empty = "░".repeat(bar_max_width as usize - bar_width);
+
+            // Truncate tool name to max 12 chars with ellipsis if needed
+            let tool_name_display = truncate_with_ellipsis(&tool.name, 12);
+
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {:>12} ", tool_name_display),
+                    Style::default().fg(Color::White),
+                ),
+                Span::styled(filled, Style::default().fg(Color::Cyan)),
+                Span::styled(empty, Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(" {:>5} ", tool.count),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!("({:>5.1}%)", percentage),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+
+        let paragraph = Paragraph::new(lines);
+        frame.render_widget(paragraph, inner);
+    }
+
+    fn render_model_detail(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        border_style: Style,
+        is_highlighted: bool,
+        is_active: bool,
+    ) {
+        let selected_model = self
+            .selected_model_index
+            .and_then(|i| self.model_usage.get(i));
+
+        let main_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(9), // Info
+                Constraint::Min(0),    // Bottom section
+            ])
+            .split(area);
+
+        let bottom_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(40), // Tools
+                Constraint::Percentage(60), // Ranking
+            ])
+            .split(main_chunks[1]);
+
+        // Cache right panel rects for Models view
+        self.cached_rects.detail = Some(main_chunks[0]);
+        self.cached_rects.tools = Some(bottom_chunks[0]);
+        self.cached_rects.list = Some(bottom_chunks[1]);
+
+        // --- 1. MODEL INFO ---
+        let info_focused = is_highlighted && self.right_panel == RightPanel::Detail;
+        let info_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if info_focused {
+                border_style
+            } else {
+                Style::default().fg(Color::DarkGray)
+            })
+            .title(
+                Line::from(Span::styled(
+                    " MODEL INFO ",
+                    Style::default()
+                        .fg(if info_focused {
+                            Color::Cyan
+                        } else {
+                            Color::Yellow
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Center),
+            );
+
+        let info_inner = info_block.inner(main_chunks[0]);
+        frame.render_widget(info_block, main_chunks[0]);
+
+        if let Some(model) = selected_model {
+            let short_name: &str = &model.short_name;
+            let provider: &str = &model.provider;
+
+            let info_columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(45), Constraint::Min(0)])
+                .split(info_inner);
+
+            let left_lines = vec![
+                Line::from(vec![
+                    Span::styled("Model     ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled(
+                        short_name,
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Provider  ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled(provider, Style::default().fg(Color::Cyan)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Sessions  ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled(
+                        format!("{}", model.sessions.len()),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Messages  ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled(
+                        format!("{}", model.messages),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+            ];
+
+            let right_lines = vec![
+                Line::from(vec![
+                    Span::styled(
+                        "Input         ",
+                        Style::default().fg(Color::Rgb(180, 180, 180)),
+                    ),
+                    Span::styled(
+                        format_number_full(model.tokens.input),
+                        Style::default().fg(Color::Blue),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        "Output        ",
+                        Style::default().fg(Color::Rgb(180, 180, 180)),
+                    ),
+                    Span::styled(
+                        format_number_full(model.tokens.output),
+                        Style::default().fg(Color::Magenta),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        "Thinking      ",
+                        Style::default().fg(Color::Rgb(180, 180, 180)),
+                    ),
+                    Span::styled(
+                        format_number_full(model.tokens.reasoning),
+                        Style::default().fg(Color::Rgb(255, 165, 0)),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        "Cache Read    ",
+                        Style::default().fg(Color::Rgb(180, 180, 180)),
+                    ),
+                    Span::styled(
+                        format_number_full(model.tokens.cache_read),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        "Cache Write   ",
+                        Style::default().fg(Color::Rgb(180, 180, 180)),
+                    ),
+                    Span::styled(
+                        format_number_full(model.tokens.cache_write),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]),
+            ];
+
+            frame.render_widget(Paragraph::new(left_lines), info_columns[0]);
+            frame.render_widget(Paragraph::new(right_lines), info_columns[1]);
+        }
+
+        // --- 2. TOOLS USED ---
+        let tools_focused = is_highlighted && self.right_panel == RightPanel::Tools;
+        let tools_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if tools_focused {
+                border_style
+            } else {
+                Style::default().fg(Color::DarkGray)
+            })
+            .title(
+                Line::from(Span::styled(
+                    " TOOLS USED ",
+                    Style::default()
+                        .fg(if tools_focused {
+                            Color::Cyan
+                        } else {
+                            Color::Yellow
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Center),
+            );
+
+        let tools_inner = tools_block.inner(bottom_chunks[0]);
+        frame.render_widget(tools_block, bottom_chunks[0]);
+
+        if let Some(model) = selected_model {
+            if !model.tools.is_empty() {
+                // Optimized: pre-allocate with known capacity for sorting
+                let mut tools: Vec<_> = model.tools.iter().collect();
+                tools.sort_unstable_by(|a, b| b.1.cmp(a.1));
+                let total: u64 = tools.iter().map(|(_, c)| **c).sum();
+                let bar_max = tools_inner.width.saturating_sub(16) as u64;
+
+                // Optimized: pre-allocate with known capacity for lines
+                let lines: Vec<Line> = tools
+                    .into_iter()
+                    .map(|(name, count)| {
+                        let width = ((*count as f64 / total as f64) * bar_max as f64) as usize;
+                        let filled = "█".repeat(width);
+                        let empty = "░".repeat(bar_max as usize - width);
+                        Line::from(vec![
+                            Span::styled(
+                                format!("{:<12}", safe_truncate_plain(name, 12)),
+                                Style::default().fg(Color::White),
+                            ),
+                            Span::styled(filled, Style::default().fg(Color::Magenta)),
+                            Span::styled(empty, Style::default().fg(Color::DarkGray)),
+                            Span::styled(
+                                format!("{:>3}", count),
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ])
+                    })
+                    .collect();
+                frame.render_widget(Paragraph::new(lines), tools_inner);
+            } else {
+                let empty = Paragraph::new("No tools used")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center);
+                frame.render_widget(empty, tools_inner);
+            }
+        }
+
+        // --- 3. MODEL RANKING ---
+        let ranking_focused = is_highlighted && self.right_panel == RightPanel::List;
+        let ranking_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if ranking_focused {
+                border_style
+            } else {
+                Style::default().fg(Color::DarkGray)
+            })
+            .title(
+                Line::from(Span::styled(
+                    " MODEL RANKING ",
+                    Style::default()
+                        .fg(if ranking_focused {
+                            Color::Cyan
+                        } else {
+                            Color::Yellow
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Center),
+            )
+            .title_bottom(
+                Line::from(Span::styled(
+                    if ranking_focused && is_active {
+                        " ↑↓: scroll │ Esc: back "
+                    } else {
+                        " "
+                    },
+                    Style::default().fg(Color::DarkGray),
+                ))
+                .alignment(Alignment::Center),
+            );
+
+        let ranking_inner = ranking_block.inner(bottom_chunks[1]);
+        frame.render_widget(ranking_block, bottom_chunks[1]);
+
+        let mut ranked_models: Vec<_> = self.model_usage.iter().enumerate().collect();
+        ranked_models.sort_unstable_by(|a, b| b.1.tokens.total().cmp(&a.1.tokens.total()));
+        let grand_total: u64 = self.model_usage.iter().map(|m| m.tokens.total()).sum();
+
+        let ranking_lines: Vec<Line> = ranked_models
+            .iter()
+            .enumerate()
+            .map(|(rank, (idx, model))| {
+                let is_selected = self.selected_model_index == Some(*idx);
+                let model_style = if is_selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                let percentage = if grand_total > 0 {
+                    (model.tokens.total() as f64 / grand_total as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:>2}", rank + 1),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(" ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{:<35} ", safe_truncate_plain(&model.display_name, 35)),
+                        model_style,
+                    ),
+                    Span::styled(
+                        format!("{:>5.1}%", percentage),
+                        Style::default()
+                            .fg(if is_selected {
+                                Color::Yellow
+                            } else {
+                                Color::DarkGray
+                            })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            })
+            .collect();
+
+        // Auto-scroll logic (only if not manually scrolling the ranking panel)
+        if !is_active || !ranking_focused {
+            if let Some(selected_idx) = self.selected_model_index {
+                if let Some(selected_rank) = ranked_models
+                    .iter()
+                    .position(|(idx, _)| *idx == selected_idx)
+                {
+                    let visible_height = ranking_inner.height as usize;
+                    if visible_height > 0 {
+                        if selected_rank >= self.ranking_scroll + visible_height - 1
+                            || selected_rank < self.ranking_scroll
+                        {
+                            self.ranking_scroll = selected_rank.saturating_sub(visible_height / 2);
+                        }
+                        self.ranking_scroll = self
+                            .ranking_scroll
+                            .min(ranking_lines.len().saturating_sub(visible_height));
+                    }
+                }
+            }
+        }
+
+        let visible_lines: Vec<Line> = ranking_lines
+            .into_iter()
+            .skip(self.ranking_scroll)
+            .take(ranking_inner.height as usize)
+            .collect();
+
+        frame.render_widget(Paragraph::new(visible_lines), ranking_inner);
+    }
+
+    fn render_session_detail(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        border_style: Style,
+        _is_active: bool,
+    ) {
+        let session = self.selected_session();
+        // Optimized: pre-allocate with known capacity (9 lines for session info)
+        let mut final_lines = Vec::with_capacity(9);
+        if let Some(s) = session {
+            let title = self
+                .session_titles
+                .get(&s.id.to_string())
+                .map(|t| t.replace("New session - ", ""))
+                .unwrap_or_else(|| "Untitled".to_string());
+            let project = if !s.path_root.is_empty() {
+                s.path_root.clone()
+            } else {
+                s.path_cwd.clone()
+            };
+
+            final_lines.push(Line::from(vec![
+                Span::styled(
+                    "Title        ",
+                    Style::default().fg(Color::Rgb(180, 180, 180)),
+                ),
+                Span::styled(
+                    title
+                        .chars()
+                        .take(area.width as usize - 14)
+                        .collect::<String>(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+
+            final_lines.push(Line::from(vec![
+                Span::styled(
+                    "Session ID   ",
+                    Style::default().fg(Color::Rgb(180, 180, 180)),
+                ),
+                Span::styled(
+                    s.id.as_ref(),
+                    Style::default()
+                        .fg(Color::Rgb(150, 150, 150))
+                        .add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+
+            final_lines.push(Line::from(vec![
+                Span::styled(
+                    "Project      ",
+                    Style::default().fg(Color::Rgb(180, 180, 180)),
+                ),
+                Span::styled(
+                    project
+                        .chars()
+                        .take(area.width as usize - 14)
+                        .collect::<String>(),
+                    Style::default().fg(Color::Blue),
+                ),
+            ]));
+
+            let mut model_line = vec![Span::styled(
+                "Models       ",
+                Style::default().fg(Color::Rgb(180, 180, 180)),
+            )];
+            let mut models: Vec<_> = s.models.iter().collect();
+            models.sort();
+            let mut current_len = 0;
+            let max_len = area.width.saturating_sub(15) as usize;
+            for (i, m) in models.iter().enumerate() {
+                let name = m; // Show full model name with provider (e.g., "prox/glm-4.7")
+                let display = if i == 0 {
+                    name.to_string()
+                } else {
+                    format!(", {}", name)
+                };
+                if current_len + display.len() > max_len && i > 0 {
+                    model_line.push(Span::styled(
+                        format!(" +{}", models.len() - i),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                    break;
+                }
+                model_line.push(Span::styled(
+                    display.clone(),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                current_len += display.len();
+            }
+            final_lines.push(Line::from(model_line));
+
+            final_lines.push(Line::from(vec![
+                Span::styled(
+                    "Input        ",
+                    Style::default().fg(Color::Rgb(180, 180, 180)),
+                ),
+                Span::styled(
+                    format_number_full(s.tokens.input),
+                    Style::default().fg(Color::Blue),
+                ),
+            ]));
+
+            final_lines.push(Line::from(vec![
+                Span::styled(
+                    "Output       ",
+                    Style::default().fg(Color::Rgb(180, 180, 180)),
+                ),
+                Span::styled(
+                    format_number_full(s.tokens.output),
+                    Style::default().fg(Color::Magenta),
+                ),
+            ]));
+
+            final_lines.push(Line::from(vec![
+                Span::styled(
+                    "Thinking     ",
+                    Style::default().fg(Color::Rgb(180, 180, 180)),
+                ),
+                Span::styled(
+                    format_number_full(s.tokens.reasoning),
+                    Style::default().fg(Color::Rgb(255, 165, 0)),
+                ),
+            ]));
+
+            final_lines.push(Line::from(vec![
+                Span::styled(
+                    "Cache Read   ",
+                    Style::default().fg(Color::Rgb(180, 180, 180)),
+                ),
+                Span::styled(
+                    format_number_full(s.tokens.cache_read),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+
+            final_lines.push(Line::from(vec![
+                Span::styled(
+                    "Cache Write  ",
+                    Style::default().fg(Color::Rgb(180, 180, 180)),
+                ),
+                Span::styled(
+                    format_number_full(s.tokens.cache_write),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+        } else {
+            final_lines.push(Line::from(Span::styled(
+                " No session selected",
+                Style::default().fg(Color::Rgb(180, 180, 180)),
+            )));
+        }
+
+        frame.render_widget(
+            Paragraph::new(final_lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border_style)
+                    .title(
+                        Line::from(Span::styled(
+                            " SESSION INFO ",
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                        .alignment(Alignment::Center),
+                    ),
+            ),
+            area,
+        );
+    }
+
+    fn render_session_list(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        border_style: Style,
+        is_highlighted: bool,
+        is_active: bool,
+    ) {
+        // Use cached items to avoid recomputing on every render
+        let items: Vec<ListItem> = self.cached_session_items.clone();
+
+        let title_color = if is_highlighted {
+            Color::Cyan
+        } else {
+            Color::Yellow
+        };
+
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border_style)
+                    .title(
+                        Line::from(Span::styled(
+                            " SESSIONS ",
+                            Style::default()
+                                .fg(title_color)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                        .alignment(Alignment::Center),
+                    )
+                    .title_bottom(
+                        Line::from(Span::styled(
+                            if is_active {
+                                " ↑↓: scroll │ Enter: Open Chat │ Esc: back "
+                            } else {
+                                " "
+                            },
+                            Style::default().fg(Color::DarkGray),
+                        ))
+                        .alignment(Alignment::Center),
+                    ),
+            )
+            .highlight_style(if is_active {
+                Style::default()
+                    .bg(Color::Rgb(60, 60, 90))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            })
+            .highlight_symbol(if is_active { "▶ " } else { "  " })
+            .highlight_spacing(HighlightSpacing::Always);
+
+        frame.render_stateful_widget(list, area, &mut self.session_list_state);
+    }
+}
