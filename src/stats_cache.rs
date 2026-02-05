@@ -54,12 +54,10 @@ impl StatsCache {
 
     pub fn load_or_compute(&self) -> crate::stats::Stats {
         // OPTIMIZATION: Check cache metadata BEFORE deserializing
-        // This avoids expensive deserialization if cache is stale
         if let Ok(cache_meta) = fs::metadata(&self.cache_path) {
             if let Ok(modified) = cache_meta.modified() {
                 if let Ok(age) = modified.elapsed() {
                     if age <= Duration::from_secs(120) {
-                        // Cache appears fresh, try to load it
                         if let Ok(cached) = self.load_cache() {
                             if self.validate_cache_fast(&cached) {
                                 let mut stats_lock = self.stats.write();
@@ -77,7 +75,6 @@ impl StatsCache {
             }
         }
 
-        // Cache is stale, missing, or invalid - recompute
         let stats = crate::stats::collect_stats();
         self.update_cache(&stats);
         stats
@@ -89,13 +86,11 @@ impl StatsCache {
     }
 
     fn validate_cache_fast(&self, cached: &CachedStats) -> bool {
-        // Fast validation: check if cache file exists and is recent
         let cache_meta = match fs::metadata(&self.cache_path) {
             Ok(m) => m,
             Err(_) => return false,
         };
 
-        // Check if cache is older than 2 minutes for fresher data
         let cache_age = cache_meta
             .modified()
             .ok()
@@ -106,15 +101,11 @@ impl StatsCache {
             return false;
         }
 
-        // CRITICAL: Check processed message count using processed_message_ids
-        // This correctly matches the number of successfully parsed messages
-        // instead of comparing to total file count (which includes invalid files)
         let message_count = self.count_message_files_fast();
         if cached.processed_message_ids.len() != message_count {
             return false;
         }
 
-        // Quick hash check on a few recent files
         let all_files = match self.list_all_files() {
             Ok(files) => files,
             Err(_) => return false,
@@ -123,9 +114,7 @@ impl StatsCache {
             return false;
         }
 
-        // Sample check: verify a few cached hashes still match on disk
         let sample_files: Vec<_> = cached.file_hashes.keys().take(20).collect();
-
         for path in sample_files {
             let Some(current_hash) = self.compute_file_hash(path) else {
                 return false;
@@ -138,7 +127,6 @@ impl StatsCache {
         true
     }
 
-    /// Fast parallel message file count
     fn count_message_files_fast(&self) -> usize {
         let message_path = self._storage_path.join("message");
         if !message_path.exists() {
@@ -149,9 +137,7 @@ impl StatsCache {
             return 0;
         };
 
-        // Collect entries first, then process in parallel
         let dirs: Vec<_> = entries.flatten().collect();
-
         dirs.par_iter()
             .map(|entry| {
                 let path = entry.path();
@@ -172,16 +158,30 @@ impl StatsCache {
             .sum()
     }
 
-    fn update_files_internal(&self, cached: &mut CachedStats, paths: Vec<String>) {
+    pub fn update_files(&self, paths: Vec<String>) -> HashSet<String> {
+        let mut stats_lock = self.stats.write();
+        self.update_files_internal(&mut stats_lock, paths)
+    }
+
+    fn update_files_internal(
+        &self,
+        cached: &mut CachedStats,
+        paths: Vec<String>,
+    ) -> HashSet<String> {
+        let mut affected_sessions = HashSet::new();
         let has_session_changes = paths
             .iter()
             .any(|p| p.contains("session.json") || p.contains("session_diff/"));
 
         if has_session_changes {
-            // Full refresh for session changes
             cached.stats = crate::stats::collect_stats();
             if let Ok(all_files) = self.list_all_files() {
                 cached.processed_message_ids = self.build_message_id_set(&all_files);
+            }
+            for day_stat in cached.stats.per_day.values() {
+                for id in day_stat.sessions.keys() {
+                    affected_sessions.insert(id.clone());
+                }
             }
         } else {
             if cached.processed_message_ids.is_empty() {
@@ -189,21 +189,20 @@ impl StatsCache {
                     cached.processed_message_ids = self.build_message_id_set(&all_files);
                 }
             }
-            // Incremental update for messages/parts
             for p in &paths {
                 if p.contains("message/") {
-                    self.incrementally_update_messages(
+                    if let Some(session_id) = self.incrementally_update_messages(
                         &mut cached.stats,
                         p,
                         &mut cached.processed_message_ids,
-                    );
+                    ) {
+                        affected_sessions.insert(session_id);
+                    }
                 } else if p.contains("part/") {
                     self.incrementally_update_parts(&mut cached.stats, p);
                 }
             }
 
-            // OPTIMIZATION: Sort model_usage ONCE after all updates, not per-message
-            // This avoids O(n log n) sorting for each message in the batch
             cached
                 .stats
                 .model_usage
@@ -212,17 +211,17 @@ impl StatsCache {
 
         cached.version += 1;
 
-        // Update hashes only for changed files
         for p in &paths {
             if let Some(h) = self.compute_file_hash(p) {
                 cached.file_hashes.insert(p.clone(), h);
             }
         }
 
-        // Write cache asynchronously (ignore errors for performance)
         if let Ok(data) = serialize(&*cached) {
             let _ = fs::write(&self.cache_path, data);
         }
+
+        affected_sessions
     }
 
     fn update_cache(&self, stats: &crate::stats::Stats) {
@@ -231,9 +230,7 @@ impl StatsCache {
         cached.version += 1;
         cached.file_hashes.clear();
 
-        // Only compute hashes for files that exist (skip errors)
         if let Ok(files) = self.list_all_files() {
-            // Parallelize hash computation for speed
             let hashes: HashMap<String, u64> = files
                 .par_iter()
                 .filter_map(|f| self.compute_file_hash(f).map(|h| (f.clone(), h)))
@@ -242,7 +239,6 @@ impl StatsCache {
             cached.processed_message_ids = self.build_message_id_set(&files);
         }
 
-        // Write cache (ignore errors for performance)
         if let Ok(data) = serialize(&*cached) {
             let _ = fs::write(&self.cache_path, data);
         }
@@ -281,9 +277,6 @@ impl StatsCache {
     }
 
     fn list_all_files(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-        // DISABLE CACHE to ensure we always get fresh file counts to fix the 7 messages lag
-        // We never read the cache, so don't bother updating it either
-
         let dirs = ["message", "part", "session", "session_diff"];
         let files: Vec<String> = dirs
             .par_iter()
@@ -293,11 +286,10 @@ impl StatsCache {
                     return Vec::new();
                 }
 
-                // Parallelize the scanning of subdirectories
                 if let Ok(entries) = fs::read_dir(&dp) {
                     return entries
                         .flatten()
-                        .par_bridge() // Parallelize processing of each entry in the top-level dir
+                        .par_bridge()
                         .flat_map(|entry| {
                             let p = entry.path();
                             if p.is_dir() {
@@ -329,24 +321,17 @@ impl StatsCache {
         Ok(files)
     }
 
-    pub fn update_files(&self, paths: Vec<String>) {
-        let mut cached = self.stats.read().clone();
-        self.update_files_internal(&mut cached, paths);
-        let mut stats_lock = self.stats.write();
-        stats_lock.stats.clone_from(&cached.stats);
-    }
-
     fn incrementally_update_messages(
         &self,
         stats: &mut crate::stats::Stats,
         path: &str,
         processed_message_ids: &mut HashSet<Box<str>>,
-    ) {
+    ) -> Option<String> {
         let Ok(bytes) = fs::read(path) else {
-            return;
+            return None;
         };
         let Ok(msg) = serde_json::from_slice::<crate::stats::Message>(&bytes) else {
-            return;
+            return None;
         };
 
         let message_id = match msg.id.clone() {
@@ -354,11 +339,12 @@ impl StatsCache {
             _ => path.to_string().into_boxed_str(),
         };
         if processed_message_ids.contains(&message_id) {
-            return;
+            return None;
         }
         processed_message_ids.insert(message_id);
 
-        let session_id = msg.session_id.clone().unwrap_or_default();
+        let session_id_lenient = msg.session_id.clone().unwrap_or_default();
+        let session_id = session_id_lenient.0.clone();
         let ts = msg.time.as_ref().and_then(|t| t.created.map(|v| *v));
         let day = crate::stats::get_day(ts);
         let model_id = crate::stats::get_model_id(&msg);
@@ -384,7 +370,6 @@ impl StatsCache {
             crate::stats::Tokens::default()
         };
 
-        // Update totals
         stats.totals.tokens.input += tokens_add.input;
         stats.totals.tokens.output += tokens_add.output;
         stats.totals.tokens.reasoning += tokens_add.reasoning;
@@ -395,9 +380,8 @@ impl StatsCache {
         stats
             .totals
             .sessions
-            .insert(session_id.0.clone().into_boxed_str());
+            .insert(session_id.clone().into_boxed_str());
 
-        // Update or create model usage
         if let Some(m) = stats.model_usage.iter_mut().find(|m| *m.name == *model_id) {
             m.messages += 1;
             m.cost += cost;
@@ -406,7 +390,7 @@ impl StatsCache {
             m.tokens.reasoning += tokens_add.reasoning;
             m.tokens.cache_read += tokens_add.cache_read;
             m.tokens.cache_write += tokens_add.cache_write;
-            m.sessions.insert(session_id.0.clone().into_boxed_str());
+            m.sessions.insert(session_id.clone().into_boxed_str());
         } else {
             let name_str: &str = &model_id;
             let parts: Vec<&str> = name_str.split('/').collect();
@@ -421,16 +405,13 @@ impl StatsCache {
                 provider: p.into(),
                 display_name: format!("{}/{}", p, n).into_boxed_str(),
                 messages: 1,
-                sessions: [session_id.0.clone().into_boxed_str()].into(),
+                sessions: [session_id.clone().into_boxed_str()].into(),
                 tokens: tokens_add,
                 tools: HashMap::new(),
                 cost,
             });
         }
-        // NOTE: model_usage sorting is done ONCE after all updates in update_files_internal()
-        // to avoid O(n log n) sorting for each message in a batch
 
-        // Update per-day stats
         let d = stats.per_day.entry(day).or_default();
         d.messages += 1;
         d.cost += cost;
@@ -440,11 +421,10 @@ impl StatsCache {
         d.tokens.cache_read += tokens_add.cache_read;
         d.tokens.cache_write += tokens_add.cache_write;
 
-        // Update session stats
         let s_arc = d
             .sessions
-            .entry(session_id.to_string())
-            .or_insert_with(|| Arc::new(crate::stats::SessionStat::new(session_id.to_string())));
+            .entry(session_id.clone())
+            .or_insert_with(|| Arc::new(crate::stats::SessionStat::new(session_id.clone())));
         let s = Arc::make_mut(s_arc);
         s.messages += 1;
         s.cost += cost;
@@ -467,6 +447,8 @@ impl StatsCache {
                 s.path_root = root.clone().into();
             }
         }
+
+        Some(session_id)
     }
 
     fn incrementally_update_parts(&self, stats: &mut crate::stats::Stats, path: &str) {

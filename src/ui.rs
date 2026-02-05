@@ -387,8 +387,6 @@ impl App {
         self.current_chat_session_id = None;
         // Rebuild cached session items to avoid recomputing on every render
         self.rebuild_cached_session_items();
-        // Rebuild session lookup map (Phase 2 optimization)
-        self.rebuild_session_lookup();
     }
 
     /// Rebuild cached session list items to avoid heavy computation on every render
@@ -456,8 +454,6 @@ impl App {
         }
     }
 
-    /// Partial update of session lookup for improved performance
-    #[allow(dead_code)]
     fn partial_update_session_lookup(&mut self, session_id: &str) {
         // Find the session in per_day and update it in session_lookup
         for day_stat in self.per_day.values() {
@@ -630,15 +626,19 @@ impl App {
     pub fn refresh_stats(&mut self, changed_files: Vec<PathBuf>) {
         if let Some(cache) = &self.stats_cache {
             let is_full_refresh = changed_files.is_empty();
+            let mut affected_sessions = std::collections::HashSet::new();
+
             let (totals, per_day, session_titles, model_usage) = if is_full_refresh {
-                cache.load_or_compute().into_tuple()
+                let stats = cache.load_or_compute();
+                // For full refresh, we'll rebuild everything
+                stats.into_tuple()
             } else {
                 // Optimized: avoid double to_string() call
                 let files: Vec<String> = changed_files
                     .iter()
                     .filter_map(|p| p.to_str().map(ToString::to_string))
                     .collect();
-                cache.update_files(files);
+                affected_sessions = cache.update_files(files);
                 cache.get_stats().into_tuple()
             };
 
@@ -657,6 +657,7 @@ impl App {
                     self.day_list_state.select(Some(0));
                 }
                 self.rebuild_session_lookup();
+                self.update_session_list();
             } else {
                 // For incremental updates, we don't need to rebuild the entire day_list
                 // just ensure it contains any new days (though messages usually arrive on existing days)
@@ -669,25 +670,32 @@ impl App {
                 }
                 if day_list_changed {
                     self.day_list.sort_unstable_by(|a, b| b.cmp(a));
+                    if self.day_list_state.selected().is_none() {
+                        self.day_list_state.select(Some(0));
+                    }
                 }
 
-                // Partially update session_lookup for changed sessions
-                for path in changed_files {
-                    if let Some(path_str) = path.to_str() {
-                        if path_str.contains("message/") {
-                            // Extract session ID from message file if possible
-                            // Or just rebuild the lookup for the last few days
-                            // For simplicity and correctness, rebuild lookup if it's not too big
-                            // but here we can be smarter.
-                            // However, we don't easily know which session changed without parsing.
-                            // Let's at least rebuild it incrementally if we can.
+                // Incrementally update session_lookup for affected sessions
+                for session_id in &affected_sessions {
+                    self.partial_update_session_lookup(session_id);
+                }
+
+                // Only rebuild session list if the currently selected day was affected
+                let mut current_day_affected = false;
+                if let Some(current_day) = self.selected_day() {
+                    if let Some(day_stat) = self.per_day.get(&current_day) {
+                        for session_id in &affected_sessions {
+                            if day_stat.sessions.contains_key(session_id) {
+                                current_day_affected = true;
+                                break;
+                            }
                         }
                     }
                 }
-                // If the number of sessions is small, full rebuild is fine.
-                // If it's large, we might need a more targeted approach.
-                // Let's rebuild it for now but with reserve to avoid reallocs.
-                self.rebuild_session_lookup();
+
+                if current_day_affected {
+                    self.update_session_list();
+                }
             }
 
             // Update tool usage
@@ -709,8 +717,6 @@ impl App {
                 self.selected_model_index = Some(0);
             }
 
-            // Rebuild caches
-            self.update_session_list();
             self.precompute_day_strings();
 
             log::debug!("Stats refreshed successfully (live update)");
