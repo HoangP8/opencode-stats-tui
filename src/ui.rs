@@ -31,6 +31,15 @@ struct CachedChat {
     total_lines: u16,
 }
 
+/// Helper to create cache key from session_id and day
+fn cache_key(session_id: &str, day: Option<&str>) -> String {
+    if let Some(d) = day {
+        format!("{}|{}", session_id, d)
+    } else {
+        session_id.to_string()
+    }
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum Focus {
     Left,
@@ -454,19 +463,21 @@ impl App {
             })
             .max()
             .unwrap_or(7);
-        let fixed_width =
-            3 + 8 + 3 + 8 + 3 + (max_cost_len + 1) + 3 + 8 + 3 + max_models_len + 2;
-        let title_width = width
-            .saturating_sub((fixed_width).min(u16::MAX as usize) as u16) as usize;
+        let fixed_width = 3 + 8 + 3 + 8 + 3 + (max_cost_len + 1) + 3 + 8 + 3 + max_models_len + 2;
+        let title_width =
+            width.saturating_sub((fixed_width).min(u16::MAX as usize) as u16) as usize;
+
         self.cached_session_items = self
             .session_list
             .iter()
             .map(|s| {
+                // No [Continued] badge - continuation info shown in panel title above
                 let title = self
                     .session_titles
                     .get(&s.id.to_string())
                     .map(|t| t.replace("New session - ", ""))
                     .unwrap_or_else(|| s.id.chars().take(14).collect());
+
                 let model_count = s.models.len();
                 let model_text = if model_count == 1 {
                     "1 model".into()
@@ -477,6 +488,13 @@ impl App {
                 let additions = s.diffs.additions;
                 let deletions = s.diffs.deletions;
 
+                // Gray title for continued sessions to highlight them
+                let title_color = if s.is_continuation {
+                    Color::Rgb(150, 150, 150)
+                } else {
+                    Color::White
+                };
+
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         format!(
@@ -484,7 +502,7 @@ impl App {
                             title.chars().take(title_width.max(8)).collect::<String>(),
                             width = title_width.max(8)
                         ),
-                        Style::default().fg(Color::White),
+                        Style::default().fg(title_color),
                     ),
                     Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
                     Span::styled(
@@ -572,6 +590,9 @@ impl App {
             None => return,
         };
 
+        // Get the current day for filtering messages
+        let current_day = self.selected_day();
+
         // Find the session_stat for this session_id - use session_lookup for O(1) access (Phase 2 optimization)
         let session_stat = self
             .session_lookup
@@ -583,16 +604,15 @@ impl App {
         let session_id_str = session_id.to_string();
         self.current_chat_session_id = Some(session_id_str.clone());
 
-        let total_lines = if let Some(cached) = self.chat_cache.get(&session_id_str) {
+        // Use composite key (session_id + day) for caching
+        let cache_key = cache_key(&session_id_str, current_day.as_deref());
+
+        let total_lines = if let Some(cached) = self.chat_cache.get(&cache_key) {
             let messages = cached.messages.clone();
-            if let Some(pos) = self
-                .chat_cache_order
-                .iter()
-                .position(|s| s == &session_id_str)
-            {
+            if let Some(pos) = self.chat_cache_order.iter().position(|s| s == &cache_key) {
                 self.chat_cache_order.remove(pos);
             }
-            self.chat_cache_order.push(session_id_str.clone());
+            self.chat_cache_order.push(cache_key.clone());
 
             // Open modal with cached messages and session stat
             self.modal.open_session(
@@ -602,6 +622,7 @@ impl App {
                 self.session_message_files
                     .get(&session_id_str)
                     .map(|v| v.as_slice()),
+                current_day.as_deref(),
             );
             cached.total_lines
         } else {
@@ -609,7 +630,8 @@ impl App {
                 .session_message_files
                 .get(&session_id_str)
                 .map(|v| v.as_slice());
-            let messages = load_session_chat(&session_id_str, files);
+            // Pass current day to filter messages to only show this day's messages
+            let messages = load_session_chat(&session_id_str, files, current_day.as_deref());
             let total_lines: u16 = messages.iter().map(calculate_message_rendered_lines).sum();
             let blank_lines = if !messages.is_empty() {
                 messages.len() - 1
@@ -628,17 +650,22 @@ impl App {
             }
 
             self.chat_cache.insert(
-                session_id_str.clone(),
+                cache_key.clone(),
                 CachedChat {
                     messages: messages.clone(),
                     total_lines,
                 },
             );
-            self.chat_cache_order.push(session_id_str.clone());
+            self.chat_cache_order.push(cache_key.clone());
 
             // Open modal with loaded messages and session stat
-            self.modal
-                .open_session(&session_id_str, messages, &session_stat, files);
+            self.modal.open_session(
+                &session_id_str,
+                messages,
+                &session_stat,
+                files,
+                current_day.as_deref(),
+            );
             total_lines
         };
 
@@ -1621,11 +1648,10 @@ impl App {
         let mut items = Vec::with_capacity(self.day_list.len());
         let cost_width = self.max_cost_width();
         let sess_width = 4usize;
-        let fixed_width =
-            3 + 7 + 4 + 7 + 4 + 3 + (cost_width + 1) + 3 + (sess_width + 5);
+        let fixed_width = 3 + 7 + 4 + 7 + 4 + 3 + (cost_width + 1) + 3 + (sess_width + 5);
         let inner_width = area.width.saturating_sub(2);
-        let available = inner_width
-            .saturating_sub((fixed_width + 2).min(u16::MAX as usize) as u16) as usize;
+        let available =
+            inner_width.saturating_sub((fixed_width + 2).min(u16::MAX as usize) as u16) as usize;
         let name_width = available.max(8);
 
         for day in &self.day_list {
@@ -1723,11 +1749,10 @@ impl App {
         let mut items = Vec::with_capacity(self.model_usage.len());
         let cost_width = self.max_cost_width();
         let sess_width = 4usize;
-        let fixed_width =
-            3 + 7 + 4 + 7 + 4 + 3 + (cost_width + 1) + 3 + (sess_width + 5);
+        let fixed_width = 3 + 7 + 4 + 7 + 4 + 3 + (cost_width + 1) + 3 + (sess_width + 5);
         let inner_width = area.width.saturating_sub(2);
-        let available = inner_width
-            .saturating_sub((fixed_width + 2).min(u16::MAX as usize) as u16) as usize;
+        let available =
+            inner_width.saturating_sub((fixed_width + 2).min(u16::MAX as usize) as u16) as usize;
         let name_width = available.max(8);
 
         for m in &self.model_usage {
@@ -1814,7 +1839,7 @@ impl App {
             LeftPanel::Days => {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(11), Constraint::Min(0)])
+                    .constraints([Constraint::Length(10), Constraint::Min(0)])
                     .split(area);
 
                 // Cache right panel rects for Days view
@@ -1823,7 +1848,6 @@ impl App {
                 self.cached_rects.tools = None;
 
                 let detail_highlighted = is_focused && self.right_panel == RightPanel::Detail;
-                let detail_active = detail_highlighted && self.is_active;
                 self.render_session_detail(
                     frame,
                     chunks[0],
@@ -1832,7 +1856,7 @@ impl App {
                     } else {
                         Style::default().fg(Color::DarkGray)
                     },
-                    detail_active,
+                    detail_highlighted,
                 );
 
                 let list_highlighted = is_focused && self.right_panel == RightPanel::List;
@@ -1947,7 +1971,7 @@ impl App {
         area: Rect,
         border_style: Style,
         is_highlighted: bool,
-        is_active: bool,
+        _is_active: bool,
     ) {
         let selected_model = self
             .selected_model_index
@@ -2247,17 +2271,6 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Center),
-            )
-            .title_bottom(
-                Line::from(Span::styled(
-                    if ranking_focused && is_active {
-                        " ↑↓: scroll │ Esc: back "
-                    } else {
-                        " "
-                    },
-                    Style::default().fg(Color::DarkGray),
-                ))
-                .alignment(Alignment::Center),
             );
 
         let ranking_inner = ranking_block.inner(bottom_chunks[1]);
@@ -2286,7 +2299,12 @@ impl App {
                 };
                 let percent_text = format!("{:>5.1}%", percentage);
                 let token_text = format_number(model.tokens.total());
-                let suffix = format!(" {} ({:>width$})", percent_text, token_text, width = max_token_len);
+                let suffix = format!(
+                    " {} ({:>width$})",
+                    percent_text,
+                    token_text,
+                    width = max_token_len
+                );
                 let suffix_len = suffix.chars().count() as u16;
                 let bar_max_width = bar_available_width.saturating_sub(suffix_len) as usize;
                 let bar_width = if grand_total > 0 {
@@ -2358,11 +2376,34 @@ impl App {
         frame: &mut Frame,
         area: Rect,
         border_style: Style,
-        _is_active: bool,
+        is_highlighted: bool,
     ) {
         let session = self.selected_session();
-        // Optimized: pre-allocate with known capacity (9 lines for session info)
-        let mut final_lines = Vec::with_capacity(9);
+        // Optimized: pre-allocate with known capacity (8 lines for session info)
+        let mut final_lines = Vec::with_capacity(8);
+        
+        // Build title for the panel: show session ID and continuation info
+        let panel_title = if let Some(s) = &session {
+            if s.is_continuation {
+                if let Some(first_date) = &s.first_created_date {
+                    format!(" {} [Continue from {}] ", s.id, first_date)
+                } else {
+                    format!(" {} [Continued] ", s.id)
+                }
+            } else {
+                format!(" {} ", s.id)
+            }
+        } else {
+            " SESSION INFO ".to_string()
+        };
+        
+        // Title color: cyan when highlighted/selected, gray otherwise
+        let title_color = if is_highlighted {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+        
         if let Some(s) = session {
             let title = self
                 .session_titles
@@ -2393,19 +2434,6 @@ impl App {
 
             final_lines.push(Line::from(vec![
                 Span::styled(
-                    "Session ID   ",
-                    Style::default().fg(Color::Rgb(180, 180, 180)),
-                ),
-                Span::styled(
-                    s.id.as_ref(),
-                    Style::default()
-                        .fg(Color::Rgb(150, 150, 150))
-                        .add_modifier(Modifier::ITALIC),
-                ),
-            ]));
-
-            final_lines.push(Line::from(vec![
-                Span::styled(
                     "Project      ",
                     Style::default().fg(Color::Rgb(180, 180, 180)),
                 ),
@@ -2427,7 +2455,7 @@ impl App {
             let mut current_len = 0;
             let max_len = area.width.saturating_sub(15) as usize;
             for (i, m) in models.iter().enumerate() {
-                let name = m; // Show full model name with provider (e.g., "prox/glm-4.7")
+                let name = m;
                 let display = if i == 0 {
                     name.to_string()
                 } else {
@@ -2520,9 +2548,9 @@ impl App {
                     .border_style(border_style)
                     .title(
                         Line::from(Span::styled(
-                            " SESSION INFO ",
+                            panel_title,
                             Style::default()
-                                .fg(Color::Yellow)
+                                .fg(title_color)
                                 .add_modifier(Modifier::BOLD),
                         ))
                         .alignment(Alignment::Center),

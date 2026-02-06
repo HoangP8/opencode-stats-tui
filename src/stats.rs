@@ -77,6 +77,10 @@ pub struct SessionStat {
     pub path_cwd: Box<str>,
     pub path_root: Box<str>,
     pub file_diffs: Vec<FileDiff>,
+    // Session continuation tracking
+    pub original_session_id: Option<Box<str>>,
+    pub first_created_date: Option<Box<str>>,
+    pub is_continuation: bool,
 }
 
 impl SessionStat {
@@ -93,6 +97,9 @@ impl SessionStat {
             path_cwd: String::new().into_boxed_str(),
             path_root: String::new().into_boxed_str(),
             file_diffs: Vec::new(),
+            original_session_id: None,
+            first_created_date: None,
+            is_continuation: false,
         }
     }
 
@@ -287,6 +294,8 @@ pub(crate) struct TokensData {
     pub(crate) cache: Option<CacheData>,
 }
 
+// DiffItem and Summary are used to extract cumulative diff state from messages
+// for per-day breakdown (since session_diff only has final state)
 #[derive(Deserialize, Default, Clone)]
 pub(crate) struct DiffItem {
     pub(crate) file: Option<LenientString>,
@@ -425,6 +434,7 @@ pub(crate) struct Message {
     pub(crate) model: Option<ModelData>,
     pub(crate) time: Option<TimeData>,
     pub(crate) tokens: Option<TokensData>,
+    #[allow(dead_code)]
     #[serde(default, deserialize_with = "deserialize_lenient_summary")]
     pub(crate) summary: Option<Summary>,
     pub(crate) path: Option<PathData>,
@@ -540,6 +550,27 @@ pub fn get_day(ts: Option<i64>) -> String {
         }
         None => "Unknown".into(),
     }
+}
+
+/// Detect if a session is a continuation from a previous day
+/// Returns (original_session_id, first_created_date) if continuation detected
+#[inline]
+fn detect_session_continuation(
+    session_id: &str,
+    current_day: &str,
+    all_session_first_days: &HashMap<String, String>,
+) -> (Option<Box<str>>, Option<Box<str>>) {
+    // Check if this session was first seen on a different day
+    if let Some(first_day) = all_session_first_days.get(session_id) {
+        if first_day != current_day {
+            // This is a continuation - session started on a different day
+            return (
+                Some(session_id.to_string().into_boxed_str()),
+                Some(first_day.clone().into_boxed_str()),
+            );
+        }
+    }
+    (None, None)
 }
 
 #[inline]
@@ -700,6 +731,41 @@ fn load_session_diff_map() -> HashMap<String, Vec<FileDiff>> {
         .collect()
 }
 
+/// Compute incremental diffs: current cumulative state minus previous cumulative state
+/// For each file in current, subtract the values from previous (if present)
+#[inline]
+fn compute_incremental_diffs(current: &[FileDiff], previous: &[FileDiff]) -> Vec<FileDiff> {
+    // Build lookup for previous state
+    let prev_map: HashMap<&str, &FileDiff> =
+        previous.iter().map(|d| (d.path.as_ref(), d)).collect();
+
+    current
+        .iter()
+        .filter_map(|curr| {
+            let (adds, dels, status) = if let Some(prev) = prev_map.get(curr.path.as_ref()) {
+                // File existed before: compute delta
+                let a = curr.additions.saturating_sub(prev.additions);
+                let d = curr.deletions.saturating_sub(prev.deletions);
+                // If no change on this day, skip
+                if a == 0 && d == 0 {
+                    return None;
+                }
+                (a, d, curr.status.clone())
+            } else {
+                // New file on this day
+                (curr.additions, curr.deletions, curr.status.clone())
+            };
+
+            Some(FileDiff {
+                path: curr.path.clone(),
+                additions: adds,
+                deletions: dels,
+                status,
+            })
+        })
+        .collect()
+}
+
 pub fn collect_stats() -> Stats {
     let mut totals = Totals::default();
     let session_titles = load_session_titles();
@@ -714,12 +780,15 @@ pub fn collect_stats() -> Stats {
     let mut session_message_files: HashMap<String, Vec<std::path::PathBuf>> =
         HashMap::with_capacity(128);
     let mut processed_message_ids: HashSet<Box<str>> = HashSet::with_capacity(msg_files.len());
+    // Track first day each session was seen for continuation detection
+    let mut session_first_days: HashMap<String, String> = HashMap::with_capacity(64);
 
     struct FullMessageData {
         msg: Message,
         tools: Vec<Box<str>>,
         path: std::path::PathBuf,
         message_id: Box<str>,
+        cumulative_diffs: Vec<FileDiff>, // Cumulative diff state from summary.diffs
     }
 
     let mut processed_data: Vec<FullMessageData> = msg_files
@@ -754,11 +823,40 @@ pub fn collect_stats() -> Stats {
                 }
             }
 
+            // Extract cumulative diff state from message summary
+            let cumulative_diffs: Vec<FileDiff> = msg
+                .summary
+                .as_ref()
+                .and_then(|s| s.diffs.as_ref())
+                .map(|diffs| {
+                    diffs
+                        .iter()
+                        .map(|d| FileDiff {
+                            path: d
+                                .file
+                                .as_ref()
+                                .map(|s| s.0.clone())
+                                .unwrap_or_default()
+                                .into_boxed_str(),
+                            additions: d.additions.map(|v| *v).unwrap_or(0),
+                            deletions: d.deletions.map(|v| *v).unwrap_or(0),
+                            status: d
+                                .status
+                                .as_ref()
+                                .map(|s| s.0.clone())
+                                .unwrap_or_else(|| "modified".into())
+                                .into_boxed_str(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
             Some(FullMessageData {
                 msg,
                 tools,
                 path: p.clone(),
                 message_id,
+                cumulative_diffs,
             })
         })
         .collect();
@@ -771,8 +869,17 @@ pub fn collect_stats() -> Stats {
             .unwrap_or(0)
     });
 
+    // Track last message's cumulative diff state per session per day
+    // Key: "session_id|day" -> cumulative diffs from last message of that day
+    // Using concatenated string key to enable zero-allocation lookups
+    let mut session_day_last_diffs: HashMap<Box<str>, Vec<FileDiff>> = HashMap::with_capacity(64);
+
     for data in processed_data {
-        processed_message_ids.insert(data.message_id);
+        // Skip duplicate messages (same message_id seen before)
+        if !processed_message_ids.insert(data.message_id) {
+            continue;
+        }
+        
         let msg = &data.msg;
         let session_id: String = msg
             .session_id
@@ -780,11 +887,13 @@ pub fn collect_stats() -> Stats {
             .map(|s| s.0.clone())
             .unwrap_or_default();
 
+        // Optimization: avoid allocation if key already exists
         if !session_id.is_empty() {
-            session_message_files
-                .entry(session_id.clone())
-                .or_default()
-                .push(data.path);
+            if let Some(files) = session_message_files.get_mut(&session_id) {
+                files.push(data.path);
+            } else {
+                session_message_files.insert(session_id.clone(), vec![data.path]);
+            }
         }
 
         let ts = msg.time.as_ref().and_then(|t| t.created.map(|v| *v));
@@ -792,7 +901,15 @@ pub fn collect_stats() -> Stats {
         let model_id = get_model_id(msg);
         let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
 
-        totals.sessions.insert(session_id.clone().into_boxed_str());
+        // Track first day session was seen for continuation detection
+        if !session_id.is_empty() && !session_first_days.contains_key(&session_id) {
+            session_first_days.insert(session_id.clone(), day.clone());
+        }
+
+        // Optimization: only insert if not already present (avoid allocation on common path)
+        if !session_id.is_empty() && !totals.sessions.contains(session_id.as_str()) {
+            totals.sessions.insert(session_id.clone().into_boxed_str());
+        }
         totals.messages += 1;
         totals.cost += cost;
         add_tokens(&mut totals.tokens, &msg.tokens);
@@ -815,12 +932,17 @@ pub fn collect_stats() -> Stats {
             }
         });
         model_entry.messages += 1;
-        model_entry
-            .sessions
-            .insert(session_id.clone().into_boxed_str());
+        // Optimization: only insert if not already present (avoid allocation on common path)
+        if !session_id.is_empty() && !model_entry.sessions.contains(session_id.as_str()) {
+            model_entry.sessions.insert(session_id.clone().into_boxed_str());
+        }
         model_entry.cost += cost;
         add_tokens(&mut model_entry.tokens, &msg.tokens);
-        if let Some(agent) = msg.agent.as_ref().map(|s| s.0.as_str()).filter(|s| !s.is_empty())
+        if let Some(agent) = msg
+            .agent
+            .as_ref()
+            .map(|s| s.0.as_str())
+            .filter(|s| !s.is_empty())
         {
             *model_entry
                 .agents
@@ -828,15 +950,39 @@ pub fn collect_stats() -> Stats {
                 .or_insert(0) += 1;
         }
 
-        let day_stat = per_day.entry(day).or_default();
+        // Optimization: avoid allocation if day already exists
+        let day_stat = if let Some(existing) = per_day.get_mut(&day) {
+            existing
+        } else {
+            per_day.insert(day.clone(), DayStat::default());
+            per_day.get_mut(&day).unwrap()
+        };
         day_stat.messages += 1;
         day_stat.cost += cost;
         add_tokens(&mut day_stat.tokens, &msg.tokens);
 
-        let session_stat_arc = day_stat
-            .sessions
-            .entry(session_id.clone())
-            .or_insert_with(|| Arc::new(SessionStat::new(session_id.clone())));
+        // Get or create the session for THIS specific day (each day has its own session entry)
+        // Optimization: avoid allocation if session already exists for this day
+        let session_stat_arc = if let Some(existing) = day_stat.sessions.get_mut(&session_id) {
+            existing
+        } else {
+            // Detect if this is a continuation from a previous day
+            let (original_id, first_created) = if !session_id.is_empty() {
+                detect_session_continuation(&session_id, &day, &session_first_days)
+            } else {
+                (None, None)
+            };
+
+            let is_continued = original_id.is_some();
+            let mut stat = SessionStat::new(session_id.clone());
+            stat.original_session_id = original_id;
+            stat.first_created_date = first_created;
+            stat.is_continuation = is_continued;
+            day_stat.sessions.insert(session_id.clone(), Arc::new(stat));
+            day_stat.sessions.get_mut(&session_id).unwrap()
+        };
+
+        // Accumulate data for this day's session (separate from other days)
         let session_stat = Arc::make_mut(session_stat_arc);
         session_stat.messages += 1;
         session_stat.cost += cost;
@@ -848,10 +994,11 @@ pub fn collect_stats() -> Stats {
             }
         }
 
-        for t_box in data.tools {
-            *totals.tools.entry(t_box.clone()).or_insert(0) += 1;
-            *session_stat.tools.entry(t_box.clone()).or_insert(0) += 1;
-            *model_entry.tools.entry(t_box).or_insert(0) += 1;
+        // Optimization: reduce clones from 2 to 1 per tool
+        for t in data.tools {
+            *totals.tools.entry(t.clone()).or_insert(0) += 1;
+            *session_stat.tools.entry(t.clone()).or_insert(0) += 1;
+            *model_entry.tools.entry(t).or_insert(0) += 1;
         }
 
         if let Some(p) = &msg.path {
@@ -863,53 +1010,103 @@ pub fn collect_stats() -> Stats {
             }
         }
 
-        if let Some(summary) = &msg.summary {
-            if let Some(diffs) = &summary.diffs {
-                for item in diffs {
-                    let path = item.file.as_ref().map(|s| s.as_ref()).unwrap_or("unknown");
-                    let adds = item.additions.map(|v| *v).unwrap_or(0);
-                    let dels = item.deletions.map(|v| *v).unwrap_or(0);
-                    let status = item
-                        .status
-                        .as_ref()
-                        .map(|s| s.as_ref())
-                        .unwrap_or("modified");
-                    if let Some(e) = session_stat
-                        .file_diffs
-                        .iter_mut()
-                        .find(|d| &*d.path == path)
-                    {
-                        e.additions += adds;
-                        e.deletions += dels;
-                        if status != "modified" {
-                            e.status = status.into();
-                        }
-                    } else {
-                        session_stat.file_diffs.push(FileDiff {
-                            path: path.into(),
-                            additions: adds,
-                            deletions: dels,
-                            status: status.into(),
-                        });
-                    }
-                }
-            }
+        // Track cumulative diff state from last message of each session per day
+        // Since messages are sorted by time, later messages overwrite earlier ones
+        if !session_id.is_empty() && !data.cumulative_diffs.is_empty() {
+            let key: Box<str> = format!("{}|{}", session_id, day).into_boxed_str();
+            session_day_last_diffs.insert(key, data.cumulative_diffs);
         }
     }
 
-    for day in per_day.values_mut() {
-        for sess_arc in day.sessions.values_mut() {
+    // Precompute diff totals from session_diff_map for global totals
+    let precomputed_diff_totals: HashMap<&str, (u64, u64)> = session_diff_map
+        .iter()
+        .map(|(id, diffs)| {
+            let adds: u64 = diffs.iter().map(|d| d.additions).sum();
+            let dels: u64 = diffs.iter().map(|d| d.deletions).sum();
+            (id.as_str(), (adds, dels))
+        })
+        .collect();
+
+    // Build sorted list of days per session to compute previous day's cumulative state
+    let mut session_sorted_days: HashMap<Box<str>, Vec<Box<str>>> = HashMap::with_capacity(64);
+    for key in session_day_last_diffs.keys() {
+        if let Some((session_id, day)) = key.split_once('|') {
+            session_sorted_days
+                .entry(session_id.into())
+                .or_insert_with(Vec::new)
+                .push(day.into());
+        }
+    }
+    for days in session_sorted_days.values_mut() {
+        days.sort_unstable();
+    }
+
+    // Track which session IDs have been counted in global totals
+    let mut counted_session_diffs: HashSet<Box<str>> = HashSet::with_capacity(64);
+
+    for (day_str, day_stat) in per_day.iter_mut() {
+        for sess_arc in day_stat.sessions.values_mut() {
+            let sess_id: Box<str> = sess_arc.id.clone();
             let sess = Arc::make_mut(sess_arc);
-            if let Some(diffs) = session_diff_map.get(sess.id.as_ref()) {
-                sess.file_diffs = diffs.clone();
+
+            // Build lookup key once: "session_id|day"
+            let lookup_key: Box<str> = format!("{}|{}", sess_id, day_str).into_boxed_str();
+
+            // Get cumulative diff state from last message of THIS day
+            let current_day_diffs = session_day_last_diffs.get(&lookup_key).cloned();
+
+            if let Some(mut diffs) = current_day_diffs {
+                // For continuation sessions, compute incremental diffs
+                // by subtracting previous day's cumulative state
+                if sess.is_continuation {
+                    if let Some(sorted_days) = session_sorted_days.get(&sess_id) {
+                        // Find the previous day for this session
+                        if let Some(pos) = sorted_days.iter().position(|d| d.as_ref() == day_str) {
+                            if pos > 0 {
+                                let prev_day = &sorted_days[pos - 1];
+                                let prev_key: Box<str> =
+                                    format!("{}|{}", sess_id, prev_day).into_boxed_str();
+                                if let Some(prev_diffs) = session_day_last_diffs.get(&prev_key) {
+                                    // Compute incremental: current - previous
+                                    diffs = compute_incremental_diffs(&diffs, prev_diffs);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                sort_file_diffs(&mut diffs);
+                let adds: u64 = diffs.iter().map(|d| d.additions).sum();
+                let dels: u64 = diffs.iter().map(|d| d.deletions).sum();
+                sess.file_diffs = diffs;
+                sess.diffs.additions = adds;
+                sess.diffs.deletions = dels;
+            } else if let Some(final_diffs) = session_diff_map.get(sess_id.as_ref()) {
+                // Fallback to session_diff file for sessions without message-level diffs
+                // Only use for non-continuation (original day)
+                if !sess.is_continuation {
+                    sess.file_diffs = final_diffs.clone();
+                    sort_file_diffs(&mut sess.file_diffs);
+                    if let Some(&(adds, dels)) = precomputed_diff_totals.get(sess_id.as_ref()) {
+                        sess.diffs.additions = adds;
+                        sess.diffs.deletions = dels;
+                    }
+                }
             }
-            sort_file_diffs(&mut sess.file_diffs);
-            sess.diffs.additions = sess.file_diffs.iter().map(|d| d.additions).sum();
-            sess.diffs.deletions = sess.file_diffs.iter().map(|d| d.deletions).sum();
-            day.diffs.additions += sess.diffs.additions;
-            day.diffs.deletions += sess.diffs.deletions;
-            totals.diffs.additions += sess.diffs.additions;
-            totals.diffs.deletions += sess.diffs.deletions;
+
+            // Add to day totals
+            day_stat.diffs.additions += sess.diffs.additions;
+            day_stat.diffs.deletions += sess.diffs.deletions;
+
+            // Global totals: use session_diff (final state) once per session
+            if !counted_session_diffs.contains(sess_id.as_ref()) {
+                if let Some(&(adds, dels)) = precomputed_diff_totals.get(sess_id.as_ref()) {
+                    totals.diffs.additions += adds;
+                    totals.diffs.deletions += dels;
+                }
+                counted_session_diffs.insert(sess_id);
+            }
         }
     }
 
@@ -929,6 +1126,7 @@ pub fn collect_stats() -> Stats {
 pub fn load_session_chat(
     session_id: &str,
     files: Option<&[std::path::PathBuf]>,
+    day_filter: Option<&str>, // Only load messages from this specific day
 ) -> Vec<ChatMessage> {
     let part_path_str = get_storage_path("part");
     let part_root = Path::new(&part_path_str);
@@ -938,6 +1136,15 @@ pub fn load_session_chat(
             .filter_map(|p| {
                 let bytes = fs::read(p).ok()?;
                 let msg: Message = serde_json::from_slice(&bytes).ok()?;
+
+                // Filter by day if specified
+                if let Some(target_day) = day_filter {
+                    let msg_day = get_day(msg.time.as_ref().and_then(|t| t.created.map(|v| *v)));
+                    if msg_day != target_day {
+                        return None;
+                    }
+                }
+
                 Some(msg)
             })
             .collect()
@@ -953,6 +1160,15 @@ pub fn load_session_chat(
                 if msg.session_id.as_ref().map(|s| s.as_ref()) != Some(session_id) {
                     return None;
                 }
+
+                // Filter by day if specified
+                if let Some(target_day) = day_filter {
+                    let msg_day = get_day(msg.time.as_ref().and_then(|t| t.created.map(|v| *v)));
+                    if msg_day != target_day {
+                        return None;
+                    }
+                }
+
                 Some(msg)
             })
             .collect()
@@ -1067,12 +1283,22 @@ pub struct SessionDetails {
 pub fn load_session_details(
     session_id: &str,
     files: Option<&[std::path::PathBuf]>,
+    day_filter: Option<&str>, // Only load messages from this specific day
 ) -> SessionDetails {
     let model_map: HashMap<Box<str>, ModelTokenStats> = if let Some(f) = files {
         f.par_iter()
             .filter_map(|p| {
                 let bytes = fs::read(p).ok()?;
                 let msg: Message = serde_json::from_slice(&bytes).ok()?;
+
+                // Filter by day if specified
+                if let Some(target_day) = day_filter {
+                    let msg_day = get_day(msg.time.as_ref().and_then(|t| t.created.map(|v| *v)));
+                    if msg_day != target_day {
+                        return None;
+                    }
+                }
+
                 let model_id = get_model_id(&msg);
                 let mut tokens = Tokens::default();
                 add_tokens(&mut tokens, &msg.tokens);
@@ -1124,6 +1350,14 @@ pub fn load_session_details(
                 let msg: Message = serde_json::from_slice(&bytes).ok()?;
                 if msg.session_id.as_ref().map(|s| s.as_ref()) != Some(session_id) {
                     return None;
+                }
+
+                // Filter by day if specified
+                if let Some(target_day) = day_filter {
+                    let msg_day = get_day(msg.time.as_ref().and_then(|t| t.created.map(|v| *v)));
+                    if msg_day != target_day {
+                        return None;
+                    }
                 }
 
                 let model_id = get_model_id(&msg);

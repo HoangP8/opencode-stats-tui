@@ -64,8 +64,9 @@ impl SessionModal {
         chat_messages: Vec<ChatMessage>,
         session_stat: &crate::stats::SessionStat,
         files: Option<&[std::path::PathBuf]>,
+        day_filter: Option<&str>, // Filter session details by day
     ) {
-        let details = load_session_details(session_id, files);
+        let details = load_session_details(session_id, files, day_filter);
         self.session_details = Some(details);
         self.current_session = Some(session_stat.clone());
         self.chat_messages = chat_messages;
@@ -406,22 +407,14 @@ impl SessionModal {
             .map(|t| t.replace("New session - ", ""))
             .unwrap_or_else(|| "Untitled".to_string());
 
-        // Title row with full session ID
-        let mut title_spans = Vec::with_capacity(2);
-        title_spans.push(Span::styled(
-            safe_truncate(
-                &title,
-                (area.width.saturating_sub(session.id.len() as u16 + 5)) as usize,
-            ),
+        // Title row - simple, clean display (session ID shown in panel title)
+        lines.push(Line::from(Span::styled(
+            safe_truncate(&title, (area.width.saturating_sub(4)) as usize),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
-        ));
-        title_spans.push(Span::styled(
-            format!(" [{}]", &session.id),
-            Style::default().fg(Color::DarkGray),
-        ));
-        lines.push(Line::from(title_spans));
+        )));
+
         lines.push(Line::from(""));
 
         // Model usage section
@@ -682,13 +675,24 @@ impl SessionModal {
             .take(visible_height)
             .collect();
 
+        // Build title: show session ID and continuation info
+        let title_text = if session.is_continuation {
+            if let Some(first_date) = &session.first_created_date {
+                format!(" {} [Continue from {}] ", session.id, first_date)
+            } else {
+                format!(" {} [Continued] ", session.id)
+            }
+        } else {
+            format!(" {} ", session.id)
+        };
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
             .style(Style::default().bg(Color::Rgb(10, 10, 15)))
             .title(
                 Line::from(Span::styled(
-                    " SESSION INFO ",
+                    title_text,
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
