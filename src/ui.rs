@@ -107,6 +107,7 @@ pub struct App {
     session_list: Vec<Arc<crate::stats::SessionStat>>,
     session_list_state: ListState,
     cached_session_items: Vec<ListItem<'static>>, // Cached rendered list items
+    cached_session_width: u16,
     chat_cache: HashMap<String, CachedChat>,
     chat_cache_order: Vec<String>,
     chat_scroll: u16,
@@ -170,12 +171,19 @@ fn usage_list_row(
     output_tokens: u64,
     cost: f64,
     session_count: usize,
+    name_width: usize,
+    cost_width: usize,
+    sess_width: usize,
 ) -> Line<'static> {
     let in_val = format_number(input_tokens);
     let out_val = format_number(output_tokens);
 
     // Optimized: use format! with padding instead of manual loop
-    let name_display = format!("{:<17}", name.chars().take(17).collect::<String>());
+    let name_display = format!(
+        "{:<width$}",
+        name.chars().take(name_width).collect::<String>(),
+        width = name_width
+    );
 
     // Optimized: combine nested format! calls into single format
     let spans = vec![
@@ -190,12 +198,12 @@ fn usage_list_row(
         Span::styled(" out", Style::default().fg(Color::Rgb(180, 180, 180))),
         Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
         Span::styled(
-            format!("${:>7.2}", cost),
+            format!("${:>width$.2}", cost, width = cost_width),
             Style::default().fg(Color::Yellow),
         ),
         Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
         Span::styled(
-            format!("{:>4} sess", session_count),
+            format!("{:>width$} sess", session_count, width = sess_width),
             Style::default().fg(Color::Cyan),
         ),
     ];
@@ -352,6 +360,7 @@ impl App {
             tool_usage,
             ranking_scroll: 0,
             cached_session_items: Vec::new(),
+            cached_session_width: 0,
             cached_day_strings: HashMap::with_capacity(32),
             session_lookup: HashMap::with_capacity(256),
 
@@ -385,6 +394,21 @@ impl App {
         app
     }
 
+    fn max_cost_width(&self) -> usize {
+        let mut max_len = 8usize; // allow xxxxx.xx
+        for day in &self.day_list {
+            if let Some(stat) = self.per_day.get(day) {
+                let s = format!("{:.2}", stat.display_cost());
+                max_len = max_len.max(s.len());
+            }
+        }
+        for m in self.model_usage.iter() {
+            let s = format!("{:.2}", m.cost);
+            max_len = max_len.max(s.len());
+        }
+        max_len
+    }
+
     fn update_session_list(&mut self) {
         self.session_list.clear();
         if let Some(day) = self.selected_day() {
@@ -402,12 +426,14 @@ impl App {
         }
         // Clear cached chat session since session list changed
         self.current_chat_session_id = None;
-        // Rebuild cached session items to avoid recomputing on every render
-        self.rebuild_cached_session_items();
+        // Clear cached items; rebuild on render with correct width
+        self.cached_session_items.clear();
+        self.cached_session_width = 0;
     }
 
     /// Rebuild cached session list items to avoid heavy computation on every render
-    fn rebuild_cached_session_items(&mut self) {
+    fn rebuild_cached_session_items(&mut self, width: u16) {
+        self.cached_session_width = width;
         let max_cost_len = self
             .session_list
             .iter()
@@ -415,6 +441,23 @@ impl App {
             .max()
             .unwrap_or(0)
             .max(8);
+        let max_models_len = self
+            .session_list
+            .iter()
+            .map(|s| {
+                let c = s.models.len();
+                if c == 1 {
+                    "1 model".len()
+                } else {
+                    format!("{} models", c).len()
+                }
+            })
+            .max()
+            .unwrap_or(7);
+        let fixed_width =
+            3 + 8 + 3 + 8 + 3 + (max_cost_len + 1) + 3 + 8 + 3 + max_models_len + 2;
+        let title_width = width
+            .saturating_sub((fixed_width).min(u16::MAX as usize) as u16) as usize;
         self.cached_session_items = self
             .session_list
             .iter()
@@ -430,12 +473,17 @@ impl App {
                 } else {
                     format!("{} models", model_count)
                 };
+                let model_text = format!("{:>width$}", model_text, width = max_models_len);
                 let additions = s.diffs.additions;
                 let deletions = s.diffs.deletions;
 
                 ListItem::new(Line::from(vec![
                     Span::styled(
-                        format!("{:<18}", title.chars().take(18).collect::<String>()),
+                        format!(
+                            "{:<width$}",
+                            title.chars().take(title_width.max(8)).collect::<String>(),
+                            width = title_width.max(8)
+                        ),
                         Style::default().fg(Color::White),
                     ),
                     Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
@@ -1571,6 +1619,14 @@ impl App {
     ) {
         // Pre-allocate Vec with capacity to avoid reallocations
         let mut items = Vec::with_capacity(self.day_list.len());
+        let cost_width = self.max_cost_width();
+        let sess_width = 4usize;
+        let fixed_width =
+            3 + 7 + 4 + 7 + 4 + 3 + (cost_width + 1) + 3 + (sess_width + 5);
+        let inner_width = area.width.saturating_sub(2);
+        let available = inner_width
+            .saturating_sub((fixed_width + 2).min(u16::MAX as usize) as u16) as usize;
+        let name_width = available.max(8);
 
         for day in &self.day_list {
             // Optimized: single HashMap lookup instead of multiple map calls
@@ -1585,8 +1641,8 @@ impl App {
                 (0, 0, 0, 0.0)
             };
 
-            let in_val = format_number(input);
-            let out_val = format_number(output);
+            let _in_val = format_number(input);
+            let _out_val = format_number(output);
 
             // Use cached day string (Phase 2 optimization - avoids date parsing on every render)
             let day_with_name = self
@@ -1595,49 +1651,16 @@ impl App {
                 .cloned()
                 .unwrap_or_else(|| day.clone());
 
-            // Pre-allocate spans Vec with exact capacity (10 spans)
-            let mut spans = Vec::with_capacity(10);
-            spans.push(Span::styled(
-                format!("{:<17}", day_with_name),
-                Style::default().fg(Color::White),
-            ));
-            spans.push(Span::styled(
-                " │ ",
-                Style::default().fg(Color::Rgb(180, 180, 180)),
-            ));
-            spans.push(Span::styled(
-                format!("{:>7}", in_val),
-                Style::default().fg(Color::Blue),
-            ));
-            spans.push(Span::styled(
-                " in ",
-                Style::default().fg(Color::Rgb(180, 180, 180)),
-            ));
-            spans.push(Span::styled(
-                format!("{:>7}", out_val),
-                Style::default().fg(Color::Magenta),
-            ));
-            spans.push(Span::styled(
-                " out",
-                Style::default().fg(Color::Rgb(180, 180, 180)),
-            ));
-            spans.push(Span::styled(
-                " │ ",
-                Style::default().fg(Color::Rgb(180, 180, 180)),
-            ));
-            spans.push(Span::styled(
-                format!("${:>7.2}", cost),
-                Style::default().fg(Color::Yellow),
-            ));
-            spans.push(Span::styled(
-                " │ ",
-                Style::default().fg(Color::Rgb(180, 180, 180)),
-            ));
-            spans.push(Span::styled(
-                format!("{:>4} sess", sess),
-                Style::default().fg(Color::Cyan),
-            ));
-            items.push(ListItem::new(Line::from(spans)));
+            items.push(ListItem::new(usage_list_row(
+                day_with_name,
+                input,
+                output,
+                cost,
+                sess,
+                name_width,
+                cost_width,
+                sess_width,
+            )));
         }
 
         let title_color = if is_highlighted {
@@ -1698,6 +1721,14 @@ impl App {
     ) {
         // Pre-allocate Vec with capacity to avoid reallocations
         let mut items = Vec::with_capacity(self.model_usage.len());
+        let cost_width = self.max_cost_width();
+        let sess_width = 4usize;
+        let fixed_width =
+            3 + 7 + 4 + 7 + 4 + 3 + (cost_width + 1) + 3 + (sess_width + 5);
+        let inner_width = area.width.saturating_sub(2);
+        let available = inner_width
+            .saturating_sub((fixed_width + 2).min(u16::MAX as usize) as u16) as usize;
+        let name_width = available.max(8);
 
         for m in &self.model_usage {
             // Show full model name with provider (e.g., "prox/glm-4.7")
@@ -1708,6 +1739,9 @@ impl App {
                 m.tokens.output,
                 m.display_cost(),
                 m.sessions.len(),
+                name_width,
+                cost_width,
+                sess_width,
             )));
         }
 
@@ -2506,6 +2540,10 @@ impl App {
         is_highlighted: bool,
         is_active: bool,
     ) {
+        let inner_width = area.width.saturating_sub(2);
+        if self.cached_session_width != inner_width || self.cached_session_items.is_empty() {
+            self.rebuild_cached_session_items(inner_width);
+        }
         // Use cached items to avoid recomputing on every render
         let items: Vec<ListItem> = self.cached_session_items.clone();
 
