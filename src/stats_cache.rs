@@ -16,8 +16,6 @@ pub struct CachedStats {
     pub stats: crate::stats::Stats,
     pub version: u64,
     pub file_hashes: HashMap<String, u64>,
-    #[serde(default)]
-    pub processed_message_ids: HashSet<Box<str>>,
 }
 
 /// Incremental updater for stats
@@ -47,7 +45,6 @@ impl StatsCache {
                 stats: crate::stats::Stats::default(),
                 version: 0,
                 file_hashes: HashMap::new(),
-                processed_message_ids: HashSet::new(),
             })),
         })
     }
@@ -64,9 +61,6 @@ impl StatsCache {
                                 stats_lock.stats.clone_from(&cached.stats);
                                 stats_lock.version = cached.version;
                                 stats_lock.file_hashes.clone_from(&cached.file_hashes);
-                                stats_lock
-                                    .processed_message_ids
-                                    .clone_from(&cached.processed_message_ids);
                                 return cached.stats.clone();
                             }
                         }
@@ -102,7 +96,7 @@ impl StatsCache {
         }
 
         let message_count = self.count_message_files_fast();
-        if cached.processed_message_ids.len() != message_count {
+        if cached.stats.processed_message_ids.len() != message_count {
             return false;
         }
 
@@ -175,27 +169,17 @@ impl StatsCache {
 
         if has_session_changes {
             cached.stats = crate::stats::collect_stats();
-            if let Ok(all_files) = self.list_all_files() {
-                cached.processed_message_ids = self.build_message_id_set(&all_files);
-            }
             for day_stat in cached.stats.per_day.values() {
                 for id in day_stat.sessions.keys() {
                     affected_sessions.insert(id.clone());
                 }
             }
         } else {
-            if cached.processed_message_ids.is_empty() {
-                if let Ok(all_files) = self.list_all_files() {
-                    cached.processed_message_ids = self.build_message_id_set(&all_files);
-                }
-            }
             for p in &paths {
                 if p.contains("message/") {
-                    if let Some(session_id) = self.incrementally_update_messages(
-                        &mut cached.stats,
-                        p,
-                        &mut cached.processed_message_ids,
-                    ) {
+                    if let Some(session_id) =
+                        self.incrementally_update_messages(&mut cached.stats, p)
+                    {
                         affected_sessions.insert(session_id);
                     }
                 } else if p.contains("part/") {
@@ -236,7 +220,6 @@ impl StatsCache {
                 .filter_map(|f| self.compute_file_hash(f).map(|h| (f.clone(), h)))
                 .collect();
             cached.file_hashes = hashes;
-            cached.processed_message_ids = self.build_message_id_set(&files);
         }
 
         if let Ok(data) = serialize(&*cached) {
@@ -253,27 +236,6 @@ impl StatsCache {
             .ok()?
             .as_secs();
         Some(mod_time.wrapping_mul(31).wrapping_add(m.len()))
-    }
-
-    fn build_message_id_set(&self, files: &[String]) -> HashSet<Box<str>> {
-        files
-            .iter()
-            .filter(|p| Self::is_message_file(p))
-            .filter_map(|path| {
-                let bytes = fs::read(path).ok()?;
-                let msg = serde_json::from_slice::<crate::stats::Message>(&bytes).ok()?;
-                let message_id = match msg.id {
-                    Some(id) if !id.0.is_empty() => id.0.into_boxed_str(),
-                    _ => path.to_string().into_boxed_str(),
-                };
-                Some(message_id)
-            })
-            .collect()
-    }
-
-    #[inline]
-    fn is_message_file(path: &str) -> bool {
-        path.contains("/message/") && path.ends_with(".json")
     }
 
     fn list_all_files(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -325,7 +287,6 @@ impl StatsCache {
         &self,
         stats: &mut crate::stats::Stats,
         path: &str,
-        processed_message_ids: &mut HashSet<Box<str>>,
     ) -> Option<String> {
         let Ok(bytes) = fs::read(path) else {
             return None;
@@ -338,13 +299,22 @@ impl StatsCache {
             Some(id) if !id.0.is_empty() => id.0.into_boxed_str(),
             _ => path.to_string().into_boxed_str(),
         };
-        if processed_message_ids.contains(&message_id) {
+        if stats.processed_message_ids.contains(&message_id) {
             return None;
         }
-        processed_message_ids.insert(message_id);
+        stats.processed_message_ids.insert(message_id);
 
         let session_id_lenient = msg.session_id.clone().unwrap_or_default();
         let session_id = session_id_lenient.0.clone();
+
+        if !session_id.is_empty() {
+            stats
+                .session_message_files
+                .entry(session_id.clone())
+                .or_default()
+                .push(PathBuf::from(path));
+        }
+
         let ts = msg.time.as_ref().and_then(|t| t.created.map(|v| *v));
         let day = crate::stats::get_day(ts);
         let model_id = crate::stats::get_model_id(&msg);
@@ -408,8 +378,17 @@ impl StatsCache {
                 sessions: [session_id.clone().into_boxed_str()].into(),
                 tokens: tokens_add,
                 tools: HashMap::new(),
+                agents: HashMap::new(),
                 cost,
             });
+        }
+        if let Some(agent) = msg.agent.as_ref().map(|s| s.0.as_str()).filter(|s| !s.is_empty())
+        {
+            if let Some(m) = stats.model_usage.iter_mut().find(|m| *m.name == *model_id) {
+                *m.agents
+                    .entry(agent.to_string().into_boxed_str())
+                    .or_insert(0) += 1;
+            }
         }
 
         let d = stats.per_day.entry(day).or_default();

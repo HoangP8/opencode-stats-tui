@@ -152,25 +152,13 @@ pub struct Stats {
     pub per_day: HashMap<String, DayStat>,
     pub session_titles: HashMap<String, String>,
     pub model_usage: Vec<ModelUsage>,
+    #[serde(default)]
+    pub session_message_files: HashMap<String, Vec<std::path::PathBuf>>,
+    #[serde(default)]
+    pub processed_message_ids: HashSet<Box<str>>,
 }
 
-impl Stats {
-    pub fn into_tuple(
-        self,
-    ) -> (
-        Totals,
-        HashMap<String, DayStat>,
-        HashMap<String, String>,
-        Vec<ModelUsage>,
-    ) {
-        (
-            self.totals,
-            self.per_day,
-            self.session_titles,
-            self.model_usage,
-        )
-    }
-}
+impl Stats {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelUsage {
@@ -182,6 +170,7 @@ pub struct ModelUsage {
     pub sessions: HashSet<Box<str>>,
     pub tokens: Tokens,
     pub tools: HashMap<Box<str>, u64>,
+    pub agents: HashMap<Box<str>, u64>,
     pub cost: f64,
 }
 
@@ -428,6 +417,7 @@ pub(crate) struct Message {
     #[serde(rename = "sessionID")]
     pub(crate) session_id: Option<LenientString>,
     pub(crate) role: Option<LenientString>,
+    pub(crate) agent: Option<LenientString>,
     #[serde(rename = "providerID")]
     pub(crate) provider_id: Option<LenientString>,
     #[serde(rename = "modelID")]
@@ -505,12 +495,23 @@ pub fn format_number(value: u64) -> String {
 pub fn format_number_full(value: u64) -> String {
     let s = value.to_string();
     let len = s.len();
+
+    // Fast path: numbers with 3 or fewer digits don't need commas
+    if len <= 3 {
+        return s;
+    }
+
+    // Optimized: use byte operations since to_string() always produces ASCII
     let mut result = String::with_capacity(len + (len - 1) / 3);
-    for (i, c) in s.chars().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
+    let bytes = s.as_bytes();
+
+    for (i, &byte) in bytes.iter().enumerate() {
+        // Add comma before every 3rd digit from the right
+        if i > 0 && (len - i) % 3 == 0 {
             result.push(',');
         }
-        result.push(c);
+        // Safe to use as char since we know it's ASCII
+        result.push(byte as char);
     }
     result
 }
@@ -710,10 +711,15 @@ pub fn collect_stats() -> Stats {
 
     let mut per_day: HashMap<String, DayStat> = HashMap::with_capacity(msg_files.len() / 20);
     let mut model_stats: HashMap<Box<str>, ModelUsage> = HashMap::with_capacity(8);
+    let mut session_message_files: HashMap<String, Vec<std::path::PathBuf>> =
+        HashMap::with_capacity(128);
+    let mut processed_message_ids: HashSet<Box<str>> = HashSet::with_capacity(msg_files.len());
 
     struct FullMessageData {
         msg: Message,
         tools: Vec<Box<str>>,
+        path: std::path::PathBuf,
+        message_id: Box<str>,
     }
 
     let mut processed_data: Vec<FullMessageData> = msg_files
@@ -722,11 +728,17 @@ pub fn collect_stats() -> Stats {
             let bytes = fs::read(p).ok()?;
             let msg: Message = serde_json::from_slice(&bytes).ok()?;
 
+            let message_id = match &msg.id {
+                Some(id) if !id.0.is_empty() => id.0.clone().into_boxed_str(),
+                _ => p.to_string_lossy().to_string().into_boxed_str(),
+            };
+
             let mut tools = Vec::new();
             if let Some(id) = &msg.id {
                 let id_str = &id.0;
                 if !id_str.is_empty() {
-                    if let Ok(entries) = fs::read_dir(part_root.join(id_str)) {
+                    let part_dir = part_root.join(id_str);
+                    if let Ok(entries) = fs::read_dir(part_dir) {
                         for entry in entries.flatten() {
                             if let Ok(bytes) = fs::read(entry.path()) {
                                 if let Ok(part) = serde_json::from_slice::<PartData>(&bytes) {
@@ -742,7 +754,12 @@ pub fn collect_stats() -> Stats {
                 }
             }
 
-            Some(FullMessageData { msg, tools })
+            Some(FullMessageData {
+                msg,
+                tools,
+                path: p.clone(),
+                message_id,
+            })
         })
         .collect();
 
@@ -755,12 +772,21 @@ pub fn collect_stats() -> Stats {
     });
 
     for data in processed_data {
+        processed_message_ids.insert(data.message_id);
         let msg = &data.msg;
         let session_id: String = msg
             .session_id
             .as_ref()
             .map(|s| s.0.clone())
             .unwrap_or_default();
+
+        if !session_id.is_empty() {
+            session_message_files
+                .entry(session_id.clone())
+                .or_default()
+                .push(data.path);
+        }
+
         let ts = msg.time.as_ref().and_then(|t| t.created.map(|v| *v));
         let day = get_day(ts);
         let model_id = get_model_id(msg);
@@ -772,11 +798,9 @@ pub fn collect_stats() -> Stats {
         add_tokens(&mut totals.tokens, &msg.tokens);
 
         let model_entry = model_stats.entry(model_id.clone()).or_insert_with(|| {
-            // Optimized: parse name once and reuse
             let name_str: &str = &model_id;
             let short: Box<str> = name_str.rsplit('/').next().unwrap_or(name_str).into();
             let provider: Box<str> = name_str.split('/').next().unwrap_or(name_str).into();
-            // Optimized: avoid cloning by moving values
             ModelUsage {
                 name: model_id.clone(),
                 short_name: short.clone(),
@@ -786,6 +810,7 @@ pub fn collect_stats() -> Stats {
                 sessions: HashSet::new(),
                 tokens: Tokens::default(),
                 tools: HashMap::new(),
+                agents: HashMap::new(),
                 cost: 0.0,
             }
         });
@@ -795,6 +820,13 @@ pub fn collect_stats() -> Stats {
             .insert(session_id.clone().into_boxed_str());
         model_entry.cost += cost;
         add_tokens(&mut model_entry.tokens, &msg.tokens);
+        if let Some(agent) = msg.agent.as_ref().map(|s| s.0.as_str()).filter(|s| !s.is_empty())
+        {
+            *model_entry
+                .agents
+                .entry(agent.to_string().into_boxed_str())
+                .or_insert(0) += 1;
+        }
 
         let day_stat = per_day.entry(day).or_default();
         day_stat.messages += 1;
@@ -889,26 +921,42 @@ pub fn collect_stats() -> Stats {
         per_day,
         session_titles,
         model_usage,
+        session_message_files,
+        processed_message_ids,
     }
 }
 
-pub fn load_session_chat(session_id: &str) -> Vec<ChatMessage> {
-    let message_path = get_storage_path("message");
+pub fn load_session_chat(
+    session_id: &str,
+    files: Option<&[std::path::PathBuf]>,
+) -> Vec<ChatMessage> {
     let part_path_str = get_storage_path("part");
     let part_root = Path::new(&part_path_str);
-    let msg_files = list_message_files(Path::new(&message_path));
-    let mut session_msgs: Vec<Message> = msg_files
-        .par_iter()
-        .filter_map(|p| {
-            let bytes = fs::read(p).ok()?;
-            let msg: Message = serde_json::from_slice(&bytes).ok()?;
 
-            if msg.session_id.as_ref().map(|s| s.as_ref()) != Some(session_id) {
-                return None;
-            }
-            Some(msg)
-        })
-        .collect();
+    let mut session_msgs: Vec<Message> = if let Some(f) = files {
+        f.par_iter()
+            .filter_map(|p| {
+                let bytes = fs::read(p).ok()?;
+                let msg: Message = serde_json::from_slice(&bytes).ok()?;
+                Some(msg)
+            })
+            .collect()
+    } else {
+        let message_path = get_storage_path("message");
+        let msg_files = list_message_files(Path::new(&message_path));
+        msg_files
+            .par_iter()
+            .filter_map(|p| {
+                let bytes = fs::read(p).ok()?;
+                let msg: Message = serde_json::from_slice(&bytes).ok()?;
+
+                if msg.session_id.as_ref().map(|s| s.as_ref()) != Some(session_id) {
+                    return None;
+                }
+                Some(msg)
+            })
+            .collect()
+    };
 
     session_msgs.sort_unstable_by_key(|m| {
         m.time
@@ -1016,60 +1064,111 @@ pub struct SessionDetails {
     pub model_stats: Vec<ModelTokenStats>,
 }
 
-pub fn load_session_details(session_id: &str) -> SessionDetails {
-    let message_path = get_storage_path("message");
-    let msg_files = list_message_files(Path::new(&message_path));
-    let model_map: HashMap<Box<str>, ModelTokenStats> = msg_files
-        .par_iter()
-        .filter_map(|p| {
-            let bytes = fs::read(p).ok()?;
-            let msg: Message = serde_json::from_slice(&bytes).ok()?;
-            if msg.session_id.as_ref().map(|s| s.as_ref()) != Some(session_id) {
-                return None;
-            }
-
-            let model_id = get_model_id(&msg);
-            let mut tokens = Tokens::default();
-            add_tokens(&mut tokens, &msg.tokens);
-
-            Some((model_id, tokens))
-        })
-        .fold(
-            HashMap::new,
-            |mut acc: HashMap<Box<str>, ModelTokenStats>, (model, tokens)| {
-                let entry = acc.entry(model.clone()).or_insert_with(|| ModelTokenStats {
-                    name: model,
-                    messages: 0,
-                    tokens: Tokens::default(),
-                });
-                entry.messages += 1;
-                entry.tokens.input += tokens.input;
-                entry.tokens.output += tokens.output;
-                entry.tokens.reasoning += tokens.reasoning;
-                entry.tokens.cache_read += tokens.cache_read;
-                entry.tokens.cache_write += tokens.cache_write;
-                acc
-            },
-        )
-        .reduce(
-            HashMap::new,
-            |mut a: HashMap<Box<str>, ModelTokenStats>, b| {
-                for (k, v) in b {
-                    let entry = a.entry(k).or_insert_with(|| ModelTokenStats {
-                        name: v.name,
+pub fn load_session_details(
+    session_id: &str,
+    files: Option<&[std::path::PathBuf]>,
+) -> SessionDetails {
+    let model_map: HashMap<Box<str>, ModelTokenStats> = if let Some(f) = files {
+        f.par_iter()
+            .filter_map(|p| {
+                let bytes = fs::read(p).ok()?;
+                let msg: Message = serde_json::from_slice(&bytes).ok()?;
+                let model_id = get_model_id(&msg);
+                let mut tokens = Tokens::default();
+                add_tokens(&mut tokens, &msg.tokens);
+                Some((model_id, tokens))
+            })
+            .fold(
+                HashMap::new,
+                |mut acc: HashMap<Box<str>, ModelTokenStats>, (model, tokens)| {
+                    let entry = acc.entry(model.clone()).or_insert_with(|| ModelTokenStats {
+                        name: model,
                         messages: 0,
                         tokens: Tokens::default(),
                     });
-                    entry.messages += v.messages;
-                    entry.tokens.input += v.tokens.input;
-                    entry.tokens.output += v.tokens.output;
-                    entry.tokens.reasoning += v.tokens.reasoning;
-                    entry.tokens.cache_read += v.tokens.cache_read;
-                    entry.tokens.cache_write += v.tokens.cache_write;
+                    entry.messages += 1;
+                    entry.tokens.input += tokens.input;
+                    entry.tokens.output += tokens.output;
+                    entry.tokens.reasoning += tokens.reasoning;
+                    entry.tokens.cache_read += tokens.cache_read;
+                    entry.tokens.cache_write += tokens.cache_write;
+                    acc
+                },
+            )
+            .reduce(
+                HashMap::new,
+                |mut a: HashMap<Box<str>, ModelTokenStats>, b| {
+                    for (k, v) in b {
+                        let entry = a.entry(k).or_insert_with(|| ModelTokenStats {
+                            name: v.name,
+                            messages: 0,
+                            tokens: Tokens::default(),
+                        });
+                        entry.messages += v.messages;
+                        entry.tokens.input += v.tokens.input;
+                        entry.tokens.output += v.tokens.output;
+                        entry.tokens.reasoning += v.tokens.reasoning;
+                        entry.tokens.cache_read += v.tokens.cache_read;
+                        entry.tokens.cache_write += v.tokens.cache_write;
+                    }
+                    a
+                },
+            )
+    } else {
+        let message_path = get_storage_path("message");
+        let msg_files = list_message_files(Path::new(&message_path));
+        msg_files
+            .par_iter()
+            .filter_map(|p| {
+                let bytes = fs::read(p).ok()?;
+                let msg: Message = serde_json::from_slice(&bytes).ok()?;
+                if msg.session_id.as_ref().map(|s| s.as_ref()) != Some(session_id) {
+                    return None;
                 }
-                a
-            },
-        );
+
+                let model_id = get_model_id(&msg);
+                let mut tokens = Tokens::default();
+                add_tokens(&mut tokens, &msg.tokens);
+
+                Some((model_id, tokens))
+            })
+            .fold(
+                HashMap::new,
+                |mut acc: HashMap<Box<str>, ModelTokenStats>, (model, tokens)| {
+                    let entry = acc.entry(model.clone()).or_insert_with(|| ModelTokenStats {
+                        name: model,
+                        messages: 0,
+                        tokens: Tokens::default(),
+                    });
+                    entry.messages += 1;
+                    entry.tokens.input += tokens.input;
+                    entry.tokens.output += tokens.output;
+                    entry.tokens.reasoning += tokens.reasoning;
+                    entry.tokens.cache_read += tokens.cache_read;
+                    entry.tokens.cache_write += tokens.cache_write;
+                    acc
+                },
+            )
+            .reduce(
+                HashMap::new,
+                |mut a: HashMap<Box<str>, ModelTokenStats>, b| {
+                    for (k, v) in b {
+                        let entry = a.entry(k).or_insert_with(|| ModelTokenStats {
+                            name: v.name,
+                            messages: 0,
+                            tokens: Tokens::default(),
+                        });
+                        entry.messages += v.messages;
+                        entry.tokens.input += v.tokens.input;
+                        entry.tokens.output += v.tokens.output;
+                        entry.tokens.reasoning += v.tokens.reasoning;
+                        entry.tokens.cache_read += v.tokens.cache_read;
+                        entry.tokens.cache_write += v.tokens.cache_write;
+                    }
+                    a
+                },
+            )
+    };
 
     let mut model_stats: Vec<ModelTokenStats> = model_map.into_values().collect();
     model_stats.sort_unstable_by(|a, b| b.tokens.total().cmp(&a.tokens.total()));
@@ -1077,10 +1176,30 @@ pub fn load_session_details(session_id: &str) -> SessionDetails {
     SessionDetails { model_stats }
 }
 
+#[inline]
 fn truncate_string(s: &str, max: usize) -> Box<str> {
     // Optimized: early return if no truncation needed
+    if s.len() <= max {
+        return s.into();
+    }
+
+    // Fast path for ASCII strings (most common case)
+    if s.is_ascii() {
+        // For ASCII, byte length equals char count
+        if s.len() <= max {
+            return s.into();
+        }
+        // Truncate at byte position (safe for ASCII)
+        let end = max.min(s.len());
+        let mut result = String::with_capacity(end + 3);
+        result.push_str(&s[..end]);
+        result.push_str("...");
+        return result.into_boxed_str();
+    }
+
+    // Slow path for non-ASCII: count chars properly
     if s.chars().count() <= max {
-        s.into()
+        return s.into();
     } else {
         // Find the byte position where we need to truncate
         let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());

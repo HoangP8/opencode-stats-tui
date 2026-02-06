@@ -63,8 +63,9 @@ impl SessionModal {
         session_id: &str,
         chat_messages: Vec<ChatMessage>,
         session_stat: &crate::stats::SessionStat,
+        files: Option<&[std::path::PathBuf]>,
     ) {
-        let details = load_session_details(session_id);
+        let details = load_session_details(session_id, files);
         self.session_details = Some(details);
         self.current_session = Some(session_stat.clone());
         self.chat_messages = chat_messages;
@@ -885,12 +886,21 @@ impl SessionModal {
 
 /// Helper: Truncate string with ellipsis if too long
 /// Returns a static string slice - optimized to avoid allocations
+#[inline]
 fn safe_truncate(s: &str, max_len: usize) -> &str {
     // Optimized: early return without char count if already short enough
     if s.len() <= max_len {
         return s;
     }
-    // Optimized: use char_indices to avoid allocation
+
+    // Fast path for ASCII strings (most common case)
+    if s.is_ascii() {
+        // For ASCII, byte length equals char count
+        // Safe to truncate at byte boundary
+        return &s[..max_len.min(s.len())];
+    }
+
+    // Slow path for non-ASCII: count chars properly
     let end = s
         .char_indices()
         .nth(max_len)
@@ -901,9 +911,22 @@ fn safe_truncate(s: &str, max_len: usize) -> &str {
 
 /// Helper: Truncate string and return Cow<'_, str>
 /// Uses Cow to avoid allocation when no truncation needed
+#[inline]
 fn safe_truncate_plain(s: &str, max_len: usize) -> Cow<'_, str> {
     // Optimized: check byte length first as a fast path
-    if s.len() <= max_len || s.chars().count() <= max_len {
+    if s.len() <= max_len {
+        return Cow::Borrowed(s);
+    }
+
+    // Fast path for ASCII strings (most common case)
+    if s.is_ascii() {
+        // For ASCII, byte length equals char count
+        // Safe to truncate at byte boundary
+        return Cow::Borrowed(&s[..max_len]);
+    }
+
+    // Slow path for non-ASCII: count chars properly
+    if s.chars().count() <= max_len {
         Cow::Borrowed(s)
     } else {
         Cow::Owned(s.chars().take(max_len).collect())

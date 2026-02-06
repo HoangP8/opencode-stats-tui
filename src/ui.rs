@@ -101,6 +101,7 @@ pub struct App {
     totals: Totals,
     per_day: HashMap<String, DayStat>,
     session_titles: HashMap<String, String>,
+    session_message_files: HashMap<String, Vec<PathBuf>>,
     day_list: Vec<String>,
     day_list_state: ListState,
     session_list: Vec<Arc<crate::stats::SessionStat>>,
@@ -271,11 +272,26 @@ impl App {
         let stats_cache = StatsCache::new(storage_path.clone()).ok();
         log::info!("Initialized stats cache for: {}", storage_path.display());
 
-        let (totals, per_day, session_titles, model_usage) = if let Some(cache) = &stats_cache {
-            cache.load_or_compute().into_tuple()
-        } else {
-            crate::stats::collect_stats().into_tuple()
-        };
+        let (totals, per_day, session_titles, model_usage, session_message_files) =
+            if let Some(cache) = &stats_cache {
+                let s = cache.load_or_compute();
+                (
+                    s.totals,
+                    s.per_day,
+                    s.session_titles,
+                    s.model_usage,
+                    s.session_message_files,
+                )
+            } else {
+                let s = crate::stats::collect_stats();
+                (
+                    s.totals,
+                    s.per_day,
+                    s.session_titles,
+                    s.model_usage,
+                    s.session_message_files,
+                )
+            };
 
         // Set up live watcher for real-time updates
         let needs_refresh = Arc::new(Mutex::new(Vec::new()));
@@ -323,6 +339,7 @@ impl App {
             totals,
             per_day,
             session_titles,
+            session_message_files,
             day_list,
             day_list_state,
             session_list: Vec::new(),
@@ -391,6 +408,13 @@ impl App {
 
     /// Rebuild cached session list items to avoid heavy computation on every render
     fn rebuild_cached_session_items(&mut self) {
+        let max_cost_len = self
+            .session_list
+            .iter()
+            .map(|s| format!("{:.2}", s.display_cost()).len())
+            .max()
+            .unwrap_or(0)
+            .max(8);
         self.cached_session_items = self
             .session_list
             .iter()
@@ -426,7 +450,7 @@ impl App {
                     ),
                     Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
                     Span::styled(
-                        format!("${:>7.2}", s.display_cost()),
+                        format!("${:>width$.2}", s.display_cost(), width = max_cost_len),
                         Style::default().fg(Color::Yellow),
                     ),
                     Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
@@ -523,11 +547,21 @@ impl App {
             self.chat_cache_order.push(session_id_str.clone());
 
             // Open modal with cached messages and session stat
-            self.modal
-                .open_session(&session_id_str, messages, &session_stat);
+            self.modal.open_session(
+                &session_id_str,
+                messages,
+                &session_stat,
+                self.session_message_files
+                    .get(&session_id_str)
+                    .map(|v| v.as_slice()),
+            );
             cached.total_lines
         } else {
-            let messages = load_session_chat(&session_id_str);
+            let files = self
+                .session_message_files
+                .get(&session_id_str)
+                .map(|v| v.as_slice());
+            let messages = load_session_chat(&session_id_str, files);
             let total_lines: u16 = messages.iter().map(calculate_message_rendered_lines).sum();
             let blank_lines = if !messages.is_empty() {
                 messages.len() - 1
@@ -556,7 +590,7 @@ impl App {
 
             // Open modal with loaded messages and session stat
             self.modal
-                .open_session(&session_id_str, messages, &session_stat);
+                .open_session(&session_id_str, messages, &session_stat, files);
             total_lines
         };
 
@@ -628,25 +662,38 @@ impl App {
             let is_full_refresh = changed_files.is_empty();
             let mut affected_sessions = std::collections::HashSet::new();
 
-            let (totals, per_day, session_titles, model_usage) = if is_full_refresh {
-                let stats = cache.load_or_compute();
-                // For full refresh, we'll rebuild everything
-                stats.into_tuple()
-            } else {
-                // Optimized: avoid double to_string() call
-                let files: Vec<String> = changed_files
-                    .iter()
-                    .filter_map(|p| p.to_str().map(ToString::to_string))
-                    .collect();
-                affected_sessions = cache.update_files(files);
-                cache.get_stats().into_tuple()
-            };
+            let (totals, per_day, session_titles, model_usage, session_message_files) =
+                if is_full_refresh {
+                    let s = cache.load_or_compute();
+                    (
+                        s.totals,
+                        s.per_day,
+                        s.session_titles,
+                        s.model_usage,
+                        s.session_message_files,
+                    )
+                } else {
+                    let files: Vec<String> = changed_files
+                        .iter()
+                        .filter_map(|p| p.to_str().map(ToString::to_string))
+                        .collect();
+                    affected_sessions = cache.update_files(files);
+                    let s = cache.get_stats();
+                    (
+                        s.totals,
+                        s.per_day,
+                        s.session_titles,
+                        s.model_usage,
+                        s.session_message_files,
+                    )
+                };
 
             // Update all stats
             self.totals = totals;
             self.per_day = per_day;
             self.session_titles = session_titles;
             self.model_usage = model_usage;
+            self.session_message_files = session_message_files;
 
             // Rebuild derived data if full refresh, otherwise partial
             if is_full_refresh {
@@ -891,13 +938,7 @@ impl App {
                             LeftPanel::Models => match self.right_panel {
                                 RightPanel::Detail => {}
                                 RightPanel::Tools => self.right_panel = RightPanel::Detail,
-                                RightPanel::List => {
-                                    if self.ranking_scroll == 0 {
-                                        self.right_panel = RightPanel::Detail;
-                                    } else {
-                                        self.ranking_scroll = self.ranking_scroll.saturating_sub(1);
-                                    }
-                                }
+                                RightPanel::List => self.right_panel = RightPanel::Tools,
                             },
                             _ => {}
                         },
@@ -949,12 +990,7 @@ impl App {
                             LeftPanel::Models => match self.right_panel {
                                 RightPanel::Detail => self.right_panel = RightPanel::Tools,
                                 RightPanel::Tools => {}
-                                RightPanel::List => {
-                                    let max_scroll = self.model_usage.len().saturating_sub(1);
-                                    if self.ranking_scroll < max_scroll {
-                                        self.ranking_scroll += 1;
-                                    }
-                                }
+                                RightPanel::List => {}
                             },
                             _ => {}
                         },
@@ -978,6 +1014,135 @@ impl App {
                                 _ => {}
                             },
                         },
+                    }
+                }
+            }
+            KeyCode::PageUp => {
+                if self.focus == Focus::Right {
+                    match self.left_panel {
+                        LeftPanel::Days => {
+                            for _ in 0..10 {
+                                self.session_previous();
+                            }
+                        }
+                        LeftPanel::Models => {
+                            if self.right_panel == RightPanel::List {
+                                self.ranking_scroll = self.ranking_scroll.saturating_sub(10);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match self.left_panel {
+                        LeftPanel::Days => {
+                            for _ in 0..10 {
+                                self.day_previous();
+                            }
+                            self.update_session_list();
+                        }
+                        LeftPanel::Models => {
+                            for _ in 0..10 {
+                                self.model_previous();
+                            }
+                            self.selected_model_index = self.model_list_state.selected();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            KeyCode::PageDown => {
+                if self.focus == Focus::Right {
+                    match self.left_panel {
+                        LeftPanel::Days => {
+                            for _ in 0..10 {
+                                self.session_next();
+                            }
+                        }
+                        LeftPanel::Models => {
+                            if self.right_panel == RightPanel::List {
+                                let max_scroll = self.model_usage.len().saturating_sub(1);
+                                self.ranking_scroll = (self.ranking_scroll + 10).min(max_scroll);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match self.left_panel {
+                        LeftPanel::Days => {
+                            for _ in 0..10 {
+                                self.day_next();
+                            }
+                            self.update_session_list();
+                        }
+                        LeftPanel::Models => {
+                            for _ in 0..10 {
+                                self.model_next();
+                            }
+                            self.selected_model_index = self.model_list_state.selected();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            KeyCode::Home => {
+                if self.focus == Focus::Right {
+                    match self.left_panel {
+                        LeftPanel::Days => {
+                            self.session_list_state.select(Some(0));
+                        }
+                        LeftPanel::Models => {
+                            if self.right_panel == RightPanel::List {
+                                self.ranking_scroll = 0;
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match self.left_panel {
+                        LeftPanel::Days => {
+                            self.day_list_state.select(Some(0));
+                            self.update_session_list();
+                        }
+                        LeftPanel::Models => {
+                            self.model_list_state.select(Some(0));
+                            self.selected_model_index = Some(0);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            KeyCode::End => {
+                if self.focus == Focus::Right {
+                    match self.left_panel {
+                        LeftPanel::Days => {
+                            if !self.session_list.is_empty() {
+                                self.session_list_state
+                                    .select(Some(self.session_list.len() - 1));
+                            }
+                        }
+                        LeftPanel::Models => {
+                            if self.right_panel == RightPanel::List {
+                                self.ranking_scroll = self.model_usage.len().saturating_sub(1);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match self.left_panel {
+                        LeftPanel::Days => {
+                            if !self.day_list.is_empty() {
+                                self.day_list_state.select(Some(self.day_list.len() - 1));
+                                self.update_session_list();
+                            }
+                        }
+                        LeftPanel::Models => {
+                            if !self.model_usage.is_empty() {
+                                let last = self.model_usage.len() - 1;
+                                self.model_list_state.select(Some(last));
+                                self.selected_model_index = Some(last);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1055,7 +1220,17 @@ impl App {
                     }
                     Some("list") => {
                         // Only allow scrolling when panel is active (after Enter)
-                        if self.is_active {
+                        if self.left_panel == LeftPanel::Models && self.models_active {
+                            if mouse.kind == MouseEventKind::ScrollUp {
+                                self.ranking_scroll = self.ranking_scroll.saturating_sub(1);
+                            } else {
+                                let max_scroll = self.model_usage.len().saturating_sub(1);
+                                if self.ranking_scroll < max_scroll {
+                                    self.ranking_scroll += 1;
+                                }
+                            }
+                            true
+                        } else if self.is_active {
                             if mouse.kind == MouseEventKind::ScrollUp {
                                 self.session_previous();
                             } else {
@@ -1747,7 +1922,7 @@ impl App {
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(9), // Info
+                Constraint::Length(7), // Info (5 lines content + borders)
                 Constraint::Min(0),    // Bottom section
             ])
             .split(area);
@@ -1767,6 +1942,9 @@ impl App {
 
         // --- 1. MODEL INFO ---
         let info_focused = is_highlighted && self.right_panel == RightPanel::Detail;
+        let info_title = selected_model
+            .map(|m| format!(" {} ", m.name))
+            .unwrap_or_else(|| " MODEL INFO ".to_string());
         let info_block = Block::default()
             .borders(Borders::ALL)
             .border_style(if info_focused {
@@ -1776,7 +1954,7 @@ impl App {
             })
             .title(
                 Line::from(Span::styled(
-                    " MODEL INFO ",
+                    info_title,
                     Style::default()
                         .fg(if info_focused {
                             Color::Cyan
@@ -1792,30 +1970,28 @@ impl App {
         frame.render_widget(info_block, main_chunks[0]);
 
         if let Some(model) = selected_model {
-            let short_name: &str = &model.short_name;
-            let provider: &str = &model.provider;
+            let mut agent_pairs: Vec<(&Box<str>, &u64)> = model.agents.iter().collect();
+            agent_pairs.sort_unstable_by(|a, b| b.1.cmp(a.1));
 
             let info_columns = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(45), Constraint::Min(0)])
+                .constraints([
+                    Constraint::Percentage(24),
+                    Constraint::Percentage(38),
+                    Constraint::Percentage(38),
+                ])
                 .split(info_inner);
+
+            let label_color = Style::default().fg(Color::Rgb(180, 180, 180));
+            let col2_width = info_columns[1].width as usize;
+            let name_fit_ellipsis = |label_len: usize, text: &str, max_width: usize| -> String {
+                let avail = max_width.saturating_sub(label_len + 1);
+                truncate_with_ellipsis(text, avail.max(1))
+            };
 
             let left_lines = vec![
                 Line::from(vec![
-                    Span::styled("Model     ", Style::default().fg(Color::Rgb(180, 180, 180))),
-                    Span::styled(
-                        short_name,
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled("Provider  ", Style::default().fg(Color::Rgb(180, 180, 180))),
-                    Span::styled(provider, Style::default().fg(Color::Cyan)),
-                ]),
-                Line::from(vec![
-                    Span::styled("Sessions  ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled("Sessions  ", label_color),
                     Span::styled(
                         format!("{}", model.sessions.len()),
                         Style::default()
@@ -1824,7 +2000,7 @@ impl App {
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("Messages  ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled("Messages  ", label_color),
                     Span::styled(
                         format!("{}", model.messages),
                         Style::default()
@@ -1832,7 +2008,65 @@ impl App {
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]),
+                Line::from(vec![
+                    Span::styled("Cost      ", label_color),
+                    Span::styled(
+                        format!("${:.2}", model.cost),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Est Cost  ", label_color),
+                    Span::styled(
+                        "$0.00",
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
             ];
+
+            let mut agent_lines: Vec<Line> = Vec::with_capacity(5);
+            let label = "Agents: ";
+            let indent = "        ";
+            if agent_pairs.is_empty() {
+                agent_lines.push(Line::from(vec![
+                    Span::styled(label, label_color),
+                    Span::styled("n/a", Style::default().fg(Color::DarkGray)),
+                ]));
+            } else {
+                let mut iter = agent_pairs.iter();
+                if let Some((a, c)) = iter.next() {
+                    let first = format!("{} ({} msg)", a.as_ref(), c);
+                    agent_lines.push(Line::from(vec![
+                        Span::styled(label, label_color),
+                        Span::styled(
+                            name_fit_ellipsis(label.len(), &first, col2_width),
+                            Style::default().fg(Color::Magenta),
+                        ),
+                    ]));
+                }
+                for (_i, (a, c)) in iter.enumerate() {
+                    if agent_lines.len() >= 5 {
+                        agent_lines.pop();
+                        agent_lines.push(Line::from(vec![
+                            Span::styled(indent, label_color),
+                            Span::styled("...", Style::default().fg(Color::Magenta)),
+                        ]));
+                        break;
+                    }
+                    let line = format!("{} ({} msg)", a.as_ref(), c);
+                    agent_lines.push(Line::from(vec![
+                        Span::styled(indent, label_color),
+                        Span::styled(
+                            name_fit_ellipsis(indent.len(), &line, col2_width),
+                            Style::default().fg(Color::Magenta),
+                        ),
+                    ]));
+                }
+            }
 
             let right_lines = vec![
                 Line::from(vec![
@@ -1888,7 +2122,8 @@ impl App {
             ];
 
             frame.render_widget(Paragraph::new(left_lines), info_columns[0]);
-            frame.render_widget(Paragraph::new(right_lines), info_columns[1]);
+            frame.render_widget(Paragraph::new(agent_lines), info_columns[1]);
+            frame.render_widget(Paragraph::new(right_lines), info_columns[2]);
         }
 
         // --- 2. TOOLS USED ---
@@ -1998,37 +2233,49 @@ impl App {
         ranked_models.sort_unstable_by(|a, b| b.1.tokens.total().cmp(&a.1.tokens.total()));
         let grand_total: u64 = self.model_usage.iter().map(|m| m.tokens.total()).sum();
 
+        let bar_available_width = ranking_inner.width.saturating_sub(2);
+        let max_token_len = self
+            .model_usage
+            .iter()
+            .map(|m| format_number(m.tokens.total()).len())
+            .max()
+            .unwrap_or(1);
         let ranking_lines: Vec<Line> = ranked_models
             .iter()
             .enumerate()
-            .map(|(rank, (idx, model))| {
+            .map(|(_rank, (idx, model))| {
                 let is_selected = self.selected_model_index == Some(*idx);
-                let model_style = if is_selected {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-
                 let percentage = if grand_total > 0 {
                     (model.tokens.total() as f64 / grand_total as f64) * 100.0
                 } else {
                     0.0
                 };
+                let percent_text = format!("{:>5.1}%", percentage);
+                let token_text = format_number(model.tokens.total());
+                let suffix = format!(" {} ({:>width$})", percent_text, token_text, width = max_token_len);
+                let suffix_len = suffix.chars().count() as u16;
+                let bar_max_width = bar_available_width.saturating_sub(suffix_len) as usize;
+                let bar_width = if grand_total > 0 {
+                    ((model.tokens.total() as f64 / grand_total as f64) * bar_max_width as f64)
+                        as usize
+                } else {
+                    0
+                };
+                let filled = "█".repeat(bar_width.min(bar_max_width));
+                let empty = "░".repeat(bar_max_width.saturating_sub(bar_width));
 
                 Line::from(vec![
                     Span::styled(
-                        format!("{:>2}", rank + 1),
-                        Style::default().fg(Color::DarkGray),
+                        filled,
+                        Style::default().fg(if is_selected {
+                            Color::Cyan
+                        } else {
+                            Color::DarkGray
+                        }),
                     ),
-                    Span::styled(" ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(empty, Style::default().fg(Color::DarkGray)),
                     Span::styled(
-                        format!("{:<35} ", safe_truncate_plain(&model.display_name, 35)),
-                        model_style,
-                    ),
-                    Span::styled(
-                        format!("{:>5.1}%", percentage),
+                        suffix,
                         Style::default()
                             .fg(if is_selected {
                                 Color::Yellow
@@ -2041,24 +2288,24 @@ impl App {
             })
             .collect();
 
-        // Auto-scroll logic (only if not manually scrolling the ranking panel)
-        if !is_active || !ranking_focused {
-            if let Some(selected_idx) = self.selected_model_index {
-                if let Some(selected_rank) = ranked_models
-                    .iter()
-                    .position(|(idx, _)| *idx == selected_idx)
-                {
-                    let visible_height = ranking_inner.height as usize;
-                    if visible_height > 0 {
-                        if selected_rank >= self.ranking_scroll + visible_height - 1
-                            || selected_rank < self.ranking_scroll
-                        {
-                            self.ranking_scroll = selected_rank.saturating_sub(visible_height / 2);
-                        }
-                        self.ranking_scroll = self
-                            .ranking_scroll
-                            .min(ranking_lines.len().saturating_sub(visible_height));
+        // Auto-scroll to keep selected model visible
+        if let Some(selected_idx) = self.selected_model_index {
+            if let Some(selected_rank) = ranked_models
+                .iter()
+                .position(|(idx, _)| *idx == selected_idx)
+            {
+                let visible_height = ranking_inner.height as usize;
+                if visible_height > 0 {
+                    if selected_rank >= self.ranking_scroll + visible_height
+                        || selected_rank < self.ranking_scroll
+                    {
+                        self.ranking_scroll = selected_rank.saturating_sub(visible_height / 2);
                     }
+                    self.ranking_scroll = self
+                        .ranking_scroll
+                        .min(ranking_lines.len().saturating_sub(visible_height));
+                } else {
+                    self.ranking_scroll = 0;
                 }
             }
         }
