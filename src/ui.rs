@@ -109,7 +109,7 @@ impl PanelRects {
 pub struct App {
     totals: Totals,
     per_day: HashMap<String, DayStat>,
-    session_titles: HashMap<String, String>,
+    session_titles: HashMap<Box<str>, String>,
     session_message_files: HashMap<String, Vec<PathBuf>>,
     day_list: Vec<String>,
     day_list_state: ListState,
@@ -172,6 +172,13 @@ fn stat_widget(label: &str, value: String, color: Color) -> Paragraph<'static> {
     .alignment(Alignment::Center)
 }
 
+/// Helper: Formatting configuration for usage list rows
+struct UsageRowFormat {
+    name_width: usize,
+    cost_width: usize,
+    sess_width: usize,
+}
+
 /// Helper: Create a list row with consistent formatting for usage lists
 /// Optimized with pre-allocated Vec capacity
 fn usage_list_row(
@@ -180,9 +187,7 @@ fn usage_list_row(
     output_tokens: u64,
     cost: f64,
     session_count: usize,
-    name_width: usize,
-    cost_width: usize,
-    sess_width: usize,
+    format: &UsageRowFormat,
 ) -> Line<'static> {
     let in_val = format_number(input_tokens);
     let out_val = format_number(output_tokens);
@@ -190,8 +195,8 @@ fn usage_list_row(
     // Optimized: use format! with padding instead of manual loop
     let name_display = format!(
         "{:<width$}",
-        name.chars().take(name_width).collect::<String>(),
-        width = name_width
+        name.chars().take(format.name_width).collect::<String>(),
+        width = format.name_width
     );
 
     // Optimized: combine nested format! calls into single format
@@ -207,12 +212,12 @@ fn usage_list_row(
         Span::styled(" out", Style::default().fg(Color::Rgb(180, 180, 180))),
         Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
         Span::styled(
-            format!("${:>width$.2}", cost, width = cost_width),
+            format!("${:>width$.2}", cost, width = format.cost_width),
             Style::default().fg(Color::Yellow),
         ),
         Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
         Span::styled(
-            format!("{:>width$} sess", session_count, width = sess_width),
+            format!("{:>width$} sess", session_count, width = format.sess_width),
             Style::default().fg(Color::Cyan),
         ),
     ];
@@ -474,8 +479,8 @@ impl App {
                 // No [Continued] badge - continuation info shown in panel title above
                 let title = self
                     .session_titles
-                    .get(&s.id.to_string())
-                    .map(|t| t.replace("New session - ", ""))
+                    .get(&s.id)
+                    .map(|t| t.strip_prefix("New session - ").unwrap_or(t).to_string())
                     .unwrap_or_else(|| s.id.chars().take(14).collect());
 
                 let model_count = s.models.len();
@@ -1683,9 +1688,11 @@ impl App {
                 output,
                 cost,
                 sess,
-                name_width,
-                cost_width,
-                sess_width,
+                &UsageRowFormat {
+                    name_width,
+                    cost_width,
+                    sess_width,
+                },
             )));
         }
 
@@ -1764,9 +1771,11 @@ impl App {
                 m.tokens.output,
                 m.display_cost(),
                 m.sessions.len(),
-                name_width,
-                cost_width,
-                sess_width,
+                &UsageRowFormat {
+                    name_width,
+                    cost_width,
+                    sess_width,
+                },
             )));
         }
 
@@ -2106,7 +2115,7 @@ impl App {
                         ),
                     ]));
                 }
-                for (_i, (a, c)) in iter.enumerate() {
+                for (a, c) in iter {
                     if agent_lines.len() >= 5 {
                         agent_lines.pop();
                         agent_lines.push(Line::from(vec![
@@ -2289,8 +2298,7 @@ impl App {
             .unwrap_or(1);
         let ranking_lines: Vec<Line> = ranked_models
             .iter()
-            .enumerate()
-            .map(|(_rank, (idx, model))| {
+            .map(|(idx, model)| {
                 let is_selected = self.selected_model_index == Some(*idx);
                 let percentage = if grand_total > 0 {
                     (model.tokens.total() as f64 / grand_total as f64) * 100.0
@@ -2407,13 +2415,13 @@ impl App {
         if let Some(s) = session {
             let title = self
                 .session_titles
-                .get(&s.id.to_string())
-                .map(|t| t.replace("New session - ", ""))
-                .unwrap_or_else(|| "Untitled".to_string());
+                .get(&s.id)
+                .map(|t| t.strip_prefix("New session - ").unwrap_or(t))
+                .unwrap_or("Untitled");
             let project = if !s.path_root.is_empty() {
-                s.path_root.clone()
+                &s.path_root
             } else {
-                s.path_cwd.clone()
+                &s.path_cwd
             };
 
             final_lines.push(Line::from(vec![

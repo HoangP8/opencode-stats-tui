@@ -224,7 +224,7 @@ impl SessionModal {
         frame: &mut Frame,
         area: Rect,
         session: &SessionStat,
-        session_titles: &HashMap<String, String>,
+        session_titles: &HashMap<Box<str>, String>,
     ) {
         // Solid clean background - no blur effect
         let modal_block = Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0)));
@@ -291,7 +291,7 @@ impl SessionModal {
         frame: &mut Frame,
         area: Rect,
         session: &SessionStat,
-        session_titles: &HashMap<String, String>,
+        session_titles: &HashMap<Box<str>, String>,
         border_style: Style,
     ) {
         // Pre-allocate with estimated capacity to avoid reallocations
@@ -299,31 +299,44 @@ impl SessionModal {
         let details = self.session_details.as_ref();
 
         let title = session_titles
-            .get(&session.id.to_string())
-            .map(|t| t.replace("New session - ", ""))
-            .unwrap_or_else(|| "Untitled".to_string());
+            .get(&session.id)
+            .map(|t| t.strip_prefix("New session - ").unwrap_or(t))
+            .unwrap_or("Untitled");
 
-        // Title row - simple, clean display (session ID shown in panel title)
-        lines.push(Line::from(Span::styled(
-            safe_truncate(&title, (area.width.saturating_sub(4)) as usize),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )));
-
+        // Separator line after title
         lines.push(Line::from(""));
 
         // Project section (best-effort git branch detection)
         let project = session.path_root.as_ref();
         if !project.is_empty() {
             lines.push(Line::from(vec![Span::styled(
-                "  PROJECT",
+                "  INFOR",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )]));
+            // Title with wrapping
+            let label_width = 9; // "Title:   " length
+            let max_title_width = (area.width.saturating_sub(10)) as usize;
+            let wrapped_title: Vec<String> =
+                wrap_text_with_indent(title, max_title_width, label_width);
+            for (i, line) in wrapped_title.into_iter().enumerate() {
+                if i == 0 {
+                    // First line with label
+                    lines.push(Line::from(vec![
+                        Span::raw("    Title:   "),
+                        Span::styled(line, Style::default().fg(Color::White)),
+                    ]));
+                } else {
+                    // Wrapped lines with indentation
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(line, Style::default().fg(Color::White)),
+                    ]));
+                }
+            }
             lines.push(Line::from(vec![
-                Span::raw("    Path:   "),
+                Span::raw("    Project: "),
                 Span::styled(
                     safe_truncate_plain(project, (area.width.saturating_sub(10)) as usize),
                     Style::default().fg(Color::White),
@@ -335,13 +348,20 @@ impl SessionModal {
                     safe_truncate_plain(&branch, (area.width.saturating_sub(12)) as usize)
                         .into_owned();
                 lines.push(Line::from(vec![
-                    Span::raw("    Branch: "),
+                    Span::raw("    Branch:  "),
                     Span::styled(branch_display, Style::default().fg(Color::Cyan)),
                 ]));
             }
 
             lines.push(Line::from(""));
         }
+
+        // Separator line after PROJECT section
+        lines.push(Line::from(vec![Span::styled(
+            "─".repeat((area.width - 2) as usize),
+            Style::default().fg(Color::Rgb(50, 50, 70)),
+        )]));
+        lines.push(Line::from(""));
 
         // Model usage section
         if let Some(d) = details {
@@ -524,8 +544,8 @@ impl SessionModal {
                         .add_modifier(Modifier::BOLD),
                 )]));
 
-                let max_val_len = 7usize;
-                let diff_block_width = (max_val_len + 1) * 2 + 3; // 19 (8+3+8)
+                let max_val_len = 6usize;
+                let diff_block_width = (max_val_len + 1) * 2 + 3; // 17 (7+3+7)
                 let fixed_prefix = 14; // 4 + 10
                 let status_sep = 1;
                 let path_sep = 2;
@@ -655,12 +675,12 @@ impl SessionModal {
         // Build title: show session ID and continuation info
         let title_text = if session.is_continuation {
             if let Some(first_date) = &session.first_created_date {
-                format!(" {} [Continue from {}] ", session.id, first_date)
+                format!("  {}  [Continue from {}]  ", session.id, first_date)
             } else {
-                format!(" {} [Continued] ", session.id)
+                format!("  {}  [Continued]  ", session.id)
             }
         } else {
-            format!(" {} ", session.id)
+            format!("  {}  ", session.id)
         };
 
         let block = Block::default()
@@ -866,49 +886,63 @@ impl SessionModal {
 /// Returns a static string slice - optimized to avoid allocations
 #[inline]
 fn safe_truncate(s: &str, max_len: usize) -> &str {
-    // Optimized: early return without char count if already short enough
     if s.len() <= max_len {
         return s;
     }
-
-    // Fast path for ASCII strings (most common case)
-    if s.is_ascii() {
-        // For ASCII, byte length equals char count
-        // Safe to truncate at byte boundary
-        return &s[..max_len.min(s.len())];
-    }
-
-    // Slow path for non-ASCII: count chars properly
-    let end = s
-        .char_indices()
-        .nth(max_len)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
-    &s[..end]
+    // Find the last safe break point (space) within limit
+    s[..max_len.saturating_sub(3)]
+        .rfind(' ')
+        .map(|pos| &s[..pos + 1])
+        .unwrap_or_else(|| &s[..max_len.saturating_sub(3)])
 }
 
-/// Helper: Truncate string and return Cow<'_, str>
-/// Uses Cow to avoid allocation when no truncation needed
-#[inline]
 fn safe_truncate_plain(s: &str, max_len: usize) -> Cow<'_, str> {
-    // Optimized: check byte length first as a fast path
     if s.len() <= max_len {
         return Cow::Borrowed(s);
     }
+    Cow::Owned(format!("{}…", &s[..max_len.saturating_sub(1)]))
+}
 
-    // Fast path for ASCII strings (most common case)
-    if s.is_ascii() {
-        // For ASCII, byte length equals char count
-        // Safe to truncate at byte boundary
-        return Cow::Borrowed(&s[..max_len]);
+fn wrap_text_with_indent(text: &str, max_width: usize, indent: usize) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current_line = String::new();
+    let mut current_width = 0;
+
+    for word in text.split_whitespace() {
+        let word_with_space = if current_line.is_empty() {
+            word.to_string()
+        } else {
+            format!(" {}", word)
+        };
+
+        if current_width + word_with_space.len() <= max_width {
+            current_line.push_str(&word_with_space);
+            current_width += word_with_space.len();
+        } else {
+            if !current_line.is_empty() {
+                result.push(current_line.clone());
+            }
+            current_line = word.to_string();
+            current_width = word.len();
+        }
     }
 
-    // Slow path for non-ASCII: count chars properly
-    if s.chars().count() <= max_len {
-        Cow::Borrowed(s)
-    } else {
-        Cow::Owned(s.chars().take(max_len).collect())
+    if !current_line.is_empty() {
+        result.push(current_line);
     }
+
+    // Apply indentation to all lines after the first
+    result
+        .into_iter()
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 {
+                line
+            } else {
+                format!("{}{}", " ".repeat(indent), line)
+            }
+        })
+        .collect()
 }
 
 /// Helper: Get role display information (icon, label, color)

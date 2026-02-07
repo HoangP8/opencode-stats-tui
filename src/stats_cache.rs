@@ -10,6 +10,10 @@ use std::{
     time::Duration,
 };
 
+// Type alias for complex return type to reduce complexity
+type SessionDiffs = HashMap<String, HashMap<String, crate::stats::FileDiff>>;
+type SessionSortedDays = HashMap<String, Vec<String>>;
+
 const CACHE_FORMAT_VERSION: u64 = 4;
 
 /// Cached statistics with version tracking
@@ -21,8 +25,7 @@ pub struct CachedStats {
     #[serde(default)]
     pub format_version: u64,
     #[serde(default)]
-    pub session_day_union_diffs:
-        HashMap<String, HashMap<String, crate::stats::FileDiff>>,
+    pub session_day_union_diffs: HashMap<String, HashMap<String, crate::stats::FileDiff>>,
     #[serde(default)]
     pub session_sorted_days: HashMap<String, Vec<String>>,
     #[serde(default)]
@@ -305,12 +308,9 @@ impl StatsCache {
     fn build_session_day_union_diffs(
         &self,
         files: &[PathBuf],
-    ) -> (
-        HashMap<String, HashMap<String, crate::stats::FileDiff>>,
-        HashMap<String, Vec<String>>,
-    ) {
-        let mut union: HashMap<String, HashMap<String, crate::stats::FileDiff>> = HashMap::new();
-        let mut session_sorted_days: HashMap<String, Vec<String>> = HashMap::new();
+    ) -> (SessionDiffs, SessionSortedDays) {
+        let mut union: SessionDiffs = HashMap::new();
+        let mut session_sorted_days: SessionSortedDays = HashMap::new();
         let mut processed_ids: HashSet<Box<str>> = HashSet::with_capacity(files.len());
 
         let mut messages: Vec<(crate::stats::Message, PathBuf)> = files
@@ -354,7 +354,7 @@ impl StatsCache {
                 continue;
             }
             let key = format!("{}|{}", session_id, day);
-            let file_map = union.entry(key).or_insert_with(HashMap::new);
+            let file_map = union.entry(key).or_default();
             for d in diffs {
                 if d.path.is_empty() {
                     continue;
@@ -656,10 +656,7 @@ impl StatsCache {
         let cumulative_diffs = Self::extract_cumulative_diffs(&msg);
         if !session_id.is_empty() && !cumulative_diffs.is_empty() {
             let key = format!("{}|{}", session_id, day);
-            let file_map = cached
-                .session_day_union_diffs
-                .entry(key)
-                .or_insert_with(HashMap::new);
+            let file_map = cached.session_day_union_diffs.entry(key).or_default();
             for d in cumulative_diffs {
                 if d.path.is_empty() {
                     continue;
@@ -679,10 +676,7 @@ impl StatsCache {
             }
 
             if let Some(sorted_days) = cached.session_sorted_days.get(&session_id).cloned() {
-                let start_pos = sorted_days
-                    .iter()
-                    .position(|d| d == &day)
-                    .unwrap_or(0);
+                let start_pos = sorted_days.iter().position(|d| d == &day).unwrap_or(0);
                 let first_day = sorted_days.first().cloned().unwrap_or_else(|| day.clone());
                 for (idx, day_str) in sorted_days.iter().enumerate().skip(start_pos) {
                     let lookup_key = format!("{}|{}", session_id, day_str);
@@ -696,7 +690,9 @@ impl StatsCache {
                     let s_arc = d_stat
                         .sessions
                         .entry(session_id.clone())
-                        .or_insert_with(|| Arc::new(crate::stats::SessionStat::new(session_id.clone())));
+                        .or_insert_with(|| {
+                            Arc::new(crate::stats::SessionStat::new(session_id.clone()))
+                        });
                     let s = Arc::make_mut(s_arc);
 
                     let is_continuation = *day_str != first_day;
@@ -715,8 +711,7 @@ impl StatsCache {
                     if !is_continuation {
                         if let Some(session_diffs) = cached.session_diff_map.get(&session_id) {
                             s.file_diffs = session_diffs.clone();
-                            if let Some(&(adds, dels)) =
-                                cached.session_diff_totals.get(&session_id)
+                            if let Some(&(adds, dels)) = cached.session_diff_totals.get(&session_id)
                             {
                                 s.diffs.additions = adds;
                                 s.diffs.deletions = dels;
@@ -754,16 +749,10 @@ impl StatsCache {
                         s.diffs.deletions = dels;
                     }
 
-                    d_stat.diffs.additions = d_stat
-                        .sessions
-                        .values()
-                        .map(|ss| ss.diffs.additions)
-                        .sum();
-                    d_stat.diffs.deletions = d_stat
-                        .sessions
-                        .values()
-                        .map(|ss| ss.diffs.deletions)
-                        .sum();
+                    d_stat.diffs.additions =
+                        d_stat.sessions.values().map(|ss| ss.diffs.additions).sum();
+                    d_stat.diffs.deletions =
+                        d_stat.sessions.values().map(|ss| ss.diffs.deletions).sum();
                 }
             }
         }

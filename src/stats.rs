@@ -157,7 +157,7 @@ impl Default for Totals {
 pub struct Stats {
     pub totals: Totals,
     pub per_day: HashMap<String, DayStat>,
-    pub session_titles: HashMap<String, String>,
+    pub session_titles: HashMap<Box<str>, String>,
     pub model_usage: Vec<ModelUsage>,
     #[serde(default)]
     pub session_message_files: HashMap<String, Vec<std::path::PathBuf>>,
@@ -517,7 +517,7 @@ pub fn format_number_full(value: u64) -> String {
 
     for (i, &byte) in bytes.iter().enumerate() {
         // Add comma before every 3rd digit from the right
-        if i > 0 && (len - i) % 3 == 0 {
+        if i > 0 && (len - i).is_multiple_of(3) {
             result.push(',');
         }
         // Safe to use as char since we know it's ASCII
@@ -625,7 +625,7 @@ fn list_message_files(root: &Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-fn load_session_titles() -> HashMap<String, String> {
+fn load_session_titles() -> HashMap<Box<str>, String> {
     let session_path = get_storage_path("session");
     let root = Path::new(&session_path);
     let Ok(entries) = fs::read_dir(root) else {
@@ -647,7 +647,7 @@ fn load_session_titles() -> HashMap<String, String> {
                                 let bytes = fs::read(se.path()).ok()?;
                                 let session = serde_json::from_slice::<SessionData>(&bytes).ok()?;
                                 Some((
-                                    session.id.map(|s| s.0).unwrap_or_default(),
+                                    session.id.map(|s| s.0).unwrap_or_default().into_boxed_str(),
                                     session.title.map(|s| s.0).unwrap_or_default(),
                                 ))
                             })
@@ -660,7 +660,7 @@ fn load_session_titles() -> HashMap<String, String> {
                     .and_then(|bytes| serde_json::from_slice::<SessionData>(&bytes).ok())
                     .map(|session| {
                         vec![(
-                            session.id.map(|s| s.0).unwrap_or_default(),
+                            session.id.map(|s| s.0).unwrap_or_default().into_boxed_str(),
                             session.title.map(|s| s.0).unwrap_or_default(),
                         )]
                     })
@@ -1045,7 +1045,7 @@ pub fn collect_stats() -> Stats {
         if let Some((session_id, day)) = key.split_once('|') {
             session_sorted_days
                 .entry(session_id.into())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(day.into());
         }
     }
@@ -1450,7 +1450,7 @@ fn truncate_string(s: &str, max: usize) -> Box<str> {
 
     // Slow path for non-ASCII: count chars properly
     if s.chars().count() <= max {
-        return s.into();
+        s.into()
     } else {
         // Find the byte position where we need to truncate
         let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
