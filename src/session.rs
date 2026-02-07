@@ -11,6 +11,8 @@ use ratatui::{
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 /// Scroll increment for smooth scrolling experience (1 line = smoothest)
 const SCROLL_INCREMENT: u16 = 1;
@@ -311,6 +313,36 @@ impl SessionModal {
 
         lines.push(Line::from(""));
 
+        // Project section (best-effort git branch detection)
+        let project = session.path_root.as_ref();
+        if !project.is_empty() {
+            lines.push(Line::from(vec![Span::styled(
+                "  PROJECT",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )]));
+            lines.push(Line::from(vec![
+                Span::raw("    Path:   "),
+                Span::styled(
+                    safe_truncate_plain(project, (area.width.saturating_sub(10)) as usize),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+
+            if let Some(branch) = detect_git_branch(project) {
+                let branch_display =
+                    safe_truncate_plain(&branch, (area.width.saturating_sub(12)) as usize)
+                        .into_owned();
+                lines.push(Line::from(vec![
+                    Span::raw("    Branch: "),
+                    Span::styled(branch_display, Style::default().fg(Color::Cyan)),
+                ]));
+            }
+
+            lines.push(Line::from(""));
+        }
+
         // Model usage section
         if let Some(d) = details {
             let mut total_tokens = 0u64;
@@ -370,11 +402,20 @@ impl SessionModal {
                     + model.tokens.cache_read
                     + model.tokens.cache_write;
 
+                // Calculate available width for model stats
+                let inner_width = area.width.saturating_sub(2) as usize;
+                let left_column_width = 18; // 6 spaces + 10 label + 8 value
+                let separator_width = 7; // "   │   "
+                let right_column_width = 18; // 10 label + 8 value
+                let min_width_for_two_columns =
+                    left_column_width + separator_width + right_column_width;
+                let show_right_column = inner_width >= min_width_for_two_columns;
+
                 for i in 0..5 {
                     let mut spans = Vec::with_capacity(7);
                     spans.push(Span::raw("      "));
 
-                    // Left column
+                    // Left column (always shown)
                     if i < left_labels.len() {
                         let (label, value, color) = &left_labels[i];
                         spans.push(Span::styled(
@@ -389,22 +430,25 @@ impl SessionModal {
                         spans.push(Span::raw(" ".repeat(18)));
                     }
 
-                    spans.push(Span::styled(
-                        "   │   ",
-                        Style::default().fg(Color::Rgb(40, 40, 50)),
-                    ));
+                    // Only show separator and right column if there's enough width
+                    if show_right_column {
+                        spans.push(Span::styled(
+                            "   │   ",
+                            Style::default().fg(Color::Rgb(40, 40, 50)),
+                        ));
 
-                    // Right column
-                    if i < right_labels.len() {
-                        let (label, value, _color) = &right_labels[i];
-                        spans.push(Span::styled(
-                            format!("{:<10}", label),
-                            Style::default().fg(Color::White),
-                        ));
-                        spans.push(Span::styled(
-                            format!("{:>8}", value),
-                            Style::default().fg(Color::White),
-                        ));
+                        // Right column
+                        if i < right_labels.len() {
+                            let (label, value, color) = &right_labels[i];
+                            spans.push(Span::styled(
+                                format!("{:<10}", label),
+                                Style::default().fg(*color),
+                            ));
+                            spans.push(Span::styled(
+                                format!("{:>8}", value),
+                                Style::default().fg(Color::White),
+                            ));
+                        }
                     }
 
                     lines.push(Line::from(spans));
@@ -421,10 +465,7 @@ impl SessionModal {
                     .add_modifier(Modifier::BOLD),
             )]));
             lines.push(Line::from(vec![
-                Span::styled(
-                    "      Combined Tokens: ",
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled("      Tokens:   ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format_number(total_tokens),
                     Style::default()
@@ -433,14 +474,35 @@ impl SessionModal {
                 ),
             ]));
             lines.push(Line::from(vec![
+                Span::styled("      Messages: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    "      Combined Savings: ",
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    "$0.00",
+                    session.messages.to_string(),
                     Style::default()
-                        .fg(Color::Green)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("      Cost:     ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("${:.2}", session.cost),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            let savings = 0.0f64;
+            let (savings_text, savings_color) = if savings < 0.0 {
+                (format!("-${:.2}", savings.abs()), Color::Red)
+            } else {
+                (format!("${:.2}", savings), Color::Green)
+            };
+            lines.push(Line::from(vec![
+                Span::styled("      Savings:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    savings_text,
+                    Style::default()
+                        .fg(savings_color)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
@@ -456,14 +518,24 @@ impl SessionModal {
             // File changes section
             if !session.file_diffs.is_empty() {
                 lines.push(Line::from(vec![Span::styled(
-                    "  FILE CHANGES ",
+                    "  FILE CHANGES",
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 )]));
-                lines.push(Line::from(""));
 
-                let path_display_width = (area.width.saturating_sub(42)) as usize;
+                let max_val_len = 7usize;
+                let diff_block_width = (max_val_len + 1) * 2 + 3; // 19 (8+3+8)
+                let fixed_prefix = 14; // 4 + 10
+                let status_sep = 1;
+                let path_sep = 2;
+                let right_margin = 5; // Add space at the end of the panel
+
+                let inner_width = area.width.saturating_sub(2) as usize;
+                let needed_width =
+                    fixed_prefix + status_sep + path_sep + diff_block_width + right_margin;
+                let path_display_width = inner_width.saturating_sub(needed_width);
+                let show_diffs = inner_width >= needed_width;
 
                 for f in &session.file_diffs {
                     let status_text = match f.status.as_ref() {
@@ -473,76 +545,85 @@ impl SessionModal {
                         _ => " unknown",
                     };
 
-                    let short_path = if f.path.len() > path_display_width
-                        && f.path.chars().count() > path_display_width
-                    {
-                        let visible_chars = path_display_width.saturating_sub(3);
-                        let truncated: String = f.path.chars().take(visible_chars).collect();
-                        format!("{}...", truncated)
-                    } else {
-                        format!("{:<width$}", f.path, width = path_display_width)
-                    };
-
                     let mut file_spans = Vec::with_capacity(10);
                     file_spans.push(Span::raw("    "));
                     file_spans.push(Span::styled(
                         format!("[{}]", status_text),
                         Style::default().fg(Color::DarkGray),
                     ));
-                    file_spans.push(Span::raw(" "));
-                    file_spans.push(Span::styled(short_path, Style::default().fg(Color::White)));
-                    file_spans.push(Span::raw(" "));
-                    file_spans.push(Span::styled(
-                        format!("{:>7}", format_number(f.additions)),
-                        Style::default().fg(Color::Green),
-                    ));
-                    file_spans.push(Span::styled("+", Style::default().fg(Color::Green)));
-                    file_spans.push(Span::styled(
-                        " │ ",
-                        Style::default().fg(Color::Rgb(40, 40, 50)),
-                    ));
-                    file_spans.push(Span::styled(
-                        format!("{:>7}", format_number(f.deletions)),
-                        Style::default().fg(Color::Red),
-                    ));
-                    file_spans.push(Span::styled("-", Style::default().fg(Color::Red)));
+
+                    if show_diffs {
+                        file_spans.push(Span::raw(" ")); // status_sep
+
+                        let path_count = f.path.chars().count();
+                        let short_path = if path_count > path_display_width {
+                            let visible_chars = path_display_width.saturating_sub(3);
+                            let truncated: String = f.path.chars().take(visible_chars).collect();
+                            format!("{}...", truncated)
+                        } else {
+                            format!("{:<width$}", f.path, width = path_display_width)
+                        };
+
+                        file_spans
+                            .push(Span::styled(short_path, Style::default().fg(Color::White)));
+                        file_spans.push(Span::raw("  ")); // path_sep
+
+                        let add_str = format_number(f.additions);
+                        let add_sign_str = format!("+{}", add_str);
+                        file_spans.push(Span::styled(
+                            format!("{:>width$}", add_sign_str, width = max_val_len + 1),
+                            Style::default().fg(Color::Green),
+                        ));
+                        file_spans.push(Span::styled(
+                            " │ ",
+                            Style::default().fg(Color::Rgb(40, 40, 50)),
+                        ));
+                        let del_str = format_number(f.deletions);
+                        let del_sign_str = format!("-{}", del_str);
+                        file_spans.push(Span::styled(
+                            format!("{:>width$}", del_sign_str, width = max_val_len + 1),
+                            Style::default().fg(Color::Red),
+                        ));
+                    }
                     lines.push(Line::from(file_spans));
                 }
 
-                // Sum it up for file changes
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![Span::styled(
-                    "    TOTAL FILE CHANGES",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )]));
-                lines.push(Line::from(vec![
-                    Span::raw("      "),
-                    Span::styled("Added Lines:   ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{:>7}", format_number(session.diffs.additions)),
+                // Add separator line and total (without "total" label)
+                if show_diffs {
+                    let mut sep_spans = Vec::new();
+                    let diff_start = fixed_prefix + status_sep + path_display_width + path_sep;
+                    sep_spans.push(Span::raw(" ".repeat(diff_start)));
+
+                    let dash_part = "─".repeat(max_val_len + 1); // 8
+                    sep_spans.push(Span::styled(
+                        format!("{}─┼─{}", dash_part, dash_part),
+                        Style::default().fg(Color::Rgb(40, 40, 50)),
+                    ));
+                    lines.push(Line::from(sep_spans));
+
+                    let mut total_spans = Vec::with_capacity(4);
+                    total_spans.push(Span::raw(" ".repeat(diff_start)));
+
+                    let add_str = format_number(session.diffs.additions);
+                    let add_sign_str = format!("+{}", add_str);
+                    total_spans.push(Span::styled(
+                        format!("{:>width$}", add_sign_str, width = max_val_len + 1),
                         Style::default()
                             .fg(Color::Green)
                             .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        "+",
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("   │   ", Style::default().fg(Color::Rgb(40, 40, 50))),
-                    Span::styled("Deleted Lines: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{:>7}", format_number(session.diffs.deletions)),
+                    ));
+                    total_spans.push(Span::styled(
+                        " │ ",
+                        Style::default().fg(Color::Rgb(40, 40, 50)),
+                    ));
+                    let del_str = format_number(session.diffs.deletions);
+                    let del_sign_str = format!("-{}", del_str);
+                    total_spans.push(Span::styled(
+                        format!("{:>width$}", del_sign_str, width = max_val_len + 1),
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        "-",
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
+                    ));
+                    lines.push(Line::from(total_spans));
+                }
             } else {
                 // No file changes
                 lines.push(Line::from(vec![Span::styled(
@@ -709,11 +790,7 @@ impl SessionModal {
         self.chat_max_scroll = (lines.len().saturating_sub(inner_height)) as u16;
         self.chat_scroll = self.chat_scroll.min(self.chat_max_scroll);
         let scroll = self.chat_scroll as usize;
-        let visible: Vec<Line> = lines
-            .into_iter()
-            .skip(scroll)
-            .take(inner_height)
-            .collect();
+        let visible: Vec<Line> = lines.into_iter().skip(scroll).take(inner_height).collect();
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -841,5 +918,55 @@ fn get_role_info(role: &str) -> (&'static str, String, Color) {
         "assistant" => ("🤖", "ASSISTANT".to_string(), Color::Green),
         "system" => ("⚙", "SYSTEM".to_string(), Color::Yellow),
         _ => ("?", role.to_uppercase(), Color::White),
+    }
+}
+
+fn detect_git_branch(root: &str) -> Option<String> {
+    let root_path = Path::new(root);
+    if root_path.as_os_str().is_empty() {
+        return None;
+    }
+
+    let git_path = root_path.join(".git");
+    let head_path = if git_path.is_dir() {
+        git_path.join("HEAD")
+    } else if git_path.is_file() {
+        let Ok(contents) = fs::read_to_string(&git_path) else {
+            return None;
+        };
+        let gitdir = contents
+            .lines()
+            .find_map(|l| l.strip_prefix("gitdir:"))
+            .map(|s| s.trim())?;
+        let gitdir_path = PathBuf::from(gitdir);
+        let resolved = if gitdir_path.is_absolute() {
+            gitdir_path
+        } else {
+            root_path.join(gitdir_path)
+        };
+        resolved.join("HEAD")
+    } else {
+        return None;
+    };
+
+    let Ok(head) = fs::read_to_string(head_path) else {
+        return None;
+    };
+    let head = head.trim();
+    if let Some(ref_line) = head.strip_prefix("ref:") {
+        let ref_path = ref_line.trim();
+        let branch = ref_path
+            .strip_prefix("refs/heads/")
+            .unwrap_or(ref_path)
+            .to_string();
+        if branch.is_empty() {
+            None
+        } else {
+            Some(branch)
+        }
+    } else if !head.is_empty() {
+        Some(format!("detached {}", &head[..head.len().min(7)]))
+    } else {
+        None
     }
 }

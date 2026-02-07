@@ -687,7 +687,7 @@ fn sort_file_diffs(file_diffs: &mut [FileDiff]) {
     });
 }
 
-fn load_session_diff_map() -> HashMap<String, Vec<FileDiff>> {
+pub(crate) fn load_session_diff_map() -> HashMap<String, Vec<FileDiff>> {
     let diff_path = get_storage_path("session_diff");
     let root = Path::new(&diff_path);
     let Ok(entries) = fs::read_dir(root) else {
@@ -1097,8 +1097,7 @@ pub fn collect_stats() -> Stats {
                             let prev_key: Box<str> =
                                 format!("{}|{}", sess_id, prev_day).into_boxed_str();
                             if let Some(prev_map) = session_day_union_diffs.get(&prev_key) {
-                                let prev_vec: Vec<FileDiff> =
-                                    prev_map.values().cloned().collect();
+                                let prev_vec: Vec<FileDiff> = prev_map.values().cloned().collect();
                                 diffs = compute_incremental_diffs(&diffs, &prev_vec);
                             }
                         }

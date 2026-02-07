@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-const CACHE_FORMAT_VERSION: u64 = 3;
+const CACHE_FORMAT_VERSION: u64 = 4;
 
 /// Cached statistics with version tracking
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +20,15 @@ pub struct CachedStats {
     pub file_hashes: HashMap<String, u64>,
     #[serde(default)]
     pub format_version: u64,
+    #[serde(default)]
+    pub session_day_union_diffs:
+        HashMap<String, HashMap<String, crate::stats::FileDiff>>,
+    #[serde(default)]
+    pub session_sorted_days: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub session_diff_map: HashMap<String, Vec<crate::stats::FileDiff>>,
+    #[serde(default)]
+    pub session_diff_totals: HashMap<String, (u64, u64)>,
 }
 
 /// Incremental updater for stats
@@ -50,6 +59,10 @@ impl StatsCache {
                 version: 0,
                 file_hashes: HashMap::new(),
                 format_version: CACHE_FORMAT_VERSION,
+                session_day_union_diffs: HashMap::new(),
+                session_sorted_days: HashMap::new(),
+                session_diff_map: HashMap::new(),
+                session_diff_totals: HashMap::new(),
             })),
         })
     }
@@ -66,6 +79,18 @@ impl StatsCache {
                                 stats_lock.stats.clone_from(&cached.stats);
                                 stats_lock.version = cached.version;
                                 stats_lock.file_hashes.clone_from(&cached.file_hashes);
+                                stats_lock
+                                    .session_day_union_diffs
+                                    .clone_from(&cached.session_day_union_diffs);
+                                stats_lock
+                                    .session_sorted_days
+                                    .clone_from(&cached.session_sorted_days);
+                                stats_lock
+                                    .session_diff_map
+                                    .clone_from(&cached.session_diff_map);
+                                stats_lock
+                                    .session_diff_totals
+                                    .clone_from(&cached.session_diff_totals);
                                 return cached.stats.clone();
                             }
                         }
@@ -186,9 +211,7 @@ impl StatsCache {
         } else {
             for p in &paths {
                 if p.contains("message/") {
-                    if let Some(session_id) =
-                        self.incrementally_update_messages(&mut cached.stats, p)
-                    {
+                    if let Some(session_id) = self.incrementally_update_messages(cached, p) {
                         affected_sessions.insert(session_id);
                     }
                 } else if p.contains("part/") {
@@ -221,6 +244,20 @@ impl StatsCache {
     fn update_cache(&self, stats: &crate::stats::Stats) {
         let mut cached = self.stats.write();
         cached.stats.clone_from(stats);
+        cached.session_diff_map = crate::stats::load_session_diff_map();
+        cached.session_diff_totals = cached
+            .session_diff_map
+            .iter()
+            .map(|(id, diffs)| {
+                let adds: u64 = diffs.iter().map(|d| d.additions).sum();
+                let dels: u64 = diffs.iter().map(|d| d.deletions).sum();
+                (id.clone(), (adds, dels))
+            })
+            .collect();
+        let message_files = self.list_message_files();
+        let (union_diffs, sorted_days) = self.build_session_day_union_diffs(&message_files);
+        cached.session_day_union_diffs = union_diffs;
+        cached.session_sorted_days = sorted_days;
         cached.version += 1;
         cached.format_version = CACHE_FORMAT_VERSION;
         cached.file_hashes.clear();
@@ -236,6 +273,176 @@ impl StatsCache {
         if let Ok(data) = serialize(&*cached) {
             let _ = fs::write(&self.cache_path, data);
         }
+    }
+
+    fn list_message_files(&self) -> Vec<PathBuf> {
+        let message_path = self._storage_path.join("message");
+        if !message_path.exists() {
+            return Vec::new();
+        }
+        let Ok(entries) = fs::read_dir(&message_path) else {
+            return Vec::new();
+        };
+        let mut files = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Ok(sub_entries) = fs::read_dir(&path) {
+                    for sub in sub_entries.flatten() {
+                        let sp = sub.path();
+                        if sp.extension().is_some_and(|e| e == "json") {
+                            files.push(sp);
+                        }
+                    }
+                }
+            } else if path.extension().is_some_and(|e| e == "json") {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    fn build_session_day_union_diffs(
+        &self,
+        files: &[PathBuf],
+    ) -> (
+        HashMap<String, HashMap<String, crate::stats::FileDiff>>,
+        HashMap<String, Vec<String>>,
+    ) {
+        let mut union: HashMap<String, HashMap<String, crate::stats::FileDiff>> = HashMap::new();
+        let mut session_sorted_days: HashMap<String, Vec<String>> = HashMap::new();
+        let mut processed_ids: HashSet<Box<str>> = HashSet::with_capacity(files.len());
+
+        let mut messages: Vec<(crate::stats::Message, PathBuf)> = files
+            .par_iter()
+            .filter_map(|p| {
+                let bytes = fs::read(p).ok()?;
+                let msg: crate::stats::Message = serde_json::from_slice(&bytes).ok()?;
+                Some((msg, p.clone()))
+            })
+            .collect();
+
+        messages.sort_unstable_by_key(|(m, _)| {
+            m.time
+                .as_ref()
+                .and_then(|t| t.created.map(|v| *v))
+                .unwrap_or(0)
+        });
+
+        for (msg, path) in messages {
+            let message_id = match msg.id.clone() {
+                Some(id) if !id.0.is_empty() => id.0.into_boxed_str(),
+                _ => path.to_string_lossy().to_string().into_boxed_str(),
+            };
+            if !processed_ids.insert(message_id) {
+                continue;
+            }
+
+            let session_id = msg
+                .session_id
+                .as_ref()
+                .map(|s| s.0.clone())
+                .unwrap_or_default();
+            if session_id.is_empty() {
+                continue;
+            }
+            let ts = msg.time.as_ref().and_then(|t| t.created.map(|v| *v));
+            let day = crate::stats::get_day(ts);
+
+            let diffs = Self::extract_cumulative_diffs(&msg);
+            if diffs.is_empty() {
+                continue;
+            }
+            let key = format!("{}|{}", session_id, day);
+            let file_map = union.entry(key).or_insert_with(HashMap::new);
+            for d in diffs {
+                if d.path.is_empty() {
+                    continue;
+                }
+                file_map.insert(d.path.to_string(), d);
+            }
+
+            let days = session_sorted_days.entry(session_id).or_default();
+            if days.binary_search(&day).is_err() {
+                days.push(day);
+                days.sort_unstable();
+            }
+        }
+
+        (union, session_sorted_days)
+    }
+
+    fn extract_cumulative_diffs(msg: &crate::stats::Message) -> Vec<crate::stats::FileDiff> {
+        msg.summary
+            .as_ref()
+            .and_then(|s| s.diffs.as_ref())
+            .map(|diffs| {
+                diffs
+                    .iter()
+                    .map(|d| crate::stats::FileDiff {
+                        path: d
+                            .file
+                            .as_ref()
+                            .map(|s| s.0.clone())
+                            .unwrap_or_default()
+                            .into_boxed_str(),
+                        additions: d.additions.map(|v| *v).unwrap_or(0),
+                        deletions: d.deletions.map(|v| *v).unwrap_or(0),
+                        status: d
+                            .status
+                            .as_ref()
+                            .map(|s| s.0.clone())
+                            .unwrap_or_else(|| "modified".into())
+                            .into_boxed_str(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn sort_file_diffs(file_diffs: &mut [crate::stats::FileDiff]) {
+        file_diffs.sort_by(|a, b| {
+            let order = |st: &str| match st {
+                "modified" => 0,
+                "added" => 1,
+                "deleted" => 2,
+                _ => 3,
+            };
+            order(&a.status)
+                .cmp(&order(&b.status))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+    }
+
+    fn compute_incremental_diffs(
+        current: &[crate::stats::FileDiff],
+        previous: &[crate::stats::FileDiff],
+    ) -> Vec<crate::stats::FileDiff> {
+        let prev_map: HashMap<&str, &crate::stats::FileDiff> =
+            previous.iter().map(|d| (d.path.as_ref(), d)).collect();
+
+        current
+            .iter()
+            .filter_map(|curr| {
+                let (adds, dels, status) = if let Some(prev) = prev_map.get(curr.path.as_ref()) {
+                    let a = curr.additions.saturating_sub(prev.additions);
+                    let d = curr.deletions.saturating_sub(prev.deletions);
+                    if a == 0 && d == 0 {
+                        return None;
+                    }
+                    (a, d, curr.status.clone())
+                } else {
+                    (curr.additions, curr.deletions, curr.status.clone())
+                };
+
+                Some(crate::stats::FileDiff {
+                    path: curr.path.clone(),
+                    additions: adds,
+                    deletions: dels,
+                    status,
+                })
+            })
+            .collect()
     }
 
     fn compute_file_hash(&self, path: &str) -> Option<u64> {
@@ -296,9 +503,10 @@ impl StatsCache {
 
     fn incrementally_update_messages(
         &self,
-        stats: &mut crate::stats::Stats,
+        cached: &mut CachedStats,
         path: &str,
     ) -> Option<String> {
+        let stats = &mut cached.stats;
         let Ok(bytes) = fs::read(path) else {
             return None;
         };
@@ -443,70 +651,121 @@ impl StatsCache {
                     s.path_root = root.clone().into();
                 }
             }
+        }
 
-            // Merge summary.diffs into session file_diffs (union-of-latest per file)
-            if let Some(summary) = &msg.summary {
-                if let Some(diffs) = &summary.diffs {
-                    let mut file_map: HashMap<Box<str>, crate::stats::FileDiff> = s
-                        .file_diffs
-                        .drain(..)
-                        .map(|fd| (fd.path.clone(), fd))
-                        .collect();
-                    for d in diffs {
-                        let path: Box<str> = d
-                            .file
-                            .as_ref()
-                            .map(|s| s.0.clone())
-                            .unwrap_or_default()
-                            .into_boxed_str();
-                        if path.is_empty() {
-                            continue;
-                        }
-                        let fd = crate::stats::FileDiff {
-                            path: path.clone(),
-                            additions: d.additions.map(|v| *v).unwrap_or(0),
-                            deletions: d.deletions.map(|v| *v).unwrap_or(0),
-                            status: d
-                                .status
-                                .as_ref()
-                                .map(|s| s.0.clone())
-                                .unwrap_or_else(|| "modified".into())
-                                .into_boxed_str(),
-                        };
-                        file_map.insert(path, fd);
-                    }
-                    s.file_diffs = file_map.into_values().collect();
-                    s.file_diffs.sort_by(|a, b| {
-                        let order = |st: &str| match st {
-                            "modified" => 0,
-                            "added" => 1,
-                            "deleted" => 2,
-                            _ => 3,
-                        };
-                        order(&a.status)
-                            .cmp(&order(&b.status))
-                            .then_with(|| a.path.cmp(&b.path))
-                    });
-                    let adds: u64 = s.file_diffs.iter().map(|f| f.additions).sum();
-                    let dels: u64 = s.file_diffs.iter().map(|f| f.deletions).sum();
-                    s.diffs.additions = adds;
-                    s.diffs.deletions = dels;
+        let cumulative_diffs = Self::extract_cumulative_diffs(&msg);
+        if !session_id.is_empty() && !cumulative_diffs.is_empty() {
+            let key = format!("{}|{}", session_id, day);
+            let file_map = cached
+                .session_day_union_diffs
+                .entry(key)
+                .or_insert_with(HashMap::new);
+            for d in cumulative_diffs {
+                if d.path.is_empty() {
+                    continue;
                 }
+                file_map.insert(d.path.to_string(), d);
             }
         }
 
-        // Recompute day diff totals from all sessions
-        if let Some(d_stat) = stats.per_day.get_mut(&day) {
-            d_stat.diffs.additions = d_stat
-                .sessions
-                .values()
-                .map(|ss| ss.diffs.additions)
-                .sum();
-            d_stat.diffs.deletions = d_stat
-                .sessions
-                .values()
-                .map(|ss| ss.diffs.deletions)
-                .sum();
+        if !session_id.is_empty() {
+            let days = cached
+                .session_sorted_days
+                .entry(session_id.clone())
+                .or_default();
+            if days.binary_search(&day).is_err() {
+                days.push(day.clone());
+                days.sort_unstable();
+            }
+
+            if let Some(sorted_days) = cached.session_sorted_days.get(&session_id).cloned() {
+                let start_pos = sorted_days
+                    .iter()
+                    .position(|d| d == &day)
+                    .unwrap_or(0);
+                let first_day = sorted_days.first().cloned().unwrap_or_else(|| day.clone());
+                for (idx, day_str) in sorted_days.iter().enumerate().skip(start_pos) {
+                    let lookup_key = format!("{}|{}", session_id, day_str);
+                    let current_day_diffs: Vec<crate::stats::FileDiff> = cached
+                        .session_day_union_diffs
+                        .get(&lookup_key)
+                        .map(|m| m.values().cloned().collect())
+                        .unwrap_or_default();
+
+                    let d_stat = stats.per_day.entry(day_str.clone()).or_default();
+                    let s_arc = d_stat
+                        .sessions
+                        .entry(session_id.clone())
+                        .or_insert_with(|| Arc::new(crate::stats::SessionStat::new(session_id.clone())));
+                    let s = Arc::make_mut(s_arc);
+
+                    let is_continuation = *day_str != first_day;
+                    s.is_continuation = is_continuation;
+                    s.first_created_date = if is_continuation {
+                        Some(first_day.clone().into_boxed_str())
+                    } else {
+                        None
+                    };
+                    s.original_session_id = if is_continuation {
+                        Some(session_id.clone().into_boxed_str())
+                    } else {
+                        None
+                    };
+
+                    if !is_continuation {
+                        if let Some(session_diffs) = cached.session_diff_map.get(&session_id) {
+                            s.file_diffs = session_diffs.clone();
+                            if let Some(&(adds, dels)) =
+                                cached.session_diff_totals.get(&session_id)
+                            {
+                                s.diffs.additions = adds;
+                                s.diffs.deletions = dels;
+                            } else {
+                                let adds: u64 = s.file_diffs.iter().map(|d| d.additions).sum();
+                                let dels: u64 = s.file_diffs.iter().map(|d| d.deletions).sum();
+                                s.diffs.additions = adds;
+                                s.diffs.deletions = dels;
+                            }
+                        } else {
+                            let mut diffs = current_day_diffs;
+                            Self::sort_file_diffs(&mut diffs);
+                            let adds: u64 = diffs.iter().map(|d| d.additions).sum();
+                            let dels: u64 = diffs.iter().map(|d| d.deletions).sum();
+                            s.file_diffs = diffs;
+                            s.diffs.additions = adds;
+                            s.diffs.deletions = dels;
+                        }
+                    } else {
+                        let mut diffs = current_day_diffs;
+                        if idx > 0 {
+                            let prev_day = &sorted_days[idx - 1];
+                            let prev_key = format!("{}|{}", session_id, prev_day);
+                            if let Some(prev_map) = cached.session_day_union_diffs.get(&prev_key) {
+                                let prev_vec: Vec<crate::stats::FileDiff> =
+                                    prev_map.values().cloned().collect();
+                                diffs = Self::compute_incremental_diffs(&diffs, &prev_vec);
+                            }
+                        }
+                        Self::sort_file_diffs(&mut diffs);
+                        let adds: u64 = diffs.iter().map(|d| d.additions).sum();
+                        let dels: u64 = diffs.iter().map(|d| d.deletions).sum();
+                        s.file_diffs = diffs;
+                        s.diffs.additions = adds;
+                        s.diffs.deletions = dels;
+                    }
+
+                    d_stat.diffs.additions = d_stat
+                        .sessions
+                        .values()
+                        .map(|ss| ss.diffs.additions)
+                        .sum();
+                    d_stat.diffs.deletions = d_stat
+                        .sessions
+                        .values()
+                        .map(|ss| ss.diffs.deletions)
+                        .sum();
+                }
+            }
         }
 
         Some(session_id)
