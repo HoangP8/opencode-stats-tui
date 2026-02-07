@@ -10,12 +10,16 @@ use std::{
     time::Duration,
 };
 
+const CACHE_FORMAT_VERSION: u64 = 3;
+
 /// Cached statistics with version tracking
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedStats {
     pub stats: crate::stats::Stats,
     pub version: u64,
     pub file_hashes: HashMap<String, u64>,
+    #[serde(default)]
+    pub format_version: u64,
 }
 
 /// Incremental updater for stats
@@ -45,6 +49,7 @@ impl StatsCache {
                 stats: crate::stats::Stats::default(),
                 version: 0,
                 file_hashes: HashMap::new(),
+                format_version: CACHE_FORMAT_VERSION,
             })),
         })
     }
@@ -80,6 +85,9 @@ impl StatsCache {
     }
 
     fn validate_cache_fast(&self, cached: &CachedStats) -> bool {
+        if cached.format_version != CACHE_FORMAT_VERSION {
+            return false;
+        }
         let cache_meta = match fs::metadata(&self.cache_path) {
             Ok(m) => m,
             Err(_) => return false,
@@ -166,8 +174,9 @@ impl StatsCache {
         let has_session_changes = paths
             .iter()
             .any(|p| p.contains("session.json") || p.contains("session_diff/"));
+        let has_message_changes = paths.iter().any(|p| p.contains("message/"));
 
-        if has_session_changes {
+        if has_session_changes || has_message_changes {
             cached.stats = crate::stats::collect_stats();
             for day_stat in cached.stats.per_day.values() {
                 for id in day_stat.sessions.keys() {
@@ -194,6 +203,7 @@ impl StatsCache {
         }
 
         cached.version += 1;
+        cached.format_version = CACHE_FORMAT_VERSION;
 
         for p in &paths {
             if let Some(h) = self.compute_file_hash(p) {
@@ -212,6 +222,7 @@ impl StatsCache {
         let mut cached = self.stats.write();
         cached.stats.clone_from(stats);
         cached.version += 1;
+        cached.format_version = CACHE_FORMAT_VERSION;
         cached.file_hashes.clear();
 
         if let Ok(files) = self.list_all_files() {
@@ -382,7 +393,11 @@ impl StatsCache {
                 cost,
             });
         }
-        if let Some(agent) = msg.agent.as_ref().map(|s| s.0.as_str()).filter(|s| !s.is_empty())
+        if let Some(agent) = msg
+            .agent
+            .as_ref()
+            .map(|s| s.0.as_str())
+            .filter(|s| !s.is_empty())
         {
             if let Some(m) = stats.model_usage.iter_mut().find(|m| *m.name == *model_id) {
                 *m.agents
@@ -391,40 +406,107 @@ impl StatsCache {
             }
         }
 
-        let d = stats.per_day.entry(day).or_default();
-        d.messages += 1;
-        d.cost += cost;
-        d.tokens.input += tokens_add.input;
-        d.tokens.output += tokens_add.output;
-        d.tokens.reasoning += tokens_add.reasoning;
-        d.tokens.cache_read += tokens_add.cache_read;
-        d.tokens.cache_write += tokens_add.cache_write;
+        // Scoped block to limit borrows of stats.per_day
+        {
+            let d = stats.per_day.entry(day.clone()).or_default();
+            d.messages += 1;
+            d.cost += cost;
+            d.tokens.input += tokens_add.input;
+            d.tokens.output += tokens_add.output;
+            d.tokens.reasoning += tokens_add.reasoning;
+            d.tokens.cache_read += tokens_add.cache_read;
+            d.tokens.cache_write += tokens_add.cache_write;
 
-        let s_arc = d
-            .sessions
-            .entry(session_id.clone())
-            .or_insert_with(|| Arc::new(crate::stats::SessionStat::new(session_id.clone())));
-        let s = Arc::make_mut(s_arc);
-        s.messages += 1;
-        s.cost += cost;
-        s.models.insert(model_id);
-        s.tokens.input += tokens_add.input;
-        s.tokens.output += tokens_add.output;
-        s.tokens.reasoning += tokens_add.reasoning;
-        s.tokens.cache_read += tokens_add.cache_read;
-        s.tokens.cache_write += tokens_add.cache_write;
-        if let Some(t) = ts {
-            if t > s.last_activity {
-                s.last_activity = t;
+            let s_arc = d
+                .sessions
+                .entry(session_id.clone())
+                .or_insert_with(|| Arc::new(crate::stats::SessionStat::new(session_id.clone())));
+            let s = Arc::make_mut(s_arc);
+            s.messages += 1;
+            s.cost += cost;
+            s.models.insert(model_id);
+            s.tokens.input += tokens_add.input;
+            s.tokens.output += tokens_add.output;
+            s.tokens.reasoning += tokens_add.reasoning;
+            s.tokens.cache_read += tokens_add.cache_read;
+            s.tokens.cache_write += tokens_add.cache_write;
+            if let Some(t) = ts {
+                if t > s.last_activity {
+                    s.last_activity = t;
+                }
+            }
+            if let Some(p) = &msg.path {
+                if let Some(cwd) = &p.cwd {
+                    s.path_cwd = cwd.clone().into();
+                }
+                if let Some(root) = &p.root {
+                    s.path_root = root.clone().into();
+                }
+            }
+
+            // Merge summary.diffs into session file_diffs (union-of-latest per file)
+            if let Some(summary) = &msg.summary {
+                if let Some(diffs) = &summary.diffs {
+                    let mut file_map: HashMap<Box<str>, crate::stats::FileDiff> = s
+                        .file_diffs
+                        .drain(..)
+                        .map(|fd| (fd.path.clone(), fd))
+                        .collect();
+                    for d in diffs {
+                        let path: Box<str> = d
+                            .file
+                            .as_ref()
+                            .map(|s| s.0.clone())
+                            .unwrap_or_default()
+                            .into_boxed_str();
+                        if path.is_empty() {
+                            continue;
+                        }
+                        let fd = crate::stats::FileDiff {
+                            path: path.clone(),
+                            additions: d.additions.map(|v| *v).unwrap_or(0),
+                            deletions: d.deletions.map(|v| *v).unwrap_or(0),
+                            status: d
+                                .status
+                                .as_ref()
+                                .map(|s| s.0.clone())
+                                .unwrap_or_else(|| "modified".into())
+                                .into_boxed_str(),
+                        };
+                        file_map.insert(path, fd);
+                    }
+                    s.file_diffs = file_map.into_values().collect();
+                    s.file_diffs.sort_by(|a, b| {
+                        let order = |st: &str| match st {
+                            "modified" => 0,
+                            "added" => 1,
+                            "deleted" => 2,
+                            _ => 3,
+                        };
+                        order(&a.status)
+                            .cmp(&order(&b.status))
+                            .then_with(|| a.path.cmp(&b.path))
+                    });
+                    let adds: u64 = s.file_diffs.iter().map(|f| f.additions).sum();
+                    let dels: u64 = s.file_diffs.iter().map(|f| f.deletions).sum();
+                    s.diffs.additions = adds;
+                    s.diffs.deletions = dels;
+                }
             }
         }
-        if let Some(p) = &msg.path {
-            if let Some(cwd) = &p.cwd {
-                s.path_cwd = cwd.clone().into();
-            }
-            if let Some(root) = &p.root {
-                s.path_root = root.clone().into();
-            }
+
+        // Recompute day diff totals from all sessions
+        if let Some(d_stat) = stats.per_day.get_mut(&day) {
+            d_stat.diffs.additions = d_stat
+                .sessions
+                .values()
+                .map(|ss| ss.diffs.additions)
+                .sum();
+            d_stat.diffs.deletions = d_stat
+                .sessions
+                .values()
+                .map(|ss| ss.diffs.deletions)
+                .sum();
         }
 
         Some(session_id)

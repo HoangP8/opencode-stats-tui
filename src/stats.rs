@@ -869,17 +869,18 @@ pub fn collect_stats() -> Stats {
             .unwrap_or(0)
     });
 
-    // Track last message's cumulative diff state per session per day
-    // Key: "session_id|day" -> cumulative diffs from last message of that day
-    // Using concatenated string key to enable zero-allocation lookups
-    let mut session_day_last_diffs: HashMap<Box<str>, Vec<FileDiff>> = HashMap::with_capacity(64);
+    // Track union of latest per-file cumulative diff state per session per day
+    // Key: "session_id|day" -> { file_path -> latest FileDiff seen that day }
+    // Each message only contains files from that edit; we union across all messages
+    let mut session_day_union_diffs: HashMap<Box<str>, HashMap<Box<str>, FileDiff>> =
+        HashMap::with_capacity(64);
 
     for data in processed_data {
         // Skip duplicate messages (same message_id seen before)
         if !processed_message_ids.insert(data.message_id) {
             continue;
         }
-        
+
         let msg = &data.msg;
         let session_id: String = msg
             .session_id
@@ -934,7 +935,9 @@ pub fn collect_stats() -> Stats {
         model_entry.messages += 1;
         // Optimization: only insert if not already present (avoid allocation on common path)
         if !session_id.is_empty() && !model_entry.sessions.contains(session_id.as_str()) {
-            model_entry.sessions.insert(session_id.clone().into_boxed_str());
+            model_entry
+                .sessions
+                .insert(session_id.clone().into_boxed_str());
         }
         model_entry.cost += cost;
         add_tokens(&mut model_entry.tokens, &msg.tokens);
@@ -1010,11 +1013,19 @@ pub fn collect_stats() -> Stats {
             }
         }
 
-        // Track cumulative diff state from last message of each session per day
-        // Since messages are sorted by time, later messages overwrite earlier ones
+        // Accumulate per-file diffs from ALL messages of each session/day (union-of-latest)
+        // Each message's summary.diffs only lists files from that edit, so we merge
+        // across all messages to get the complete picture
         if !session_id.is_empty() && !data.cumulative_diffs.is_empty() {
             let key: Box<str> = format!("{}|{}", session_id, day).into_boxed_str();
-            session_day_last_diffs.insert(key, data.cumulative_diffs);
+            let file_map = session_day_union_diffs
+                .entry(key)
+                .or_insert_with(|| HashMap::with_capacity(data.cumulative_diffs.len()));
+            for d in data.cumulative_diffs {
+                if !d.path.is_empty() {
+                    file_map.insert(d.path.clone(), d);
+                }
+            }
         }
     }
 
@@ -1030,7 +1041,7 @@ pub fn collect_stats() -> Stats {
 
     // Build sorted list of days per session to compute previous day's cumulative state
     let mut session_sorted_days: HashMap<Box<str>, Vec<Box<str>>> = HashMap::with_capacity(64);
-    for key in session_day_last_diffs.keys() {
+    for key in session_day_union_diffs.keys() {
         if let Some((session_id, day)) = key.split_once('|') {
             session_sorted_days
                 .entry(session_id.into())
@@ -1053,24 +1064,42 @@ pub fn collect_stats() -> Stats {
             // Build lookup key once: "session_id|day"
             let lookup_key: Box<str> = format!("{}|{}", sess_id, day_str).into_boxed_str();
 
-            // Get cumulative diff state from last message of THIS day
-            let current_day_diffs = session_day_last_diffs.get(&lookup_key).cloned();
+            // Get union of per-file diff states from ALL messages of THIS day
+            let current_day_diffs: Option<Vec<FileDiff>> = session_day_union_diffs
+                .get(&lookup_key)
+                .map(|m| m.values().cloned().collect());
 
-            if let Some(mut diffs) = current_day_diffs {
-                // For continuation sessions, compute incremental diffs
+            if !sess.is_continuation {
+                // Non-continuation: prefer session_diff (authoritative final state),
+                // fall back to message union diffs, then nothing
+                if let Some(session_diffs) = session_diff_map.get(sess_id.as_ref()) {
+                    sess.file_diffs = session_diffs.clone();
+                    sort_file_diffs(&mut sess.file_diffs);
+                    if let Some(&(adds, dels)) = precomputed_diff_totals.get(sess_id.as_ref()) {
+                        sess.diffs.additions = adds;
+                        sess.diffs.deletions = dels;
+                    }
+                } else if let Some(mut diffs) = current_day_diffs {
+                    sort_file_diffs(&mut diffs);
+                    let adds: u64 = diffs.iter().map(|d| d.additions).sum();
+                    let dels: u64 = diffs.iter().map(|d| d.deletions).sum();
+                    sess.file_diffs = diffs;
+                    sess.diffs.additions = adds;
+                    sess.diffs.deletions = dels;
+                }
+            } else if let Some(mut diffs) = current_day_diffs {
+                // Continuation sessions: compute incremental diffs per day
                 // by subtracting previous day's cumulative state
-                if sess.is_continuation {
-                    if let Some(sorted_days) = session_sorted_days.get(&sess_id) {
-                        // Find the previous day for this session
-                        if let Some(pos) = sorted_days.iter().position(|d| d.as_ref() == day_str) {
-                            if pos > 0 {
-                                let prev_day = &sorted_days[pos - 1];
-                                let prev_key: Box<str> =
-                                    format!("{}|{}", sess_id, prev_day).into_boxed_str();
-                                if let Some(prev_diffs) = session_day_last_diffs.get(&prev_key) {
-                                    // Compute incremental: current - previous
-                                    diffs = compute_incremental_diffs(&diffs, prev_diffs);
-                                }
+                if let Some(sorted_days) = session_sorted_days.get(&sess_id) {
+                    if let Some(pos) = sorted_days.iter().position(|d| d.as_ref() == day_str) {
+                        if pos > 0 {
+                            let prev_day = &sorted_days[pos - 1];
+                            let prev_key: Box<str> =
+                                format!("{}|{}", sess_id, prev_day).into_boxed_str();
+                            if let Some(prev_map) = session_day_union_diffs.get(&prev_key) {
+                                let prev_vec: Vec<FileDiff> =
+                                    prev_map.values().cloned().collect();
+                                diffs = compute_incremental_diffs(&diffs, &prev_vec);
                             }
                         }
                     }
@@ -1082,17 +1111,6 @@ pub fn collect_stats() -> Stats {
                 sess.file_diffs = diffs;
                 sess.diffs.additions = adds;
                 sess.diffs.deletions = dels;
-            } else if let Some(final_diffs) = session_diff_map.get(sess_id.as_ref()) {
-                // Fallback to session_diff file for sessions without message-level diffs
-                // Only use for non-continuation (original day)
-                if !sess.is_continuation {
-                    sess.file_diffs = final_diffs.clone();
-                    sort_file_diffs(&mut sess.file_diffs);
-                    if let Some(&(adds, dels)) = precomputed_diff_totals.get(sess_id.as_ref()) {
-                        sess.diffs.additions = adds;
-                        sess.diffs.deletions = dels;
-                    }
-                }
             }
 
             // Add to day totals

@@ -2381,7 +2381,7 @@ impl App {
         let session = self.selected_session();
         // Optimized: pre-allocate with known capacity (8 lines for session info)
         let mut final_lines = Vec::with_capacity(8);
-        
+
         // Build title for the panel: show session ID and continuation info
         let panel_title = if let Some(s) = &session {
             if s.is_continuation {
@@ -2396,14 +2396,14 @@ impl App {
         } else {
             " SESSION INFO ".to_string()
         };
-        
+
         // Title color: cyan when highlighted/selected, gray otherwise
         let title_color = if is_highlighted {
             Color::Cyan
         } else {
             Color::DarkGray
         };
-        
+
         if let Some(s) = session {
             let title = self
                 .session_titles

@@ -15,11 +15,12 @@ use std::collections::HashMap;
 /// Scroll increment for smooth scrolling experience (1 line = smoothest)
 const SCROLL_INCREMENT: u16 = 1;
 
-/// Cached column rectangles for optimized modal mouse hit-testing
+/// Cached column rectangles and scroll bounds for optimized modal rendering
 #[derive(Default, Clone, Copy)]
 struct ModalRects {
     info: Option<Rect>,
     chat: Option<Rect>,
+    info_max_scroll: u16,
 }
 
 /// Session modal view for displaying detailed session information
@@ -91,17 +92,18 @@ impl SessionModal {
     }
 
     /// Handle keyboard events when modal is open
-    pub fn handle_key_event(&mut self, key: KeyCode, area_height: u16) -> bool {
+    pub fn handle_key_event(&mut self, key: KeyCode, _area_height: u16) -> bool {
         if !self.open {
             return false;
         }
+
+        let info_max = self.cached_rects.info_max_scroll;
 
         match key {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.close();
                 true
             }
-            // Column selection (left/right to switch between Info and Chat)
             KeyCode::Left | KeyCode::Char('h') => {
                 self.selected_column = ModalColumn::Info;
                 true
@@ -110,7 +112,6 @@ impl SessionModal {
                 self.selected_column = ModalColumn::Chat;
                 true
             }
-            // Vertical scrolling (up/down)
             KeyCode::Up | KeyCode::Char('k') => {
                 match self.selected_column {
                     ModalColumn::Info => {
@@ -125,13 +126,7 @@ impl SessionModal {
             KeyCode::Down | KeyCode::Char('j') => {
                 match self.selected_column {
                     ModalColumn::Info => {
-                        // Calculate max scroll for info panel based on content height
-                        let info_max_scroll = if let Some(session) = &self.current_session {
-                            self.calculate_info_max_scroll(area_height, session)
-                        } else {
-                            0
-                        };
-                        self.info_scroll = (self.info_scroll + 1).min(info_max_scroll);
+                        self.info_scroll = (self.info_scroll + 1).min(info_max);
                     }
                     ModalColumn::Chat => {
                         self.chat_scroll = (self.chat_scroll + 1).min(self.chat_max_scroll);
@@ -139,7 +134,6 @@ impl SessionModal {
                 }
                 true
             }
-            // Page up/down
             KeyCode::PageUp => {
                 match self.selected_column {
                     ModalColumn::Info => {
@@ -154,13 +148,7 @@ impl SessionModal {
             KeyCode::PageDown => {
                 match self.selected_column {
                     ModalColumn::Info => {
-                        // Calculate max scroll for info panel based on content height
-                        let info_max_scroll = if let Some(session) = &self.current_session {
-                            self.calculate_info_max_scroll(area_height, session)
-                        } else {
-                            0
-                        };
-                        self.info_scroll = (self.info_scroll + 10).min(info_max_scroll);
+                        self.info_scroll = (self.info_scroll + 10).min(info_max);
                     }
                     ModalColumn::Chat => {
                         self.chat_scroll = (self.chat_scroll + 10).min(self.chat_max_scroll);
@@ -169,92 +157,6 @@ impl SessionModal {
                 true
             }
             _ => false,
-        }
-    }
-
-    /// Calculate the maximum scroll value for the info panel based on content
-    fn calculate_info_max_scroll(&self, area_height: u16, session: &SessionStat) -> u16 {
-        let details = self.session_details.as_ref();
-        let mut total_lines = 2u16; // Header + blank
-
-        if let Some(d) = details {
-            // Model section: 7 lines per model (1 header + 5 data rows + 1 blank)
-            total_lines += (d.model_stats.len() as u16) * 7;
-
-            // Combined models total (3 lines)
-            total_lines += 3;
-
-            // Separator before file changes (2 lines)
-            total_lines += 2;
-
-            // File changes section
-            if !session.file_diffs.is_empty() {
-                // Section header (1 line) + Blank (1 line)
-                total_lines += 2;
-
-                // File entries (one per file)
-                total_lines += session.file_diffs.len() as u16;
-
-                // Blank + Total line (2 lines)
-                total_lines += 2;
-            }
-        }
-
-        // Subtract 4 for borders and title
-        let available_height = area_height.saturating_sub(4);
-
-        if total_lines > available_height {
-            total_lines.saturating_sub(available_height)
-        } else {
-            0
-        }
-    }
-
-    /// Calculate the actual number of rendered lines for the chat panel
-    fn calculate_chat_max_scroll(&self, area_height: u16) -> u16 {
-        let mut total_lines = 0u16;
-
-        for msg in &self.chat_messages {
-            // Header line
-            total_lines += 1;
-
-            for part in &msg.parts {
-                match part {
-                    MessageContent::Text(text) => {
-                        let (_max_line_chars, max_lines) = match &*msg.role {
-                            "user" => (150, 5),
-                            "assistant" => (250, 10),
-                            _ => (200, 6),
-                        };
-
-                        let line_count = text.lines().count();
-                        total_lines += line_count.min(max_lines) as u16;
-
-                        // Add indicator if truncated
-                        if line_count > max_lines {
-                            total_lines += 1;
-                        }
-                    }
-                    MessageContent::ToolCall(_) => {
-                        total_lines += 1;
-                    }
-                    MessageContent::Thinking(_) => {
-                        total_lines += 1;
-                    }
-                }
-            }
-
-            // Blank line between messages
-            total_lines += 1;
-        }
-
-        // Subtract 4 for borders and title
-        let available_height = area_height.saturating_sub(4);
-
-        if total_lines > available_height {
-            total_lines.saturating_sub(available_height)
-        } else {
-            0
         }
     }
 
@@ -322,14 +224,6 @@ impl SessionModal {
         session: &SessionStat,
         session_titles: &HashMap<String, String>,
     ) {
-        // Calculate max scroll for both panels based on content height
-        let info_max_scroll = self.calculate_info_max_scroll(area.height, session);
-        self.chat_max_scroll = self.calculate_chat_max_scroll(area.height);
-
-        // Ensure current scroll doesn't exceed max
-        self.info_scroll = self.info_scroll.min(info_max_scroll);
-        self.chat_scroll = self.chat_scroll.min(self.chat_max_scroll);
-
         // Solid clean background - no blur effect
         let modal_block = Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0)));
 
@@ -356,7 +250,7 @@ impl SessionModal {
             .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(content_area);
 
-        // Cache column rectangles for optimized mouse hit-testing
+        // Cache column rectangles for mouse hit-testing
         self.cached_rects.info = Some(column_chunks[0]);
         self.cached_rects.chat = Some(column_chunks[1]);
 
@@ -391,7 +285,7 @@ impl SessionModal {
 
     /// Render modal info panel
     fn render_modal_info(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         session: &SessionStat,
@@ -665,14 +559,16 @@ impl SessionModal {
             }
         }
 
-        let scroll = self.info_scroll;
-        let info_max_scroll = self.calculate_info_max_scroll(area.height, session);
-        let scroll = scroll.min(info_max_scroll);
-        let visible_height = area.height.saturating_sub(4) as usize;
+        // Compute max scroll from actual content vs inner height (borders = 2)
+        let inner_height = area.height.saturating_sub(2) as usize;
+        let info_max_scroll = (lines.len().saturating_sub(inner_height)) as u16;
+        self.cached_rects.info_max_scroll = info_max_scroll;
+        let scroll = self.info_scroll.min(info_max_scroll);
+        self.info_scroll = scroll;
         let visible: Vec<Line> = lines
             .into_iter()
             .skip(scroll as usize)
-            .take(visible_height)
+            .take(inner_height)
             .collect();
 
         // Build title: show session ID and continuation info
@@ -709,7 +605,7 @@ impl SessionModal {
     }
 
     /// Render modal chat panel
-    fn render_modal_chat(&self, frame: &mut Frame, area: Rect, border_style: Style) {
+    fn render_modal_chat(&mut self, frame: &mut Frame, area: Rect, border_style: Style) {
         // Pre-allocate with estimated capacity to avoid reallocations
         let mut lines = Vec::with_capacity(self.chat_messages.len() * 15);
         let inner_width = area.width.saturating_sub(2) as usize;
@@ -809,13 +705,14 @@ impl SessionModal {
             lines.push(Line::from(""));
         }
 
+        let inner_height = area.height.saturating_sub(2) as usize;
+        self.chat_max_scroll = (lines.len().saturating_sub(inner_height)) as u16;
+        self.chat_scroll = self.chat_scroll.min(self.chat_max_scroll);
         let scroll = self.chat_scroll as usize;
-        // Take only what's needed for the visible area to reduce memory usage
-        let visible_height = area.height.saturating_sub(4) as usize;
         let visible: Vec<Line> = lines
             .into_iter()
             .skip(scroll)
-            .take(visible_height)
+            .take(inner_height)
             .collect();
 
         let block = Block::default()
