@@ -123,7 +123,14 @@ pub struct App {
     model_usage: Vec<ModelUsage>,
     model_list_state: ListState,
     tool_usage: Vec<ToolUsage>,
+    tool_scroll: u16,
+    tool_max_scroll: u16,
+    detail_scroll: u16,
+    detail_max_scroll: u16,
+    model_tool_scroll: u16,
+    model_tool_max_scroll: u16,
     ranking_scroll: usize,
+    ranking_max_scroll: usize,
 
     // Phase 2: Render Caching
     cached_day_strings: HashMap<String, String>, // Pre-formatted day strings with weekday names
@@ -373,7 +380,14 @@ impl App {
             model_usage,
             model_list_state,
             tool_usage,
+            tool_scroll: 0,
+            tool_max_scroll: 0,
+            detail_scroll: 0,
+            detail_max_scroll: 0,
+            model_tool_scroll: 0,
+            model_tool_max_scroll: 0,
             ranking_scroll: 0,
+            ranking_max_scroll: 0,
             cached_session_items: Vec::new(),
             cached_session_width: 0,
             cached_day_strings: HashMap::with_capacity(32),
@@ -1018,8 +1032,13 @@ impl App {
                             }
                         },
                         Focus::Right => match self.left_panel {
+                            LeftPanel::Stats => {
+                                self.tool_scroll = self.tool_scroll.saturating_sub(1);
+                            }
                             LeftPanel::Days => match self.right_panel {
-                                RightPanel::Detail => {}
+                                RightPanel::Detail => {
+                                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                                }
                                 RightPanel::List => {
                                     if self.session_list_state.selected() == Some(0) {
                                         self.right_panel = RightPanel::Detail;
@@ -1031,10 +1050,15 @@ impl App {
                             },
                             LeftPanel::Models => match self.right_panel {
                                 RightPanel::Detail => {}
-                                RightPanel::Tools => self.right_panel = RightPanel::Detail,
-                                RightPanel::List => self.right_panel = RightPanel::Tools,
+                                RightPanel::Tools => {
+                                    self.model_tool_scroll =
+                                        self.model_tool_scroll.saturating_sub(1);
+                                }
+                                RightPanel::List => {
+                                    self.model_previous();
+                                    self.selected_model_index = self.model_list_state.selected();
+                                }
                             },
-                            _ => {}
                         },
                     }
                 } else {
@@ -1051,7 +1075,7 @@ impl App {
                                     self.right_panel = RightPanel::Detail
                                 }
                             },
-                            _ => match self.right_panel {
+                            LeftPanel::Stats | LeftPanel::Days => match self.right_panel {
                                 RightPanel::Detail => {}
                                 _ => self.right_panel = RightPanel::Detail,
                             },
@@ -1076,17 +1100,36 @@ impl App {
                             }
                         },
                         Focus::Right => match self.left_panel {
+                            LeftPanel::Stats => {
+                                if self.tool_scroll < self.tool_max_scroll {
+                                    self.tool_scroll += 1;
+                                }
+                            }
                             LeftPanel::Days => match self.right_panel {
-                                RightPanel::Detail => self.right_panel = RightPanel::List,
+                                RightPanel::Detail => {
+                                    if self.detail_scroll < self.detail_max_scroll {
+                                        self.detail_scroll += 1;
+                                    } else {
+                                        self.right_panel = RightPanel::List;
+                                    }
+                                }
                                 RightPanel::List => self.session_next(),
                                 _ => {}
                             },
                             LeftPanel::Models => match self.right_panel {
                                 RightPanel::Detail => self.right_panel = RightPanel::Tools,
-                                RightPanel::Tools => {}
-                                RightPanel::List => {}
+                                RightPanel::Tools => {
+                                    if self.model_tool_scroll < self.model_tool_max_scroll {
+                                        self.model_tool_scroll += 1;
+                                    } else {
+                                        self.right_panel = RightPanel::List;
+                                    }
+                                }
+                                RightPanel::List => {
+                                    self.model_next();
+                                    self.selected_model_index = self.model_list_state.selected();
+                                }
                             },
-                            _ => {}
                         },
                     }
                 } else {
@@ -1102,7 +1145,7 @@ impl App {
                                     self.right_panel = RightPanel::Tools;
                                 }
                             }
-                            _ => match self.right_panel {
+                            LeftPanel::Stats | LeftPanel::Days => match self.right_panel {
                                 RightPanel::Detail => self.right_panel = RightPanel::List,
                                 RightPanel::List => {}
                                 _ => {}
@@ -1121,7 +1164,10 @@ impl App {
                         }
                         LeftPanel::Models => {
                             if self.right_panel == RightPanel::List {
-                                self.ranking_scroll = self.ranking_scroll.saturating_sub(10);
+                                for _ in 0..10 {
+                                    self.model_previous();
+                                }
+                                self.selected_model_index = self.model_list_state.selected();
                             }
                         }
                         _ => {}
@@ -1154,8 +1200,10 @@ impl App {
                         }
                         LeftPanel::Models => {
                             if self.right_panel == RightPanel::List {
-                                let max_scroll = self.model_usage.len().saturating_sub(1);
-                                self.ranking_scroll = (self.ranking_scroll + 10).min(max_scroll);
+                                for _ in 0..10 {
+                                    self.model_next();
+                                }
+                                self.selected_model_index = self.model_list_state.selected();
                             }
                         }
                         _ => {}
@@ -1186,7 +1234,8 @@ impl App {
                         }
                         LeftPanel::Models => {
                             if self.right_panel == RightPanel::List {
-                                self.ranking_scroll = 0;
+                                self.model_list_state.select(Some(0));
+                                self.selected_model_index = Some(0);
                             }
                         }
                         _ => {}
@@ -1216,7 +1265,11 @@ impl App {
                         }
                         LeftPanel::Models => {
                             if self.right_panel == RightPanel::List {
-                                self.ranking_scroll = self.model_usage.len().saturating_sub(1);
+                                if !self.model_usage.is_empty() {
+                                    let last = self.model_usage.len() - 1;
+                                    self.model_list_state.select(Some(last));
+                                    self.selected_model_index = Some(last);
+                                }
                             }
                         }
                         _ => {}
@@ -1285,61 +1338,88 @@ impl App {
 
                 match panel {
                     Some("days") => {
-                        self.focus = Focus::Left;
-                        self.left_panel = LeftPanel::Days;
-                        self.is_active = true;
-                        self.models_active = false;
-
-                        if mouse.kind == MouseEventKind::ScrollUp {
-                            self.day_previous();
-                        } else {
-                            self.day_next();
+                        // Only scroll if already focused/active as requested
+                        if self.left_panel == LeftPanel::Days && self.is_active {
+                            if mouse.kind == MouseEventKind::ScrollUp {
+                                self.day_previous();
+                            } else {
+                                self.day_next();
+                            }
+                            self.update_session_list();
                         }
-                        self.update_session_list();
                         true
                     }
                     Some("models") => {
-                        self.focus = Focus::Left;
-                        self.left_panel = LeftPanel::Models;
-                        self.models_active = true;
-                        self.is_active = false;
-
-                        if mouse.kind == MouseEventKind::ScrollUp {
-                            self.model_previous();
-                        } else {
-                            self.model_next();
+                        // Only scroll if already focused/active as requested
+                        if self.left_panel == LeftPanel::Models && self.models_active {
+                            if mouse.kind == MouseEventKind::ScrollUp {
+                                self.model_previous();
+                            } else {
+                                self.model_next();
+                            }
+                            self.selected_model_index = self.model_list_state.selected();
                         }
-                        self.selected_model_index = self.model_list_state.selected();
+                        true
+                    }
+                    Some("stats") => {
+                        // GENERAL USAGE is not scrollable, do nothing
+                        true
+                    }
+                    Some("detail") => {
+                        // Only scroll if the detail panel is currently focused
+                        if self.focus == Focus::Right && self.right_panel == RightPanel::Detail {
+                            if self.left_panel == LeftPanel::Stats {
+                                if mouse.kind == MouseEventKind::ScrollUp {
+                                    self.tool_scroll = self.tool_scroll.saturating_sub(1);
+                                } else if self.tool_scroll < self.tool_max_scroll {
+                                    self.tool_scroll += 1;
+                                }
+                            } else if self.left_panel == LeftPanel::Days {
+                                if mouse.kind == MouseEventKind::ScrollUp {
+                                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                                } else if self.detail_scroll < self.detail_max_scroll {
+                                    self.detail_scroll += 1;
+                                }
+                            }
+                        }
+                        true
+                    }
+                    Some("tools") => {
+                        // Only scroll if Tools are currently highlighted
+                        if self.focus == Focus::Right && self.right_panel == RightPanel::Tools {
+                            if mouse.kind == MouseEventKind::ScrollUp {
+                                self.model_tool_scroll = self.model_tool_scroll.saturating_sub(1);
+                            } else if self.model_tool_scroll < self.model_tool_max_scroll {
+                                self.model_tool_scroll += 1;
+                            }
+                        }
                         true
                     }
                     Some("list") => {
-                        self.focus = Focus::Right;
-                        self.right_panel = RightPanel::List;
-
                         if self.left_panel == LeftPanel::Models {
-                            self.models_active = true;
-                            self.is_active = false;
-
-                            if mouse.kind == MouseEventKind::ScrollUp {
-                                self.ranking_scroll = self.ranking_scroll.saturating_sub(1);
-                            } else {
-                                let max_scroll = self.model_usage.len().saturating_sub(1);
-                                if self.ranking_scroll < max_scroll {
-                                    self.ranking_scroll += 1;
+                            // MODEL RANKING: Scroll only if Models are active
+                            if self.left_panel == LeftPanel::Models && self.models_active {
+                                if mouse.kind == MouseEventKind::ScrollUp {
+                                    self.model_previous();
+                                } else {
+                                    self.model_next();
+                                }
+                                self.selected_model_index = self.model_list_state.selected();
+                            }
+                        } else {
+                            // SESSIONS: Scroll only if Session List is active
+                            if self.focus == Focus::Right
+                                && self.right_panel == RightPanel::List
+                                && self.is_active
+                            {
+                                if mouse.kind == MouseEventKind::ScrollUp {
+                                    self.session_previous();
+                                } else {
+                                    self.session_next();
                                 }
                             }
-                            true
-                        } else {
-                            self.is_active = true;
-                            self.models_active = false;
-
-                            if mouse.kind == MouseEventKind::ScrollUp {
-                                self.session_previous();
-                            } else {
-                                self.session_next();
-                            }
-                            true
                         }
+                        true
                     }
                     _ => false,
                 }
@@ -1444,13 +1524,12 @@ impl App {
                                     self.current_chat_session_id = None;
 
                                     let now = std::time::Instant::now();
-                                    let is_double = self.last_session_click.is_some_and(
-                                        |(t, last_idx)| {
+                                    let is_double =
+                                        self.last_session_click.is_some_and(|(t, last_idx)| {
                                             last_idx == idx
                                                 && now.duration_since(t)
                                                     <= std::time::Duration::from_millis(400)
-                                        },
-                                    );
+                                        });
                                     self.last_session_click = Some((now, idx));
 
                                     if is_double {
@@ -1518,39 +1597,51 @@ impl App {
 
         if self.modal.open {
             spans.extend_from_slice(&[
-                Span::styled("←→/Click", k), Span::styled(" column", t),
+                Span::styled("←→/Click", k),
+                Span::styled(" column", t),
                 sep.clone(),
-                Span::styled("↑↓/Scroll", k), Span::styled(" scroll", t),
+                Span::styled("↑↓/Scroll", k),
+                Span::styled(" scroll", t),
                 sep.clone(),
-                Span::styled("PgUp/Dn", k), Span::styled(" page", t),
+                Span::styled("PgUp/Dn", k),
+                Span::styled(" page", t),
                 sep.clone(),
-                Span::styled("Esc/Right-click", k), Span::styled(" close", t),
+                Span::styled("Esc/Right-click", k),
+                Span::styled(" close", t),
             ]);
         } else if self.is_active || self.models_active {
             spans.extend_from_slice(&[
-                Span::styled("↑↓/Scroll", k), Span::styled(" scroll", t),
+                Span::styled("↑↓/Scroll", k),
+                Span::styled(" scroll", t),
                 sep.clone(),
-                Span::styled("←→/Click", k), Span::styled(" focus", t),
+                Span::styled("←→/Click", k),
+                Span::styled(" focus", t),
             ]);
             if self.is_active && self.left_panel == LeftPanel::Days {
                 spans.extend_from_slice(&[
                     sep.clone(),
-                    Span::styled("Enter/Double-click", k), Span::styled(" open", t),
+                    Span::styled("Enter/Double-click", k),
+                    Span::styled(" open", t),
                 ]);
             }
             spans.extend_from_slice(&[
                 sep.clone(),
-                Span::styled("Esc/Right-click", k), Span::styled(" back", t),
+                Span::styled("Esc/Right-click", k),
+                Span::styled(" back", t),
             ]);
         } else {
             spans.extend_from_slice(&[
-                Span::styled("↑↓", k), Span::styled(" navigate", t),
+                Span::styled("↑↓", k),
+                Span::styled(" navigate", t),
                 sep.clone(),
-                Span::styled("←→/Click", k), Span::styled(" focus", t),
+                Span::styled("←→/Click", k),
+                Span::styled(" focus", t),
                 sep.clone(),
-                Span::styled("Enter/Scroll", k), Span::styled(" activate", t),
+                Span::styled("Enter/Scroll", k),
+                Span::styled(" activate", t),
                 sep.clone(),
-                Span::styled("q/Right-click", k), Span::styled(" quit", t),
+                Span::styled("q/Right-click", k),
+                Span::styled(" quit", t),
             ]);
         }
 
@@ -1861,7 +1952,7 @@ impl App {
                 full_name,
                 m.tokens.input,
                 m.tokens.output,
-                m.display_cost(),
+                m.cost,
                 m.sessions.len(),
                 &UsageRowFormat {
                     name_width,
@@ -1983,7 +2074,7 @@ impl App {
     }
 
     fn render_tool_usage_panel(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         border_style: Style,
@@ -2010,6 +2101,17 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Center),
+            )
+            .title_bottom(
+                Line::from(Span::styled(
+                    if is_highlighted {
+                        " ↑↓: scroll "
+                    } else {
+                        " "
+                    },
+                    Style::default().fg(Color::DarkGray),
+                ))
+                .alignment(Alignment::Center),
             );
 
         let inner = block.inner(area);
@@ -2026,6 +2128,10 @@ impl App {
         let total_count: u64 = self.tool_usage.iter().map(|t| t.count).sum();
         let bar_max_width = inner.width.saturating_sub(30) as u64;
 
+        let visible_height = inner.height as usize;
+        self.tool_max_scroll = (self.tool_usage.len().saturating_sub(visible_height)) as u16;
+        self.tool_scroll = self.tool_scroll.min(self.tool_max_scroll);
+
         let mut lines: Vec<Line> = Vec::with_capacity(self.tool_usage.len());
         for tool in &self.tool_usage {
             let percentage = if total_count > 0 {
@@ -2039,7 +2145,7 @@ impl App {
                 0
             };
             let filled = "█".repeat(bar_width);
-            let empty = "░".repeat(bar_max_width as usize - bar_width);
+            let empty = "░".repeat(bar_max_width.saturating_sub(bar_width as u64) as usize);
 
             // Truncate tool name to max 12 chars with ellipsis if needed
             let tool_name_display = truncate_with_ellipsis(&tool.name, 12);
@@ -2062,8 +2168,7 @@ impl App {
             ]));
         }
 
-        let paragraph = Paragraph::new(lines);
-        frame.render_widget(paragraph, inner);
+        frame.render_widget(Paragraph::new(lines).scroll((self.tool_scroll, 0)), inner);
     }
 
     fn render_model_detail(
@@ -2132,17 +2237,35 @@ impl App {
             let mut agent_pairs: Vec<(&Box<str>, &u64)> = model.agents.iter().collect();
             agent_pairs.sort_unstable_by(|a, b| b.1.cmp(a.1));
 
+            // Responsive layout for model info
+            let inner_width = info_inner.width;
+            let (show_agents, show_tokens) = if inner_width < 45 {
+                (false, false)
+            } else if inner_width < 80 {
+                (false, true)
+            } else {
+                (true, true)
+            };
+
+            let constraints = if show_agents && show_tokens {
+                vec![
+                    Constraint::Percentage(25),
+                    Constraint::Percentage(37),
+                    Constraint::Percentage(38),
+                ]
+            } else if show_tokens {
+                vec![Constraint::Percentage(45), Constraint::Percentage(55)]
+            } else {
+                vec![Constraint::Percentage(100)]
+            };
+
             let info_columns = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(24),
-                    Constraint::Percentage(38),
-                    Constraint::Percentage(38),
-                ])
+                .constraints(constraints)
                 .split(info_inner);
 
             let label_color = Style::default().fg(Color::Rgb(180, 180, 180));
-            let col2_width = info_columns[1].width as usize;
+            let col_width = info_columns.get(1).map(|c| c.width).unwrap_or(0) as usize;
             let name_fit_ellipsis = |label_len: usize, text: &str, max_width: usize| -> String {
                 let avail = max_width.saturating_sub(label_len + 1);
                 truncate_with_ellipsis(text, avail.max(1))
@@ -2187,102 +2310,107 @@ impl App {
                 ]),
             ];
 
-            let mut agent_lines: Vec<Line> = Vec::with_capacity(5);
-            let label = "Agents: ";
-            let indent = "        ";
-            if agent_pairs.is_empty() {
-                agent_lines.push(Line::from(vec![
-                    Span::styled(label, label_color),
-                    Span::styled("n/a", Style::default().fg(Color::DarkGray)),
-                ]));
-            } else {
-                let mut iter = agent_pairs.iter();
-                if let Some((a, c)) = iter.next() {
-                    let first = format!("{} ({} msg)", a.as_ref(), c);
+            frame.render_widget(Paragraph::new(left_lines), info_columns[0]);
+
+            if show_agents {
+                let mut agent_lines: Vec<Line> = Vec::with_capacity(5);
+                let label = "Agents: ";
+                let indent = "        ";
+                if agent_pairs.is_empty() {
                     agent_lines.push(Line::from(vec![
                         Span::styled(label, label_color),
-                        Span::styled(
-                            name_fit_ellipsis(label.len(), &first, col2_width),
-                            Style::default().fg(Color::Magenta),
-                        ),
+                        Span::styled("n/a", Style::default().fg(Color::DarkGray)),
                     ]));
-                }
-                for (a, c) in iter {
-                    if agent_lines.len() >= 5 {
-                        agent_lines.pop();
+                } else {
+                    let mut iter = agent_pairs.iter();
+                    if let Some((a, c)) = iter.next() {
+                        let first = format!("{} ({} msg)", a.as_ref(), c);
+                        agent_lines.push(Line::from(vec![
+                            Span::styled(label, label_color),
+                            Span::styled(
+                                name_fit_ellipsis(label.len(), &first, col_width),
+                                Style::default().fg(Color::Magenta),
+                            ),
+                        ]));
+                    }
+                    for (a, c) in iter {
+                        if agent_lines.len() >= 5 {
+                            agent_lines.pop();
+                            agent_lines.push(Line::from(vec![
+                                Span::styled(indent, label_color),
+                                Span::styled("...", Style::default().fg(Color::Magenta)),
+                            ]));
+                            break;
+                        }
+                        let line = format!("{} ({} msg)", a.as_ref(), c);
                         agent_lines.push(Line::from(vec![
                             Span::styled(indent, label_color),
-                            Span::styled("...", Style::default().fg(Color::Magenta)),
+                            Span::styled(
+                                name_fit_ellipsis(indent.len(), &line, col_width),
+                                Style::default().fg(Color::Magenta),
+                            ),
                         ]));
-                        break;
                     }
-                    let line = format!("{} ({} msg)", a.as_ref(), c);
-                    agent_lines.push(Line::from(vec![
-                        Span::styled(indent, label_color),
-                        Span::styled(
-                            name_fit_ellipsis(indent.len(), &line, col2_width),
-                            Style::default().fg(Color::Magenta),
-                        ),
-                    ]));
                 }
+                frame.render_widget(Paragraph::new(agent_lines), info_columns[1]);
             }
 
-            let right_lines = vec![
-                Line::from(vec![
-                    Span::styled(
-                        "Input         ",
-                        Style::default().fg(Color::Rgb(180, 180, 180)),
-                    ),
-                    Span::styled(
-                        format_number_full(model.tokens.input),
-                        Style::default().fg(Color::Blue),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "Output        ",
-                        Style::default().fg(Color::Rgb(180, 180, 180)),
-                    ),
-                    Span::styled(
-                        format_number_full(model.tokens.output),
-                        Style::default().fg(Color::Magenta),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "Thinking      ",
-                        Style::default().fg(Color::Rgb(180, 180, 180)),
-                    ),
-                    Span::styled(
-                        format_number_full(model.tokens.reasoning),
-                        Style::default().fg(Color::Rgb(255, 165, 0)),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "Cache Read    ",
-                        Style::default().fg(Color::Rgb(180, 180, 180)),
-                    ),
-                    Span::styled(
-                        format_number_full(model.tokens.cache_read),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        "Cache Write   ",
-                        Style::default().fg(Color::Rgb(180, 180, 180)),
-                    ),
-                    Span::styled(
-                        format_number_full(model.tokens.cache_write),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                ]),
-            ];
-
-            frame.render_widget(Paragraph::new(left_lines), info_columns[0]);
-            frame.render_widget(Paragraph::new(agent_lines), info_columns[1]);
-            frame.render_widget(Paragraph::new(right_lines), info_columns[2]);
+            if show_tokens {
+                let right_lines = vec![
+                    Line::from(vec![
+                        Span::styled(
+                            "Input         ",
+                            Style::default().fg(Color::Rgb(180, 180, 180)),
+                        ),
+                        Span::styled(
+                            format_number_full(model.tokens.input),
+                            Style::default().fg(Color::Blue),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "Output        ",
+                            Style::default().fg(Color::Rgb(180, 180, 180)),
+                        ),
+                        Span::styled(
+                            format_number_full(model.tokens.output),
+                            Style::default().fg(Color::Magenta),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "Thinking      ",
+                            Style::default().fg(Color::Rgb(180, 180, 180)),
+                        ),
+                        Span::styled(
+                            format_number_full(model.tokens.reasoning),
+                            Style::default().fg(Color::Rgb(255, 165, 0)),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "Cache Read    ",
+                            Style::default().fg(Color::Rgb(180, 180, 180)),
+                        ),
+                        Span::styled(
+                            format_number_full(model.tokens.cache_read),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ]),
+                    Line::from(vec![
+                        Span::styled(
+                            "Cache Write   ",
+                            Style::default().fg(Color::Rgb(180, 180, 180)),
+                        ),
+                        Span::styled(
+                            format_number_full(model.tokens.cache_write),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                    ]),
+                ];
+                let token_col_idx = if show_agents { 2 } else { 1 };
+                frame.render_widget(Paragraph::new(right_lines), info_columns[token_col_idx]);
+            }
         }
 
         // --- 2. TOOLS USED ---
@@ -2319,6 +2447,10 @@ impl App {
                 let total: u64 = tools.iter().map(|(_, c)| **c).sum();
                 let bar_max = tools_inner.width.saturating_sub(16) as u64;
 
+                self.model_tool_max_scroll =
+                    (tools.len().saturating_sub(tools_inner.height as usize)) as u16;
+                self.model_tool_scroll = self.model_tool_scroll.min(self.model_tool_max_scroll);
+
                 // Optimized: pre-allocate with known capacity for lines
                 let lines: Vec<Line> = tools
                     .into_iter()
@@ -2342,7 +2474,10 @@ impl App {
                         ])
                     })
                     .collect();
-                frame.render_widget(Paragraph::new(lines), tools_inner);
+                frame.render_widget(
+                    Paragraph::new(lines).scroll((self.model_tool_scroll, 0)),
+                    tools_inner,
+                );
             } else {
                 let empty = Paragraph::new("No tools used")
                     .style(Style::default().fg(Color::DarkGray))
@@ -2379,6 +2514,11 @@ impl App {
 
         let mut ranked_models: Vec<_> = self.model_usage.iter().enumerate().collect();
         ranked_models.sort_unstable_by(|a, b| b.1.tokens.total().cmp(&a.1.tokens.total()));
+        self.ranking_max_scroll = ranked_models
+            .len()
+            .saturating_sub(ranking_inner.height as usize);
+        self.ranking_scroll = self.ranking_scroll.min(self.ranking_max_scroll);
+
         let grand_total: u64 = self.model_usage.iter().map(|m| m.tokens.total()).sum();
 
         let bar_available_width = ranking_inner.width.saturating_sub(2);
@@ -2472,15 +2612,15 @@ impl App {
     }
 
     fn render_session_detail(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         border_style: Style,
         is_highlighted: bool,
     ) {
         let session = self.selected_session();
-        // Optimized: pre-allocate with known capacity (8 lines for session info)
-        let mut final_lines = Vec::with_capacity(8);
+        // Optimized: pre-allocate with known capacity
+        let mut final_lines = Vec::with_capacity(12);
 
         // Build title for the panel: show session ID and continuation info
         let panel_title = if let Some(s) = &session {
@@ -2497,12 +2637,37 @@ impl App {
             " SESSION INFO ".to_string()
         };
 
-        // Title color: cyan when highlighted/selected, gray otherwise
-        let title_color = if is_highlighted {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if is_highlighted {
+                border_style
+            } else {
+                Style::default().fg(Color::DarkGray)
+            })
+            .title(
+                Line::from(Span::styled(
+                    panel_title,
+                    Style::default()
+                        .fg(if is_highlighted {
+                            Color::Cyan
+                        } else {
+                            Color::Yellow
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Center),
+            )
+            .title_bottom(
+                Line::from(Span::styled(
+                    if is_highlighted {
+                        " ↑↓: scroll "
+                    } else {
+                        " "
+                    },
+                    Style::default().fg(Color::DarkGray),
+                ))
+                .alignment(Alignment::Center),
+            );
 
         if let Some(s) = session {
             let title = self
@@ -2516,16 +2681,16 @@ impl App {
                 &s.path_cwd
             };
 
+            let inner_width = area.width.saturating_sub(2) as usize;
+            let value_width = inner_width.saturating_sub(14);
+
             final_lines.push(Line::from(vec![
                 Span::styled(
                     "Title        ",
                     Style::default().fg(Color::Rgb(180, 180, 180)),
                 ),
                 Span::styled(
-                    title
-                        .chars()
-                        .take(area.width as usize - 14)
-                        .collect::<String>(),
+                    truncate_with_ellipsis(title, value_width),
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
@@ -2538,13 +2703,24 @@ impl App {
                     Style::default().fg(Color::Rgb(180, 180, 180)),
                 ),
                 Span::styled(
-                    project
-                        .chars()
-                        .take(area.width as usize - 14)
-                        .collect::<String>(),
+                    truncate_with_ellipsis(project, value_width),
                     Style::default().fg(Color::Blue),
                 ),
             ]));
+
+            use crate::session::detect_git_branch;
+            if let Some(branch) = detect_git_branch(project) {
+                final_lines.push(Line::from(vec![
+                    Span::styled(
+                        "Branch       ",
+                        Style::default().fg(Color::Rgb(180, 180, 180)),
+                    ),
+                    Span::styled(
+                        truncate_with_ellipsis(&branch, value_width),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ]));
+            }
 
             let mut model_line = vec![Span::styled(
                 "Models       ",
@@ -2553,13 +2729,12 @@ impl App {
             let mut models: Vec<_> = s.models.iter().collect();
             models.sort();
             let mut current_len = 0;
-            let max_len = area.width.saturating_sub(15) as usize;
+            let max_len = inner_width.saturating_sub(15);
             for (i, m) in models.iter().enumerate() {
-                let name = m;
                 let display = if i == 0 {
-                    name.to_string()
+                    m.to_string()
                 } else {
-                    format!(", {}", name)
+                    format!(", {}", m)
                 };
                 if current_len + display.len() > max_len && i > 0 {
                     model_line.push(Span::styled(
@@ -2579,6 +2754,32 @@ impl App {
                 current_len += display.len();
             }
             final_lines.push(Line::from(model_line));
+
+            final_lines.push(Line::from(vec![
+                Span::styled(
+                    "Messages     ",
+                    Style::default().fg(Color::Rgb(180, 180, 180)),
+                ),
+                Span::styled(
+                    format!("{}", s.messages),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+
+            final_lines.push(Line::from(vec![
+                Span::styled(
+                    "Cost         ",
+                    Style::default().fg(Color::Rgb(180, 180, 180)),
+                ),
+                Span::styled(
+                    format!("${:.2}", s.display_cost()),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
 
             final_lines.push(Line::from(vec![
                 Span::styled(
@@ -2634,28 +2835,29 @@ impl App {
                     Style::default().fg(Color::Yellow),
                 ),
             ]));
-        } else {
-            final_lines.push(Line::from(Span::styled(
-                " No session selected",
-                Style::default().fg(Color::Rgb(180, 180, 180)),
-            )));
+
+            final_lines.push(Line::from(vec![
+                Span::styled(
+                    "Activity     ",
+                    Style::default().fg(Color::Rgb(180, 180, 180)),
+                ),
+                Span::styled(
+                    chrono::DateTime::from_timestamp(s.last_activity, 0)
+                        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
         }
 
+        let inner = block.inner(area);
+        self.detail_max_scroll = (final_lines.len().saturating_sub(inner.height as usize)) as u16;
+        self.detail_scroll = self.detail_scroll.min(self.detail_max_scroll);
+
         frame.render_widget(
-            Paragraph::new(final_lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(border_style)
-                    .title(
-                        Line::from(Span::styled(
-                            panel_title,
-                            Style::default()
-                                .fg(title_color)
-                                .add_modifier(Modifier::BOLD),
-                        ))
-                        .alignment(Alignment::Center),
-                    ),
-            ),
+            Paragraph::new(final_lines)
+                .block(block)
+                .scroll((self.detail_scroll, 0)),
             area,
         );
     }

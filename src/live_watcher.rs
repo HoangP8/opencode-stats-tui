@@ -32,9 +32,9 @@ impl LiveWatcher {
         let last_event_clone = last_event.clone();
 
         // Create watcher with 100ms poll interval for faster responsiveness
-        let _config = Config::default().with_poll_interval(Duration::from_millis(100));
+        let config = Config::default().with_poll_interval(Duration::from_millis(100));
 
-        let watcher = notify::recommended_watcher(move |res: Result<Event, _>| {
+        let watcher = RecommendedWatcher::new(move |res: Result<Event, _>| {
             if let Ok(event) = res {
                 *last_event_clone.lock() = Some(Instant::now());
                 if event.kind.is_modify() || event.kind.is_create() {
@@ -63,7 +63,7 @@ impl LiveWatcher {
             } else if let Err(e) = res {
                 error!("File watcher error: {:?}", e);
             }
-        })?;
+        }, config)?;
 
         Ok(Self {
             watcher,

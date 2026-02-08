@@ -36,11 +36,7 @@ impl DayStat {
     }
 }
 
-impl ModelUsage {
-    pub fn display_cost(&self) -> f64 {
-        self.cost
-    }
-}
+impl ModelUsage {}
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct Tokens {
@@ -512,15 +508,14 @@ pub fn format_number_full(value: u64) -> String {
     }
 
     // Optimized: use byte operations since to_string() always produces ASCII
+    // and pre-allocate correct capacity to avoid reallocations
     let mut result = String::with_capacity(len + (len - 1) / 3);
     let bytes = s.as_bytes();
 
     for (i, &byte) in bytes.iter().enumerate() {
-        // Add comma before every 3rd digit from the right
-        if i > 0 && (len - i).is_multiple_of(3) {
+        if i > 0 && (len - i) % 3 == 0 {
             result.push(',');
         }
-        // Safe to use as char since we know it's ASCII
         result.push(byte as char);
     }
     result
@@ -875,6 +870,9 @@ pub fn collect_stats() -> Stats {
     let mut session_day_union_diffs: HashMap<Box<str>, HashMap<Box<str>, FileDiff>> =
         HashMap::with_capacity(64);
 
+    let mut last_ts = None;
+    let mut last_day_str = String::new();
+
     for data in processed_data {
         // Skip duplicate messages (same message_id seen before)
         if !processed_message_ids.insert(data.message_id) {
@@ -897,8 +895,15 @@ pub fn collect_stats() -> Stats {
             }
         }
 
-        let ts = msg.time.as_ref().and_then(|t| t.created.map(|v| *v));
-        let day = get_day(ts);
+        let ts_val = msg.time.as_ref().and_then(|t| t.created.map(|v| *v));
+        let day = if ts_val == last_ts && !last_day_str.is_empty() {
+            last_day_str.clone()
+        } else {
+            let d = get_day(ts_val);
+            last_ts = ts_val;
+            last_day_str = d.clone();
+            d
+        };
         let model_id = get_model_id(msg);
         let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
 
@@ -991,7 +996,7 @@ pub fn collect_stats() -> Stats {
         session_stat.cost += cost;
         session_stat.models.insert(model_id);
         add_tokens(&mut session_stat.tokens, &msg.tokens);
-        if let Some(t) = ts {
+        if let Some(t) = ts_val {
             if t > session_stat.last_activity {
                 session_stat.last_activity = t;
             }
@@ -1429,37 +1434,21 @@ pub fn load_session_details(
 
 #[inline]
 fn truncate_string(s: &str, max: usize) -> Box<str> {
-    // Optimized: early return if no truncation needed
     if s.len() <= max {
         return s.into();
     }
 
-    // Fast path for ASCII strings (most common case)
-    if s.is_ascii() {
-        // For ASCII, byte length equals char count
-        if s.len() <= max {
-            return s.into();
+    let mut char_count = 0;
+    for (idx, _) in s.char_indices() {
+        if char_count == max {
+            let mut result = String::with_capacity(idx + 3);
+            result.push_str(&s[..idx]);
+            result.push_str("...");
+            return result.into_boxed_str();
         }
-        // Truncate at byte position (safe for ASCII)
-        let end = max.min(s.len());
-        let mut result = String::with_capacity(end + 3);
-        result.push_str(&s[..end]);
-        result.push_str("...");
-        return result.into_boxed_str();
+        char_count += 1;
     }
-
-    // Slow path for non-ASCII: count chars properly
-    if s.chars().count() <= max {
-        s.into()
-    } else {
-        // Find the byte position where we need to truncate
-        let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
-
-        let mut result = String::with_capacity(end + 3);
-        result.push_str(&s[..end]);
-        result.push_str("...");
-        result.into_boxed_str()
-    }
+    s.into()
 }
 
 fn deserialize_lenient_summary<'de, D>(deserializer: D) -> Result<Option<Summary>, D::Error>

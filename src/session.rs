@@ -181,17 +181,17 @@ impl SessionModal {
                 match self.selected_column {
                     ModalColumn::Info => {
                         if mouse.kind == MouseEventKind::ScrollUp {
-                            self.info_scroll =
-                                self.info_scroll.saturating_sub(SCROLL_INCREMENT);
+                            self.info_scroll = self.info_scroll.saturating_sub(SCROLL_INCREMENT);
                         } else {
-                            self.info_scroll =
-                                self.info_scroll.saturating_add(SCROLL_INCREMENT).min(info_max);
+                            self.info_scroll = self
+                                .info_scroll
+                                .saturating_add(SCROLL_INCREMENT)
+                                .min(info_max);
                         }
                     }
                     ModalColumn::Chat => {
                         if mouse.kind == MouseEventKind::ScrollUp {
-                            self.chat_scroll =
-                                self.chat_scroll.saturating_sub(SCROLL_INCREMENT);
+                            self.chat_scroll = self.chat_scroll.saturating_sub(SCROLL_INCREMENT);
                         } else {
                             self.chat_scroll = self
                                 .chat_scroll
@@ -330,38 +330,37 @@ impl SessionModal {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )]));
-            // Title with wrapping
-            let label_width = 9; // "Title:   " length
-            let max_title_width = (area.width.saturating_sub(10)) as usize;
-            let wrapped_title: Vec<String> =
-                wrap_text_with_indent(title, max_title_width, label_width);
+            // Title with wrapping - prefix is "    Title:   " = 13 chars
+            let prefix_len: usize = 13; // "    Title:   "
+            let inner_width = area.width.saturating_sub(2) as usize; // borders
+            let first_line_width = inner_width.saturating_sub(prefix_len);
+            let continuation_width = inner_width.saturating_sub(prefix_len);
+            let wrapped_title =
+                wrap_text_with_indent(title, first_line_width.max(1), continuation_width.max(1));
             for (i, line) in wrapped_title.into_iter().enumerate() {
                 if i == 0 {
-                    // First line with label
                     lines.push(Line::from(vec![
                         Span::raw("    Title:   "),
                         Span::styled(line, Style::default().fg(Color::White)),
                     ]));
                 } else {
-                    // Wrapped lines with indentation
                     lines.push(Line::from(vec![
-                        Span::raw("    "),
+                        Span::raw(" ".repeat(prefix_len)),
                         Span::styled(line, Style::default().fg(Color::White)),
                     ]));
                 }
             }
+            let value_width = inner_width.saturating_sub(prefix_len);
             lines.push(Line::from(vec![
                 Span::raw("    Project: "),
                 Span::styled(
-                    safe_truncate_plain(project, (area.width.saturating_sub(10)) as usize),
+                    safe_truncate_plain(project, value_width),
                     Style::default().fg(Color::White),
                 ),
             ]));
 
             if let Some(branch) = detect_git_branch(project) {
-                let branch_display =
-                    safe_truncate_plain(&branch, (area.width.saturating_sub(12)) as usize)
-                        .into_owned();
+                let branch_display = safe_truncate_plain(&branch, value_width).into_owned();
                 lines.push(Line::from(vec![
                     Span::raw("    Branch:  "),
                     Span::styled(branch_display, Style::default().fg(Color::Cyan)),
@@ -437,14 +436,11 @@ impl SessionModal {
                     + model.tokens.cache_read
                     + model.tokens.cache_write;
 
-                // Calculate available width for model stats
                 let inner_width = area.width.saturating_sub(2) as usize;
-                let left_column_width = 18; // 6 spaces + 10 label + 8 value
-                let separator_width = 7; // "   │   "
-                let right_column_width = 18; // 10 label + 8 value
-                let min_width_for_two_columns =
-                    left_column_width + separator_width + right_column_width;
-                let show_right_column = inner_width >= min_width_for_two_columns;
+
+                // Responsive thresholds
+                let show_right_column = inner_width >= 50;
+                let show_separator = inner_width >= 50;
 
                 for i in 0..5 {
                     let mut spans = Vec::with_capacity(7);
@@ -461,12 +457,12 @@ impl SessionModal {
                             format!("{:>8}", value),
                             Style::default().fg(Color::White),
                         ));
-                    } else {
+                    } else if show_right_column {
                         spans.push(Span::raw(" ".repeat(18)));
                     }
 
                     // Only show separator and right column if there's enough width
-                    if show_right_column {
+                    if show_separator {
                         spans.push(Span::styled(
                             "   │   ",
                             Style::default().fg(Color::Rgb(40, 40, 50)),
@@ -858,13 +854,17 @@ impl SessionModal {
         let sep = Span::styled(" │ ", Style::default().fg(Color::Rgb(50, 50, 70)));
 
         let instructions = vec![Line::from(vec![
-            Span::styled("←→/Click", k), Span::styled(" column", t),
+            Span::styled("←→/Click", k),
+            Span::styled(" column", t),
             sep.clone(),
-            Span::styled("↑↓/Scroll", k), Span::styled(" scroll", t),
+            Span::styled("↑↓/Scroll", k),
+            Span::styled(" scroll", t),
             sep.clone(),
-            Span::styled("PgUp/Dn", k), Span::styled(" page", t),
+            Span::styled("PgUp/Dn", k),
+            Span::styled(" page", t),
             sep.clone(),
-            Span::styled("Esc/Right-click", k), Span::styled(" close", t),
+            Span::styled("Esc/Right-click", k),
+            Span::styled(" close", t),
         ])];
 
         let status_bar = Paragraph::new(instructions)
@@ -895,35 +895,117 @@ fn safe_truncate(s: &str, max_len: usize) -> &str {
 }
 
 fn safe_truncate_plain(s: &str, max_len: usize) -> Cow<'_, str> {
-    if s.chars().count() <= max_len {
+    let mut char_count = 0;
+    // Fast check for short strings
+    for _ in s.chars() {
+        char_count += 1;
+        if char_count > max_len {
+            break;
+        }
+    }
+    if char_count <= max_len {
         return Cow::Borrowed(s);
     }
+
+    // Truncate and add ellipsis - total length will be max_len
     let target = max_len.saturating_sub(1);
-    let truncated: String = s.chars().take(target).collect();
-    Cow::Owned(format!("{}…", truncated))
+    let mut current_count = 0;
+    for (idx, _) in s.char_indices() {
+        if current_count == target {
+            let mut result = s[..idx].to_string();
+            result.push('…');
+            return Cow::Owned(result);
+        }
+        current_count += 1;
+    }
+    Cow::Borrowed(s)
 }
 
-fn wrap_text_with_indent(text: &str, max_width: usize, indent: usize) -> Vec<String> {
+fn wrap_text_with_indent(
+    text: &str,
+    first_line_width: usize,
+    continuation_width: usize,
+) -> Vec<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return vec![String::new()];
+    }
+
     let mut result = Vec::new();
     let mut current_line = String::new();
     let mut current_width = 0;
+    let mut is_first_line = true;
 
-    for word in text.split_whitespace() {
-        let word_with_space = if current_line.is_empty() {
-            word.to_string()
+    for word in &words {
+        let max_width = if is_first_line {
+            first_line_width
         } else {
-            format!(" {}", word)
+            continuation_width
         };
 
-        if current_width + word_with_space.len() <= max_width {
-            current_line.push_str(&word_with_space);
-            current_width += word_with_space.len();
-        } else {
-            if !current_line.is_empty() {
-                result.push(current_line.clone());
+        if current_line.is_empty() {
+            if word.len() <= max_width {
+                current_line.push_str(word);
+                current_width = word.len();
+            } else {
+                let mut remaining = *word;
+                while !remaining.is_empty() {
+                    let w = if is_first_line {
+                        first_line_width
+                    } else {
+                        continuation_width
+                    };
+                    if remaining.len() <= w {
+                        current_line = remaining.to_string();
+                        current_width = remaining.len();
+                        break;
+                    }
+                    let break_at = w.saturating_sub(1).max(1);
+                    let byte_pos = remaining
+                        .char_indices()
+                        .nth(break_at)
+                        .map(|(i, _)| i)
+                        .unwrap_or(remaining.len());
+                    result.push(format!("{}-", &remaining[..byte_pos]));
+                    remaining = &remaining[byte_pos..];
+                    is_first_line = false;
+                }
             }
-            current_line = word.to_string();
-            current_width = word.len();
+        } else {
+            let needed = 1 + word.len();
+            if current_width + needed <= max_width {
+                current_line.push(' ');
+                current_line.push_str(word);
+                current_width += needed;
+            } else {
+                result.push(current_line);
+                is_first_line = false;
+                let new_max = continuation_width;
+                if word.len() <= new_max {
+                    current_line = word.to_string();
+                    current_width = word.len();
+                } else {
+                    current_line = String::new();
+                    current_width = 0;
+                    let mut remaining = *word;
+                    while !remaining.is_empty() {
+                        let w = continuation_width;
+                        if remaining.len() <= w {
+                            current_line = remaining.to_string();
+                            current_width = remaining.len();
+                            break;
+                        }
+                        let break_at = w.saturating_sub(1).max(1);
+                        let byte_pos = remaining
+                            .char_indices()
+                            .nth(break_at)
+                            .map(|(i, _)| i)
+                            .unwrap_or(remaining.len());
+                        result.push(format!("{}-", &remaining[..byte_pos]));
+                        remaining = &remaining[byte_pos..];
+                    }
+                }
+            }
         }
     }
 
@@ -931,18 +1013,7 @@ fn wrap_text_with_indent(text: &str, max_width: usize, indent: usize) -> Vec<Str
         result.push(current_line);
     }
 
-    // Apply indentation to all lines after the first
     result
-        .into_iter()
-        .enumerate()
-        .map(|(i, line)| {
-            if i == 0 {
-                line
-            } else {
-                format!("{}{}", " ".repeat(indent), line)
-            }
-        })
-        .collect()
 }
 
 /// Helper: Get role display information (icon, label, color)
@@ -955,7 +1026,7 @@ fn get_role_info(role: &str) -> (&'static str, String, Color) {
     }
 }
 
-fn detect_git_branch(root: &str) -> Option<String> {
+pub fn detect_git_branch(root: &str) -> Option<String> {
     let root_path = Path::new(root);
     if root_path.as_os_str().is_empty() {
         return None;
