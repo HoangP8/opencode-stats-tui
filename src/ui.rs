@@ -143,6 +143,7 @@ pub struct App {
 
     // Optimized mouse tracking
     last_mouse_panel: Option<&'static str>, // Cache last panel for faster hit-testing
+    last_session_click: Option<(std::time::Instant, usize)>, // Double-click detection for sessions
 
     // Cached panel rectangles for optimized mouse hit-testing
     cached_rects: PanelRects,
@@ -391,6 +392,7 @@ impl App {
             modal: SessionModal::new(),
 
             last_mouse_panel: None,
+            last_session_click: None,
 
             cached_rects: PanelRects::default(),
 
@@ -974,6 +976,12 @@ impl App {
                         RightPanel::List => self.right_panel = RightPanel::Tools,
                         _ => self.focus = Focus::Left,
                     }
+                } else if self.focus == Focus::Right
+                    && self.left_panel == LeftPanel::Days
+                    && self.is_active
+                {
+                    self.focus = Focus::Left;
+                    self.right_panel = RightPanel::List;
                 } else {
                     self.focus = Focus::Left;
                 }
@@ -983,6 +991,12 @@ impl App {
                     if self.right_panel == RightPanel::Tools {
                         self.right_panel = RightPanel::List;
                     }
+                } else if self.focus == Focus::Left
+                    && self.left_panel == LeftPanel::Days
+                    && self.is_active
+                {
+                    self.focus = Focus::Right;
+                    self.right_panel = RightPanel::List;
                 } else {
                     self.focus = Focus::Right;
                 }
@@ -1260,7 +1274,7 @@ impl App {
         Ok(())
     }
 
-    fn handle_mouse_event(&mut self, mouse: MouseEvent, _area: Rect) -> bool {
+    fn handle_mouse_event(&mut self, mouse: MouseEvent, area: Rect) -> bool {
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let (x, y) = (mouse.column, mouse.row);
@@ -1271,36 +1285,41 @@ impl App {
 
                 match panel {
                     Some("days") => {
-                        // Only allow scrolling when panel is active (after Enter)
-                        if self.is_active {
-                            if mouse.kind == MouseEventKind::ScrollUp {
-                                self.day_previous();
-                            } else {
-                                self.day_next();
-                            }
-                            self.update_session_list();
-                            true
+                        self.focus = Focus::Left;
+                        self.left_panel = LeftPanel::Days;
+                        self.is_active = true;
+                        self.models_active = false;
+
+                        if mouse.kind == MouseEventKind::ScrollUp {
+                            self.day_previous();
                         } else {
-                            false
+                            self.day_next();
                         }
+                        self.update_session_list();
+                        true
                     }
                     Some("models") => {
-                        // Only allow scrolling when panel is active (after Enter)
-                        if self.models_active {
-                            if mouse.kind == MouseEventKind::ScrollUp {
-                                self.model_previous();
-                            } else {
-                                self.model_next();
-                            }
-                            self.selected_model_index = self.model_list_state.selected();
-                            true
+                        self.focus = Focus::Left;
+                        self.left_panel = LeftPanel::Models;
+                        self.models_active = true;
+                        self.is_active = false;
+
+                        if mouse.kind == MouseEventKind::ScrollUp {
+                            self.model_previous();
                         } else {
-                            false
+                            self.model_next();
                         }
+                        self.selected_model_index = self.model_list_state.selected();
+                        true
                     }
                     Some("list") => {
-                        // Only allow scrolling when panel is active (after Enter)
-                        if self.left_panel == LeftPanel::Models && self.models_active {
+                        self.focus = Focus::Right;
+                        self.right_panel = RightPanel::List;
+
+                        if self.left_panel == LeftPanel::Models {
+                            self.models_active = true;
+                            self.is_active = false;
+
                             if mouse.kind == MouseEventKind::ScrollUp {
                                 self.ranking_scroll = self.ranking_scroll.saturating_sub(1);
                             } else {
@@ -1310,15 +1329,16 @@ impl App {
                                 }
                             }
                             true
-                        } else if self.is_active {
+                        } else {
+                            self.is_active = true;
+                            self.models_active = false;
+
                             if mouse.kind == MouseEventKind::ScrollUp {
                                 self.session_previous();
                             } else {
                                 self.session_next();
                             }
                             true
-                        } else {
-                            false
                         }
                     }
                     _ => false,
@@ -1326,7 +1346,16 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let pos = (mouse.column, mouse.row);
-                self.handle_mouse_single_click_optimized(pos)
+                self.handle_mouse_single_click_optimized(pos, area.height)
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                if self.is_active || self.models_active {
+                    self.is_active = false;
+                    self.models_active = false;
+                } else {
+                    self.exit = true;
+                }
+                true
             }
             _ => false,
         }
@@ -1334,7 +1363,7 @@ impl App {
 
     /// Optimized single-click handler using efficient hit-testing
     #[inline(always)]
-    fn handle_mouse_single_click_optimized(&mut self, pos: (u16, u16)) -> bool {
+    fn handle_mouse_single_click_optimized(&mut self, pos: (u16, u16), term_height: u16) -> bool {
         let (x, y) = pos;
 
         // Use optimized panel finder
@@ -1350,15 +1379,42 @@ impl App {
                 "days" => {
                     self.focus = Focus::Left;
                     self.left_panel = LeftPanel::Days;
-                    self.is_active = false;
+                    self.is_active = true;
                     self.models_active = false;
+
+                    if let Some(rect) = self.cached_rects.days {
+                        let inner_top = rect.y.saturating_add(1);
+                        let inner_bottom = rect.y + rect.height.saturating_sub(1);
+                        if y >= inner_top && y < inner_bottom {
+                            let clicked_row = (y - inner_top) as usize;
+                            let offset = self.day_list_state.offset();
+                            let idx = offset + clicked_row;
+                            if idx < self.day_list.len() {
+                                self.day_list_state.select(Some(idx));
+                                self.update_session_list();
+                            }
+                        }
+                    }
                 }
                 "models" => {
                     self.focus = Focus::Left;
                     self.left_panel = LeftPanel::Models;
+                    self.models_active = true;
                     self.is_active = false;
-                    self.models_active = false;
-                    self.selected_model_index = self.model_list_state.selected();
+
+                    if let Some(rect) = self.cached_rects.models {
+                        let inner_top = rect.y.saturating_add(1);
+                        let inner_bottom = rect.y + rect.height.saturating_sub(1);
+                        if y >= inner_top && y < inner_bottom {
+                            let clicked_row = (y - inner_top) as usize;
+                            let offset = self.model_list_state.offset();
+                            let idx = offset + clicked_row;
+                            if idx < self.model_usage.len() {
+                                self.model_list_state.select(Some(idx));
+                                self.selected_model_index = Some(idx);
+                            }
+                        }
+                    }
                 }
                 "detail" => {
                     self.focus = Focus::Right;
@@ -1371,6 +1427,42 @@ impl App {
                 "list" => {
                     self.focus = Focus::Right;
                     self.right_panel = RightPanel::List;
+
+                    if self.left_panel == LeftPanel::Days {
+                        self.is_active = true;
+                        self.models_active = false;
+
+                        if let Some(rect) = self.cached_rects.list {
+                            let inner_top = rect.y.saturating_add(1);
+                            let inner_bottom = rect.y + rect.height.saturating_sub(1);
+                            if y >= inner_top && y < inner_bottom {
+                                let clicked_row = (y - inner_top) as usize;
+                                let offset = self.session_list_state.offset();
+                                let idx = offset + clicked_row;
+                                if idx < self.session_list.len() {
+                                    self.session_list_state.select(Some(idx));
+                                    self.current_chat_session_id = None;
+
+                                    let now = std::time::Instant::now();
+                                    let is_double = self.last_session_click.is_some_and(
+                                        |(t, last_idx)| {
+                                            last_idx == idx
+                                                && now.duration_since(t)
+                                                    <= std::time::Duration::from_millis(400)
+                                        },
+                                    );
+                                    self.last_session_click = Some((now, idx));
+
+                                    if is_double {
+                                        self.open_session_modal(term_height);
+                                    }
+                                }
+                            }
+                        }
+                    } else if self.left_panel == LeftPanel::Models {
+                        self.models_active = true;
+                        self.is_active = false;
+                    }
                 }
                 _ => return false,
             }
@@ -1416,54 +1508,54 @@ impl App {
     }
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
-        let hint = if self.modal.open {
-            " ↑↓/PgUp/PgDn: scroll chat │ ←→: scroll info │ Esc/q: close "
-        } else {
-            match (self.focus, self.left_panel, self.right_panel) {
-                (Focus::Left, LeftPanel::Stats, _) => " ↑↓: navigate │ ←→: focus │ Esc/q: quit ",
-                (Focus::Left, LeftPanel::Days, _) => {
-                    if self.is_active {
-                        " ↑↓: scroll │ Enter: open chat │ Esc: back "
-                    } else {
-                        " ↑↓: navigate │ Enter: open │ ←→: focus │ Esc/q: quit "
-                    }
-                }
-                (Focus::Left, LeftPanel::Models, _) => {
-                    if self.models_active {
-                        " ↑↓: scroll │ Esc: back │ ←→: focus "
-                    } else {
-                        " ↑↓: navigate │ Enter: open │ ←→: focus │ Esc/q: quit "
-                    }
-                }
-                (Focus::Right, LeftPanel::Days, RightPanel::List) => {
-                    if self.is_active {
-                        " ↑↓: scroll │ Enter: open chat │ Esc: back "
-                    } else {
-                        " ↑↓: navigate │ Enter: open │ ←: focus left │ Esc/q: quit "
-                    }
-                }
-                (Focus::Right, _, _) => {
-                    if self.is_active || self.models_active {
-                        if self.left_panel == LeftPanel::Models {
-                            " ↑↓←→: navigate │ Esc: back │ q: quit "
-                        } else {
-                            " ↑↓: scroll │ Esc: back │ ←: focus left │ q: quit "
-                        }
-                    } else if self.left_panel == LeftPanel::Models {
-                        " ↑↓←→: navigate │ Esc: back │ ←: focus left │ Esc/q: quit "
-                    } else {
-                        " ↑↓: navigate │ ←: focus left │ Esc/q: quit "
-                    }
-                }
-            }
-        };
+        let k = Style::default()
+            .fg(Color::Rgb(140, 140, 160))
+            .add_modifier(Modifier::BOLD);
+        let t = Style::default().fg(Color::DarkGray);
+        let sep = Span::styled(" │ ", Style::default().fg(Color::Rgb(50, 50, 70)));
 
-        let status_bar = Paragraph::new(hint)
-            .style(
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .bg(Color::Rgb(20, 20, 30)),
-            )
+        let mut spans: Vec<Span> = Vec::with_capacity(16);
+
+        if self.modal.open {
+            spans.extend_from_slice(&[
+                Span::styled("←→/Click", k), Span::styled(" column", t),
+                sep.clone(),
+                Span::styled("↑↓/Scroll", k), Span::styled(" scroll", t),
+                sep.clone(),
+                Span::styled("PgUp/Dn", k), Span::styled(" page", t),
+                sep.clone(),
+                Span::styled("Esc/Right-click", k), Span::styled(" close", t),
+            ]);
+        } else if self.is_active || self.models_active {
+            spans.extend_from_slice(&[
+                Span::styled("↑↓/Scroll", k), Span::styled(" scroll", t),
+                sep.clone(),
+                Span::styled("←→/Click", k), Span::styled(" focus", t),
+            ]);
+            if self.is_active && self.left_panel == LeftPanel::Days {
+                spans.extend_from_slice(&[
+                    sep.clone(),
+                    Span::styled("Enter/Double-click", k), Span::styled(" open", t),
+                ]);
+            }
+            spans.extend_from_slice(&[
+                sep.clone(),
+                Span::styled("Esc/Right-click", k), Span::styled(" back", t),
+            ]);
+        } else {
+            spans.extend_from_slice(&[
+                Span::styled("↑↓", k), Span::styled(" navigate", t),
+                sep.clone(),
+                Span::styled("←→/Click", k), Span::styled(" focus", t),
+                sep.clone(),
+                Span::styled("Enter/Scroll", k), Span::styled(" activate", t),
+                sep.clone(),
+                Span::styled("q/Right-click", k), Span::styled(" quit", t),
+            ]);
+        }
+
+        let status_bar = Paragraph::new(Line::from(spans))
+            .style(Style::default().bg(Color::Rgb(15, 15, 25)))
             .alignment(Alignment::Center);
         frame.render_widget(status_bar, area);
     }

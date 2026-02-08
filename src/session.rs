@@ -169,24 +169,35 @@ impl SessionModal {
         }
 
         match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                match self.selected_column {
-                    ModalColumn::Info => {
-                        self.info_scroll = self.info_scroll.saturating_sub(SCROLL_INCREMENT);
-                    }
-                    ModalColumn::Chat => {
-                        self.chat_scroll = self.chat_scroll.saturating_sub(SCROLL_INCREMENT);
-                    }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let (x, y) = (mouse.column, mouse.row);
+                if Self::contains_point(self.cached_rects.info, x, y) {
+                    self.selected_column = ModalColumn::Info;
+                } else if Self::contains_point(self.cached_rects.chat, x, y) {
+                    self.selected_column = ModalColumn::Chat;
                 }
-                true
-            }
-            MouseEventKind::ScrollDown => {
+
+                let info_max = self.cached_rects.info_max_scroll;
                 match self.selected_column {
                     ModalColumn::Info => {
-                        self.info_scroll = self.info_scroll.saturating_add(SCROLL_INCREMENT);
+                        if mouse.kind == MouseEventKind::ScrollUp {
+                            self.info_scroll =
+                                self.info_scroll.saturating_sub(SCROLL_INCREMENT);
+                        } else {
+                            self.info_scroll =
+                                self.info_scroll.saturating_add(SCROLL_INCREMENT).min(info_max);
+                        }
                     }
                     ModalColumn::Chat => {
-                        self.chat_scroll = self.chat_scroll.saturating_add(SCROLL_INCREMENT);
+                        if mouse.kind == MouseEventKind::ScrollUp {
+                            self.chat_scroll =
+                                self.chat_scroll.saturating_sub(SCROLL_INCREMENT);
+                        } else {
+                            self.chat_scroll = self
+                                .chat_scroll
+                                .saturating_add(SCROLL_INCREMENT)
+                                .min(self.chat_max_scroll);
+                        }
                     }
                 }
                 true
@@ -208,6 +219,10 @@ impl SessionModal {
                 }
 
                 false
+            }
+            MouseEventKind::Down(crossterm::event::MouseButton::Right) => {
+                self.close();
+                true
             }
             _ => false,
         }
@@ -836,46 +851,24 @@ impl SessionModal {
 
     /// Render instruction bar at the bottom
     fn render_instructions(&self, frame: &mut Frame, area: Rect) {
+        let k = Style::default()
+            .fg(Color::Rgb(140, 140, 160))
+            .add_modifier(Modifier::BOLD);
+        let t = Style::default().fg(Color::DarkGray);
+        let sep = Span::styled(" │ ", Style::default().fg(Color::Rgb(50, 50, 70)));
+
         let instructions = vec![Line::from(vec![
-            Span::styled(
-                "←→",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" Select column", Style::default().fg(Color::DarkGray)),
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                "↑↓",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" Scroll", Style::default().fg(Color::DarkGray)),
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                "PgUp/PgDn",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" Page scroll", Style::default().fg(Color::DarkGray)),
-            Span::styled("  ", Style::default()),
-            Span::styled(
-                "Q/Esc",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" Quit", Style::default().fg(Color::DarkGray)),
+            Span::styled("←→/Click", k), Span::styled(" column", t),
+            sep.clone(),
+            Span::styled("↑↓/Scroll", k), Span::styled(" scroll", t),
+            sep.clone(),
+            Span::styled("PgUp/Dn", k), Span::styled(" page", t),
+            sep.clone(),
+            Span::styled("Esc/Right-click", k), Span::styled(" close", t),
         ])];
 
         let status_bar = Paragraph::new(instructions)
-            .style(
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .bg(Color::Rgb(20, 20, 30)),
-            )
+            .style(Style::default().bg(Color::Rgb(15, 15, 25)))
             .alignment(Alignment::Center);
 
         frame.render_widget(status_bar, area);
@@ -886,21 +879,28 @@ impl SessionModal {
 /// Returns a static string slice - optimized to avoid allocations
 #[inline]
 fn safe_truncate(s: &str, max_len: usize) -> &str {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         return s;
     }
-    // Find the last safe break point (space) within limit
-    s[..max_len.saturating_sub(3)]
+    let target = max_len.saturating_sub(3);
+    let byte_end = s
+        .char_indices()
+        .nth(target)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    s[..byte_end]
         .rfind(' ')
         .map(|pos| &s[..pos + 1])
-        .unwrap_or_else(|| &s[..max_len.saturating_sub(3)])
+        .unwrap_or(&s[..byte_end])
 }
 
 fn safe_truncate_plain(s: &str, max_len: usize) -> Cow<'_, str> {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         return Cow::Borrowed(s);
     }
-    Cow::Owned(format!("{}…", &s[..max_len.saturating_sub(1)]))
+    let target = max_len.saturating_sub(1);
+    let truncated: String = s.chars().take(target).collect();
+    Cow::Owned(format!("{}…", truncated))
 }
 
 fn wrap_text_with_indent(text: &str, max_width: usize, indent: usize) -> Vec<String> {
