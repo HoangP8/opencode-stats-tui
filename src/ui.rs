@@ -134,7 +134,7 @@ pub struct App {
 
     // Phase 2: Render Caching
     cached_day_strings: HashMap<String, String>, // Pre-formatted day strings with weekday names
-    session_lookup: HashMap<Box<str>, Arc<crate::stats::SessionStat>>, // O(1) session lookup (Phase 3: Box<str> for memory efficiency)
+    
 
     chat_max_scroll: u16,
     focus: Focus,
@@ -391,7 +391,7 @@ impl App {
             cached_session_items: Vec::new(),
             cached_session_width: 0,
             cached_day_strings: HashMap::with_capacity(32),
-            session_lookup: HashMap::with_capacity(256),
+
 
             chat_max_scroll: 0,
             focus: Focus::Left,
@@ -419,7 +419,6 @@ impl App {
             should_redraw: true,
         };
         app.update_session_list();
-        app.rebuild_session_lookup();
         app.precompute_day_strings();
         app
     }
@@ -440,17 +439,28 @@ impl App {
     }
 
     fn update_session_list(&mut self) {
+        let prev_selected_id = self.session_list_state.selected()
+            .and_then(|i| self.session_list.get(i))
+            .map(|s| s.id.clone());
+
         self.session_list.clear();
         if let Some(day) = self.selected_day() {
             if let Some(stat) = self.per_day.get(&day) {
-                // Optimized: pre-allocate with known capacity for sorting
                 let mut sessions: Vec<_> = stat.sessions.values().cloned().collect();
                 sessions.sort_unstable_by(|a, b| b.last_activity.cmp(&a.last_activity));
                 self.session_list = sessions;
             }
         }
         if !self.session_list.is_empty() {
-            self.session_list_state.select(Some(0));
+            if let Some(prev_id) = prev_selected_id.as_ref() {
+                if let Some(idx) = self.session_list.iter().position(|s| s.id == *prev_id) {
+                    self.session_list_state.select(Some(idx));
+                } else {
+                    self.session_list_state.select(Some(0));
+                }
+            } else {
+                self.session_list_state.select(Some(0));
+            }
         } else {
             self.session_list_state.select(None);
         }
@@ -552,30 +562,6 @@ impl App {
             .collect();
     }
 
-    /// Rebuild session lookup map for O(1) session access (Phase 2 optimization)
-    fn rebuild_session_lookup(&mut self) {
-        self.session_lookup.clear();
-        let total_sessions: usize = self.per_day.values().map(|d| d.sessions.len()).sum();
-        self.session_lookup.reserve(total_sessions);
-        for day_stat in self.per_day.values() {
-            for (id, session) in &day_stat.sessions {
-                self.session_lookup
-                    .insert(id.clone().into_boxed_str(), session.clone());
-            }
-        }
-    }
-
-    fn partial_update_session_lookup(&mut self, session_id: &str) {
-        // Find the session in per_day and update it in session_lookup
-        for day_stat in self.per_day.values() {
-            if let Some(session) = day_stat.sessions.get(session_id) {
-                self.session_lookup
-                    .insert(session_id.to_string().into_boxed_str(), session.clone());
-                return;
-            }
-        }
-    }
-
     /// Precompute formatted day strings with weekday names (Phase 2 optimization)
     fn precompute_day_strings(&mut self) {
         // Only compute if not already cached
@@ -603,23 +589,18 @@ impl App {
     }
 
     fn open_session_modal(&mut self, area_height: u16) {
-        let session_id = match self.session_list_state.selected() {
-            Some(i) => match self.session_list.get(i) {
-                Some(s) => s.id.clone(),
-                None => return,
-            },
+        let session_stat = match self.session_list_state.selected()
+            .and_then(|i| self.session_list.get(i))
+            .cloned()
+        {
+            Some(s) => s,
             None => return,
         };
 
+        let session_id = session_stat.id.clone();
+
         // Get the current day for filtering messages
         let current_day = self.selected_day();
-
-        // Find the session_stat for this session_id - use session_lookup for O(1) access (Phase 2 optimization)
-        let session_stat = self
-            .session_lookup
-            .get(&*session_id)
-            .cloned()
-            .unwrap_or_else(|| Arc::new(crate::stats::SessionStat::new(session_id.clone())));
 
         self.chat_scroll = 0;
         let session_id_str = session_id.to_string();
@@ -793,13 +774,19 @@ impl App {
 
             // Rebuild derived data if full refresh, otherwise partial
             if is_full_refresh {
+                let prev_selected_day = self.selected_day();
                 self.day_list.clear();
                 self.day_list.extend(self.per_day.keys().cloned());
                 self.day_list.sort_unstable_by(|a, b| b.cmp(a));
-                if !self.day_list.is_empty() && self.day_list_state.selected().is_none() {
+                if let Some(prev) = prev_selected_day.as_ref() {
+                    if let Some(idx) = self.day_list.iter().position(|d| d == prev) {
+                        self.day_list_state.select(Some(idx));
+                    } else if !self.day_list.is_empty() {
+                        self.day_list_state.select(Some(0));
+                    }
+                } else if !self.day_list.is_empty() && self.day_list_state.selected().is_none() {
                     self.day_list_state.select(Some(0));
                 }
-                self.rebuild_session_lookup();
                 self.update_session_list();
             } else {
                 // For incremental updates, we don't need to rebuild the entire day_list
@@ -812,15 +799,15 @@ impl App {
                     }
                 }
                 if day_list_changed {
+                    let prev_selected_day = self.selected_day();
                     self.day_list.sort_unstable_by(|a, b| b.cmp(a));
-                    if self.day_list_state.selected().is_none() {
+                    if let Some(prev) = prev_selected_day.as_ref() {
+                        if let Some(idx) = self.day_list.iter().position(|d| d == prev) {
+                            self.day_list_state.select(Some(idx));
+                        }
+                    } else if self.day_list_state.selected().is_none() {
                         self.day_list_state.select(Some(0));
                     }
-                }
-
-                // Incrementally update session_lookup for affected sessions
-                for session_id in &affected_sessions {
-                    self.partial_update_session_lookup(session_id);
                 }
 
                 // Only rebuild session list if the currently selected day was affected
