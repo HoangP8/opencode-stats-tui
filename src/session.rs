@@ -14,6 +14,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Scroll increment for smooth scrolling experience (1 line = smoothest)
 const SCROLL_INCREMENT: u16 = 1;
@@ -32,7 +33,7 @@ pub struct SessionModal {
     pub session_details: Option<SessionDetails>,
     pub current_session: Option<SessionStat>,
     pub info_scroll: u16,
-    pub chat_messages: Vec<ChatMessage>,
+    pub chat_messages: Arc<Vec<ChatMessage>>,
     pub chat_scroll: u16,
     pub chat_max_scroll: u16,
     pub selected_column: ModalColumn, // Track which column is focused
@@ -53,7 +54,7 @@ impl SessionModal {
             session_details: None,
             current_session: None,
             info_scroll: 0,
-            chat_messages: Vec::new(),
+            chat_messages: Arc::new(Vec::new()),
             chat_scroll: 0,
             chat_max_scroll: 0,
             selected_column: ModalColumn::Info,
@@ -65,7 +66,7 @@ impl SessionModal {
     pub fn open_session(
         &mut self,
         session_id: &str,
-        chat_messages: Vec<ChatMessage>,
+        chat_messages: Arc<Vec<ChatMessage>>,
         session_stat: &crate::stats::SessionStat,
         files: Option<&[std::path::PathBuf]>,
         day_filter: Option<&str>, // Filter session details by day
@@ -86,7 +87,7 @@ impl SessionModal {
         self.open = false;
         self.session_details = None;
         self.current_session = None;
-        self.chat_messages.clear();
+        self.chat_messages = Arc::new(Vec::new());
         self.chat_scroll = 0;
         self.info_scroll = 0;
         self.chat_max_scroll = 0;

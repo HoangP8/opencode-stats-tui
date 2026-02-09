@@ -1,8 +1,9 @@
 use crate::live_watcher::LiveWatcher;
 use crate::session::SessionModal;
 use crate::stats::{
-    format_duration_ms, format_number, format_number_full, load_session_chat, ChatMessage, DayStat,
-    MessageContent, ModelUsage, ToolUsage, Totals,
+    format_duration_ms, format_number, format_number_full, load_session_chat_incremental,
+    load_session_chat_with_max_ts, ChatMessage, DayStat, MessageContent, ModelUsage, ToolUsage,
+    Totals, MAX_MESSAGES_TO_LOAD,
 };
 use crate::stats_cache::StatsCache;
 use chrono::Datelike;
@@ -27,8 +28,10 @@ use std::sync::Arc;
 
 /// Cached chat session data including pre-calculated scroll info
 struct CachedChat {
-    messages: Vec<ChatMessage>,
+    messages: Arc<Vec<ChatMessage>>,
     total_lines: u16,
+    last_file_count: usize,
+    last_max_ts: i64,
 }
 
 /// Helper to create cache key from session_id and day
@@ -155,6 +158,10 @@ pub struct App {
     // Cached panel rectangles for optimized mouse hit-testing
     cached_rects: PanelRects,
 
+    // Phase 1 optimizations
+    cached_git_branch: Option<(Box<str>, Option<String>)>, // (path_root, branch) - avoid fs I/O per frame
+    cached_max_cost_width: usize,
+
     // Live stats: Cache and file watching
     stats_cache: Option<StatsCache>,
     _storage_path: PathBuf,
@@ -235,23 +242,35 @@ fn usage_list_row(
 /// Helper: Safely truncate a string to max characters without breaking UTF-8 (no ellipsis)
 /// Returns Cow to avoid allocation when no truncation needed
 fn safe_truncate_plain(s: &str, max_chars: usize) -> Cow<'_, str> {
-    if s.chars().count() <= max_chars {
-        Cow::Borrowed(s)
-    } else {
-        Cow::Owned(s.chars().take(max_chars).collect())
+    let mut count = 0;
+    for (idx, _) in s.char_indices() {
+        count += 1;
+        if count > max_chars {
+            return Cow::Owned(s[..idx].to_string());
+        }
     }
+    Cow::Borrowed(s)
 }
 
 /// Helper: Truncate a string to max characters and add ellipsis if truncated
 fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
-    // Optimized: early return without allocation if already short enough
-    if s.chars().count() <= max_chars {
-        return s.into();
+    let mut count = 0;
+    for (idx, _) in s.char_indices() {
+        count += 1;
+        if count > max_chars {
+            let visible_chars = max_chars.saturating_sub(3);
+            let byte_end = s
+                .char_indices()
+                .nth(visible_chars)
+                .map(|(i, _)| i)
+                .unwrap_or(idx);
+            let mut result = String::with_capacity(byte_end + 3);
+            result.push_str(&s[..byte_end]);
+            result.push_str("...");
+            return result;
+        }
     }
-    // Reserve space for "..."
-    let visible_chars = max_chars.saturating_sub(3);
-    let truncated: String = s.chars().take(visible_chars).collect();
-    format!("{}...", truncated)
+    s.into()
 }
 
 /// Calculate the actual number of rendered lines for a chat message
@@ -410,6 +429,9 @@ impl App {
 
             cached_rects: PanelRects::default(),
 
+            cached_git_branch: None,
+            cached_max_cost_width: 0,
+
             stats_cache,
             _storage_path: storage_path,
             live_watcher,
@@ -420,11 +442,12 @@ impl App {
         };
         app.update_session_list();
         app.precompute_day_strings();
+        app.recompute_max_cost_width();
         app
     }
 
-    fn max_cost_width(&self) -> usize {
-        let mut max_len = 8usize; // allow xxxxx.xx
+    fn recompute_max_cost_width(&mut self) {
+        let mut max_len = 8usize;
         for day in &self.day_list {
             if let Some(stat) = self.per_day.get(day) {
                 let s = format!("{:.2}", stat.display_cost());
@@ -435,7 +458,12 @@ impl App {
             let s = format!("{:.2}", m.cost);
             max_len = max_len.max(s.len());
         }
-        max_len
+        self.cached_max_cost_width = max_len;
+    }
+
+    #[inline]
+    fn max_cost_width(&self) -> usize {
+        self.cached_max_cost_width
     }
 
     fn update_session_list(&mut self) {
@@ -469,6 +497,8 @@ impl App {
         // Clear cached items; rebuild on render with correct width
         self.cached_session_items.clear();
         self.cached_session_width = 0;
+        // Invalidate git branch cache since selected session may have changed
+        self.cached_git_branch = None;
     }
 
     /// Rebuild cached session list items to avoid heavy computation on every render
@@ -610,16 +640,16 @@ impl App {
         let cache_key = cache_key(&session_id_str, current_day.as_deref());
 
         let total_lines = if let Some(cached) = self.chat_cache.get(&cache_key) {
-            let messages = cached.messages.clone();
+            let messages_arc = Arc::clone(&cached.messages);
             if let Some(pos) = self.chat_cache_order.iter().position(|s| s == &cache_key) {
                 self.chat_cache_order.remove(pos);
             }
             self.chat_cache_order.push(cache_key.clone());
 
-            // Open modal with cached messages and session stat
+            // Open modal with cached messages (Arc clone, no deep copy)
             self.modal.open_session(
                 &session_id_str,
-                messages,
+                messages_arc,
                 &session_stat,
                 self.session_message_files
                     .get(&session_id_str)
@@ -633,7 +663,8 @@ impl App {
                 .get(&session_id_str)
                 .map(|v| v.as_slice());
             // Pass current day to filter messages to only show this day's messages
-            let messages = load_session_chat(&session_id_str, files, current_day.as_deref());
+            let (messages, max_ts) =
+                load_session_chat_with_max_ts(&session_id_str, files, current_day.as_deref());
             let total_lines: u16 = messages.iter().map(calculate_message_rendered_lines).sum();
             let blank_lines = if !messages.is_empty() {
                 messages.len() - 1
@@ -641,6 +672,7 @@ impl App {
                 0
             };
             let total_lines = total_lines + blank_lines as u16;
+            let file_count = files.map(|f| f.len()).unwrap_or(0);
 
             // Implement LRU cache eviction if cache is too large
             const MAX_CACHE_SIZE: usize = 5;
@@ -651,19 +683,23 @@ impl App {
                 }
             }
 
+            let messages_arc = Arc::new(messages);
+
             self.chat_cache.insert(
                 cache_key.clone(),
                 CachedChat {
-                    messages: messages.clone(),
+                    messages: Arc::clone(&messages_arc),
                     total_lines,
+                    last_file_count: file_count,
+                    last_max_ts: max_ts,
                 },
             );
             self.chat_cache_order.push(cache_key.clone());
 
-            // Open modal with loaded messages and session stat
+            // Open modal with Arc (no deep copy)
             self.modal.open_session(
                 &session_id_str,
-                messages,
+                messages_arc,
                 &session_stat,
                 files,
                 current_day.as_deref(),
@@ -726,12 +762,6 @@ impl App {
             .and_then(|i| self.day_list.get(i).cloned())
     }
 
-    fn selected_session(&self) -> Option<&crate::stats::SessionStat> {
-        self.session_list_state
-            .selected()
-            .and_then(|i| self.session_list.get(i))
-            .map(|s| &**s)
-    }
 
     /// Refresh stats from cache (for live updates)
     pub fn refresh_stats(&mut self, changed_files: Vec<PathBuf>) {
@@ -847,7 +877,122 @@ impl App {
                 self.selected_model_index = Some(0);
             }
 
+            // Incrementally update open chat modal if its session changed.
+            if let Some(current) = self.current_chat_session_id.as_deref() {
+                if affected_sessions.contains(current) {
+                    let current_day = self.selected_day();
+                    let cache_key = cache_key(current, current_day.as_deref());
+                    if let Some(files) = self.session_message_files.get(current) {
+                        if let Some(cached) = self.chat_cache.get(&cache_key) {
+                            let cached_messages = Arc::clone(&cached.messages);
+                            let cached_total_lines = cached.total_lines;
+                            let cached_last_file_count = cached.last_file_count;
+                            let cached_last_max_ts = cached.last_max_ts;
+                            if cached_last_file_count < files.len() {
+                                let new_files = &files[cached_last_file_count..];
+                                let (mut new_msgs, new_max_ts) =
+                                    load_session_chat_incremental(
+                                        new_files,
+                                        current_day.as_deref(),
+                                        Some(cached_last_max_ts),
+                                    );
+
+                                let mut merged: Vec<ChatMessage> =
+                                    Vec::with_capacity(cached_messages.len() + new_msgs.len());
+                                merged.extend((*cached_messages).clone());
+                                if !new_msgs.is_empty() {
+                                    if let Some(last) = merged.last_mut() {
+                                        if let Some(first) = new_msgs.first() {
+                                            if last.role == first.role {
+                                                last.parts.extend(first.parts.clone());
+                                                new_msgs.remove(0);
+                                            }
+                                        }
+                                    }
+                                    merged.extend(new_msgs);
+                                }
+
+                                if merged.len() > MAX_MESSAGES_TO_LOAD {
+                                    let start = merged.len() - MAX_MESSAGES_TO_LOAD;
+                                    merged.drain(..start);
+                                }
+
+                                let total_lines: u16 =
+                                    merged.iter().map(calculate_message_rendered_lines).sum();
+                                let blank_lines = if !merged.is_empty() {
+                                    merged.len() - 1
+                                } else {
+                                    0
+                                };
+                                let total_lines = total_lines + blank_lines as u16;
+
+                                let messages_arc = Arc::new(merged);
+                                self.chat_cache.insert(
+                                    cache_key.clone(),
+                                    CachedChat {
+                                        messages: Arc::clone(&messages_arc),
+                                        total_lines,
+                                        last_file_count: files.len(),
+                                        last_max_ts: cached_last_max_ts.max(new_max_ts),
+                                    },
+                                );
+                                if let Some(pos) = self
+                                    .chat_cache_order
+                                    .iter()
+                                    .position(|s| s == &cache_key)
+                                {
+                                    self.chat_cache_order.remove(pos);
+                                }
+                                self.chat_cache_order.push(cache_key.clone());
+                                if self.modal.open {
+                                    self.modal.chat_messages = messages_arc;
+                                }
+                                affected_sessions.remove(current);
+                            } else if cached_last_file_count != files.len() {
+                                self.chat_cache.insert(
+                                    cache_key.clone(),
+                                    CachedChat {
+                                        messages: cached_messages,
+                                        total_lines: cached_total_lines,
+                                        last_file_count: files.len(),
+                                        last_max_ts: cached_last_max_ts,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Invalidate chat cache for remaining affected sessions.
+            if !affected_sessions.is_empty() {
+                if affected_sessions.len() == 1 {
+                    let only = affected_sessions.iter().next().unwrap();
+                    self.chat_cache.retain(|key, _| {
+                        if key == only {
+                            return false;
+                        }
+                        key.strip_prefix(only)
+                            .and_then(|rest| rest.strip_prefix('|'))
+                            .is_none()
+                    });
+                } else {
+                    self.chat_cache.retain(|key, _| {
+                        let session_id = key.split_once('|').map(|(s, _)| s).unwrap_or(key);
+                        !affected_sessions.contains(session_id)
+                    });
+                }
+                self.chat_cache_order
+                    .retain(|key| self.chat_cache.contains_key(key));
+                if let Some(current) = self.current_chat_session_id.as_deref() {
+                    if affected_sessions.contains(current) {
+                        self.current_chat_session_id = None;
+                    }
+                }
+            }
+
             self.precompute_day_strings();
+            self.recompute_max_cost_width();
 
             log::debug!("Stats refreshed successfully (live update)");
         }
@@ -901,19 +1046,11 @@ impl App {
             }
 
             // Check if refresh is needed from files collected by watcher
-            let pending_files = {
+            {
                 let mut lock = self.needs_refresh.lock();
-                if lock.is_empty() {
-                    Vec::new()
-                } else {
-                    let files = lock.clone();
-                    lock.clear();
-                    files
+                if !lock.is_empty() {
+                    self.pending_refresh_paths.append(&mut lock);
                 }
-            };
-
-            if !pending_files.is_empty() {
-                self.pending_refresh_paths.extend(pending_files);
             }
 
             let should_refresh = !self.pending_refresh_paths.is_empty()
@@ -2635,7 +2772,10 @@ impl App {
         border_style: Style,
         is_highlighted: bool,
     ) {
-        let session = self.selected_session();
+        let session = self
+            .session_list_state
+            .selected()
+            .and_then(|i| self.session_list.get(i).cloned());
 
         let panel_title = if let Some(s) = &session {
             if s.is_continuation {
@@ -2681,11 +2821,12 @@ impl App {
                 .get(&s.id)
                 .map(|t| t.strip_prefix("New session - ").unwrap_or(t))
                 .unwrap_or("Untitled");
-            let project = if !s.path_root.is_empty() {
-                &s.path_root
+            let project_str: Box<str> = if !s.path_root.is_empty() {
+                s.path_root.clone()
             } else {
-                &s.path_cwd
+                s.path_cwd.clone()
             };
+            let project: &str = &project_str;
 
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
@@ -2715,8 +2856,17 @@ impl App {
                 ),
             ]));
 
-            use crate::session::detect_git_branch;
-            let branch = detect_git_branch(project);
+            let branch = match &self.cached_git_branch {
+                Some((cached_root, cached_branch)) if &**cached_root == project => {
+                    cached_branch.clone()
+                }
+                _ => {
+                    use crate::session::detect_git_branch;
+                    let b = detect_git_branch(project);
+                    self.cached_git_branch = Some((project_str.clone(), b.clone()));
+                    b
+                }
+            };
             left_lines.push(Line::from(vec![
                 Span::styled("Branch       ", label_style),
                 Span::styled(
@@ -2882,14 +3032,14 @@ impl App {
         if self.cached_session_width != inner_width || self.cached_session_items.is_empty() {
             self.rebuild_cached_session_items(inner_width);
         }
-        // Use cached items to avoid recomputing on every render
-        let items: Vec<ListItem> = self.cached_session_items.clone();
 
         let title_color = if is_highlighted {
             Color::Cyan
         } else {
             Color::Yellow
         };
+
+        let items: Vec<ListItem> = self.cached_session_items.clone();
 
         let list = List::new(items)
             .block(

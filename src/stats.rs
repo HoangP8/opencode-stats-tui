@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 // Fast path constants for performance
-const MAX_MESSAGES_TO_LOAD: usize = 100;
+pub const MAX_MESSAGES_TO_LOAD: usize = 100;
 const MAX_CHARS_PER_TEXT_PART: usize = 500;
 const MAX_TOOL_TITLE_CHARS: usize = 100;
 
@@ -1203,11 +1203,13 @@ pub fn collect_stats() -> Stats {
     }
 }
 
-pub fn load_session_chat(
-    session_id: &str,
+fn load_session_chat_internal(
+    session_id: Option<&str>,
     files: Option<&[std::path::PathBuf]>,
-    day_filter: Option<&str>, // Only load messages from this specific day
-) -> Vec<ChatMessage> {
+    day_filter: Option<&str>,
+    since_ts: Option<i64>,
+    apply_limit: bool,
+) -> (Vec<ChatMessage>, i64) {
     let part_path_str = get_storage_path("part");
     let part_root = Path::new(&part_path_str);
 
@@ -1225,6 +1227,14 @@ pub fn load_session_chat(
                     }
                 }
 
+                // Filter by timestamp if specified
+                if let Some(since) = since_ts {
+                    let created = msg.time.as_ref().and_then(|t| t.created.map(|v| *v)).unwrap_or(0);
+                    if created <= since {
+                        return None;
+                    }
+                }
+
                 Some(msg)
             })
             .collect()
@@ -1237,14 +1247,24 @@ pub fn load_session_chat(
                 let bytes = fs::read(p).ok()?;
                 let msg: Message = serde_json::from_slice(&bytes).ok()?;
 
-                if msg.session_id.as_ref().map(|s| s.as_ref()) != Some(session_id) {
-                    return None;
+                if let Some(session_id) = session_id {
+                    if msg.session_id.as_ref().map(|s| s.as_ref()) != Some(session_id) {
+                        return None;
+                    }
                 }
 
                 // Filter by day if specified
                 if let Some(target_day) = day_filter {
                     let msg_day = get_day(msg.time.as_ref().and_then(|t| t.created.map(|v| *v)));
                     if msg_day != target_day {
+                        return None;
+                    }
+                }
+
+                // Filter by timestamp if specified
+                if let Some(since) = since_ts {
+                    let created = msg.time.as_ref().and_then(|t| t.created.map(|v| *v)).unwrap_or(0);
+                    if created <= since {
                         return None;
                     }
                 }
@@ -1260,13 +1280,19 @@ pub fn load_session_chat(
             .and_then(|t| t.created.map(|v| *v))
             .unwrap_or(0)
     });
-    if session_msgs.len() > MAX_MESSAGES_TO_LOAD {
+    if apply_limit && session_msgs.len() > MAX_MESSAGES_TO_LOAD {
         let start = session_msgs.len() - MAX_MESSAGES_TO_LOAD;
         session_msgs.drain(..start);
     }
 
+    let mut max_ts = since_ts.unwrap_or(0);
     let mut merged: Vec<ChatMessage> = Vec::with_capacity(session_msgs.len());
     for msg in session_msgs {
+        let created = msg.time.as_ref().and_then(|t| t.created.map(|v| *v)).unwrap_or(0);
+        if created > max_ts {
+            max_ts = created;
+        }
+
         let role: Box<str> = msg
             .role
             .as_ref()
@@ -1345,7 +1371,23 @@ pub fn load_session_chat(
             parts: parts_vec,
         });
     }
-    merged
+    (merged, max_ts)
+}
+
+pub fn load_session_chat_with_max_ts(
+    session_id: &str,
+    files: Option<&[std::path::PathBuf]>,
+    day_filter: Option<&str>,
+) -> (Vec<ChatMessage>, i64) {
+    load_session_chat_internal(Some(session_id), files, day_filter, None, true)
+}
+
+pub fn load_session_chat_incremental(
+    files: &[std::path::PathBuf],
+    day_filter: Option<&str>,
+    since_ts: Option<i64>,
+) -> (Vec<ChatMessage>, i64) {
+    load_session_chat_internal(None, Some(files), day_filter, since_ts, false)
 }
 
 #[derive(Clone)]

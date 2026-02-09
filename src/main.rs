@@ -4,7 +4,6 @@ mod session;
 mod stats;
 mod stats_cache;
 mod theme;
-
 mod ui;
 
 /// Cleanup terminal state - ensures terminal is restored even if ratatui fails
@@ -121,9 +120,8 @@ fn disable_all_modes() {
     let _ = stdout.write_all(combined.as_bytes());
     let _ = stdout.flush();
 
-    // Increased delay to ensure terminal processes all disable commands
-    // This prevents escape sequences from appearing on screen
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    // Brief delay to ensure terminal processes all disable commands
+    std::thread::sleep(std::time::Duration::from_millis(30));
 }
 
 /// Flush the OS-level terminal input buffer
@@ -167,7 +165,7 @@ fn main() -> io::Result<()> {
     // 4. Finally leave raw mode
 
     disable_all_modes(); // Step 1: STOP generating new mouse events
-    drain_input_events_until_silence(std::time::Duration::from_millis(150)); // Step 2: Clear the queue
+    drain_input_events_until_silence(std::time::Duration::from_millis(100)); // Step 2: Clear the queue
     flush_stdin_buffer(); // Step 3: Flush OS buffer
     force_cleanup_terminal(); // Step 4: Leave raw mode
 

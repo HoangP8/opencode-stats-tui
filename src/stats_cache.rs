@@ -202,9 +202,8 @@ impl StatsCache {
         let has_session_changes = paths
             .iter()
             .any(|p| p.contains("session.json") || p.contains("session_diff/"));
-        let has_message_changes = paths.iter().any(|p| p.contains("message/"));
 
-        if has_session_changes || has_message_changes {
+        if has_session_changes {
             cached.stats = crate::stats::collect_stats();
             for day_stat in cached.stats.per_day.values() {
                 for id in day_stat.sessions.keys() {
