@@ -1,8 +1,8 @@
 use crate::live_watcher::LiveWatcher;
 use crate::session::SessionModal;
 use crate::stats::{
-    format_number, format_number_full, load_session_chat, ChatMessage, DayStat, MessageContent,
-    ModelUsage, ToolUsage, Totals,
+    format_duration_ms, format_number, format_number_full, load_session_chat, ChatMessage, DayStat,
+    MessageContent, ModelUsage, ToolUsage, Totals,
 };
 use crate::stats_cache::StatsCache;
 use chrono::Datelike;
@@ -1593,7 +1593,7 @@ impl App {
                 Span::styled("PgUp/Dn", k),
                 Span::styled(" page", t),
                 sep.clone(),
-                Span::styled("Esc/Right-click", k),
+                Span::styled("Esc/q/Right-click", k),
                 Span::styled(" close", t),
             ]);
         } else if self.is_active || self.models_active {
@@ -1613,7 +1613,7 @@ impl App {
             }
             spans.extend_from_slice(&[
                 sep.clone(),
-                Span::styled("Esc/Right-click", k),
+                Span::styled("Esc/q/Right-click", k),
                 Span::styled(" back", t),
             ]);
         } else {
@@ -1627,7 +1627,7 @@ impl App {
                 Span::styled("Enter/Scroll", k),
                 Span::styled(" activate", t),
                 sep.clone(),
-                Span::styled("q/Right-click", k),
+                Span::styled("Esc/q/Right-click", k),
                 Span::styled(" quit", t),
             ]);
         }
@@ -1722,66 +1722,81 @@ impl App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Length(2)])
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(24),
+                Constraint::Length(1),
+                Constraint::Percentage(18),
+                Constraint::Percentage(18),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
             .split(inner);
 
-        let stats_layout_top = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(20),
-                Constraint::Percentage(20),
-                Constraint::Percentage(26),
-                Constraint::Percentage(36),
-            ])
-            .split(rows[0]);
+        let sep_style = Style::default().fg(Color::Rgb(180, 180, 180));
+        for &i in &[1, 4] {
+            let sep_area = cols[i];
+            let sep = Paragraph::new(vec![
+                Line::from(Span::styled("│", sep_style)),
+                Line::from(Span::styled("│", sep_style)),
+                Line::from(Span::styled("│", sep_style)),
+                Line::from(Span::styled("│", sep_style)),
+            ]);
+            frame.render_widget(sep, sep_area);
+        }
 
-        let stats_layout_bottom = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(20),
-                Constraint::Percentage(20),
-                Constraint::Percentage(26),
-                Constraint::Percentage(36),
-            ])
-            .split(rows[1]);
+        let total_responses = self.totals.messages.saturating_sub(self.totals.prompts);
 
-        // Use helper for simple stats
-        let s_sess = stat_widget(
-            "Sessions",
-            format!("{}", self.totals.sessions.len()),
-            Color::Cyan,
+        // Col 1: Sessions / Cost
+        let c1 = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Length(2)])
+            .split(cols[0]);
+        frame.render_widget(
+            stat_widget("Sessions", format!("{}", self.totals.sessions.len()), Color::Cyan),
+            c1[0],
         );
-        let s_cost = stat_widget(
-            "Cost",
-            format!("${:.2}", self.totals.display_cost()),
-            Color::Yellow,
-        );
-        let s_msg = stat_widget("Messages", format!("{}", self.totals.messages), Color::Cyan);
-        let s_in = stat_widget(
-            "Input",
-            format_number(self.totals.tokens.input),
-            Color::Blue,
-        );
-        let s_out = stat_widget(
-            "Output",
-            format_number(self.totals.tokens.output),
-            Color::Magenta,
-        );
-        let s_think = stat_widget(
-            "Thinking",
-            format_number(self.totals.tokens.reasoning),
-            Color::Rgb(255, 165, 0),
-        );
-        let s_cache = stat_widget(
-            "Cache",
-            format_number(self.totals.tokens.cache_read + self.totals.tokens.cache_write),
-            Color::Yellow,
+        frame.render_widget(
+            stat_widget("Cost", format!("${:.2}", self.totals.display_cost()), Color::Yellow),
+            c1[1],
         );
 
-        // Line changes needs custom formatting (two colors)
-        let s_lines = Paragraph::new(vec![
+        // Col 2: Input / Output
+        let c2 = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Length(2)])
+            .split(cols[2]);
+        frame.render_widget(
+            stat_widget("Input", format_number(self.totals.tokens.input), Color::Blue),
+            c2[0],
+        );
+        frame.render_widget(
+            stat_widget("Output", format_number(self.totals.tokens.output), Color::Magenta),
+            c2[1],
+        );
+
+        // Col 3: Thinking / Cache
+        let c3 = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Length(2)])
+            .split(cols[3]);
+        frame.render_widget(
+            stat_widget("Thinking", format_number(self.totals.tokens.reasoning), Color::Rgb(255, 165, 0)),
+            c3[0],
+        );
+        frame.render_widget(
+            stat_widget("Cache", format_number(self.totals.tokens.cache_read + self.totals.tokens.cache_write), Color::Yellow),
+            c3[1],
+        );
+
+        // Col 4: Lines / User · Agent
+        let c4 = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Length(2)])
+            .split(cols[5]);
+
+        let lines_widget = Paragraph::new(vec![
             Line::from(Span::styled(
                 "Line Changes",
                 Style::default().fg(Color::Rgb(180, 180, 180)),
@@ -1789,26 +1804,37 @@ impl App {
             Line::from(vec![
                 Span::styled(
                     format!("+{}", format_number(self.totals.diffs.additions)),
-                    Style::default().fg(Color::Green),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" / ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                Span::styled(" / ", Style::default().fg(Color::Rgb(100, 100, 120))),
                 Span::styled(
                     format!("-{}", format_number(self.totals.diffs.deletions)),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
             ]),
         ])
         .alignment(Alignment::Center);
+        frame.render_widget(lines_widget, c4[0]);
 
-        frame.render_widget(s_sess, stats_layout_top[0]);
-        frame.render_widget(s_msg, stats_layout_top[1]);
-        frame.render_widget(s_cost, stats_layout_top[2]);
-        frame.render_widget(s_lines, stats_layout_top[3]);
-
-        frame.render_widget(s_in, stats_layout_bottom[0]);
-        frame.render_widget(s_out, stats_layout_bottom[1]);
-        frame.render_widget(s_think, stats_layout_bottom[2]);
-        frame.render_widget(s_cache, stats_layout_bottom[3]);
+        let msg_widget = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "User / Agent Messages",
+                Style::default().fg(Color::Rgb(180, 180, 180)),
+            )),
+            Line::from(vec![
+                Span::styled(
+                    format!("{}", self.totals.prompts),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" / ", Style::default().fg(Color::Rgb(100, 100, 120))),
+                Span::styled(
+                    format!("{}", total_responses),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+        ])
+        .alignment(Alignment::Center);
+        frame.render_widget(msg_widget, c4[1]);
     }
 
     fn render_day_list(
@@ -2181,8 +2207,8 @@ impl App {
         let bottom_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(40), // Tools
-                Constraint::Percentage(60), // Ranking
+                Constraint::Percentage(50), // Tools
+                Constraint::Percentage(50), // Ranking
             ])
             .split(main_chunks[1]);
 
@@ -2258,6 +2284,10 @@ impl App {
                 truncate_with_ellipsis(text, avail.max(1))
             };
 
+            let non_cache = (model.tokens.input + model.tokens.output + model.tokens.reasoning).max(1) as f64;
+            let est_cost = model.cost + (model.tokens.cache_read as f64 * model.cost / non_cache);
+            let savings = est_cost - model.cost;
+
             let left_lines = vec![
                 Line::from(vec![
                     Span::styled("Sessions  ", label_color),
@@ -2287,11 +2317,11 @@ impl App {
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("Est Cost  ", label_color),
+                    Span::styled("Savings   ", label_color),
                     Span::styled(
-                        "$0.00",
+                        format!("${:.2}", savings),
                         Style::default()
-                            .fg(Color::DarkGray)
+                            .fg(if savings > 0.0 { Color::Green } else { Color::DarkGray })
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]),
@@ -2606,10 +2636,7 @@ impl App {
         is_highlighted: bool,
     ) {
         let session = self.selected_session();
-        // Optimized: pre-allocate with known capacity
-        let mut final_lines = Vec::with_capacity(12);
 
-        // Build title for the panel: show session ID and continuation info
         let panel_title = if let Some(s) = &session {
             if s.is_continuation {
                 if let Some(first_date) = &s.first_created_date {
@@ -2643,18 +2670,10 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Center),
-            )
-            .title_bottom(
-                Line::from(Span::styled(
-                    if is_highlighted {
-                        " ↑↓: scroll "
-                    } else {
-                        " "
-                    },
-                    Style::default().fg(Color::DarkGray),
-                ))
-                .alignment(Alignment::Center),
             );
+
+        let info_inner = block.inner(area);
+        frame.render_widget(block, area);
 
         if let Some(s) = session {
             let title = self
@@ -2668,185 +2687,187 @@ impl App {
                 &s.path_cwd
             };
 
-            let inner_width = area.width.saturating_sub(2) as usize;
-            let value_width = inner_width.saturating_sub(14);
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+                .split(info_inner);
 
-            final_lines.push(Line::from(vec![
+            let label_style = Style::default().fg(Color::Rgb(180, 180, 180));
+            let left_val_width = cols[0].width.saturating_sub(14) as usize;
+
+            let mut left_lines: Vec<Line> = Vec::with_capacity(8);
+
+            left_lines.push(Line::from(vec![
+                Span::styled("Title        ", label_style),
                 Span::styled(
-                    "Title        ",
-                    Style::default().fg(Color::Rgb(180, 180, 180)),
-                ),
-                Span::styled(
-                    truncate_with_ellipsis(title, value_width),
+                    truncate_with_ellipsis(title, left_val_width),
                     Style::default()
                         .fg(Color::White)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
 
-            final_lines.push(Line::from(vec![
+            left_lines.push(Line::from(vec![
+                Span::styled("Project      ", label_style),
                 Span::styled(
-                    "Project      ",
-                    Style::default().fg(Color::Rgb(180, 180, 180)),
-                ),
-                Span::styled(
-                    truncate_with_ellipsis(project, value_width),
+                    truncate_with_ellipsis(project, left_val_width),
                     Style::default().fg(Color::Blue),
                 ),
             ]));
 
             use crate::session::detect_git_branch;
-            if let Some(branch) = detect_git_branch(project) {
-                final_lines.push(Line::from(vec![
-                    Span::styled(
-                        "Branch       ",
-                        Style::default().fg(Color::Rgb(180, 180, 180)),
-                    ),
-                    Span::styled(
-                        truncate_with_ellipsis(&branch, value_width),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                ]));
-            }
-
-            let mut model_line = vec![Span::styled(
-                "Models       ",
-                Style::default().fg(Color::Rgb(180, 180, 180)),
-            )];
-            let mut models: Vec<_> = s.models.iter().collect();
-            models.sort();
-            let mut current_len = 0;
-            let max_len = inner_width.saturating_sub(15);
-            for (i, m) in models.iter().enumerate() {
-                let display = if i == 0 {
-                    m.to_string()
-                } else {
-                    format!(", {}", m)
-                };
-                if current_len + display.len() > max_len && i > 0 {
-                    model_line.push(Span::styled(
-                        format!(" +{}", models.len() - i),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                    break;
-                }
-                model_line.push(Span::styled(
-                    display.clone(),
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                current_len += display.len();
-            }
-            final_lines.push(Line::from(model_line));
-
-            final_lines.push(Line::from(vec![
+            let branch = detect_git_branch(project);
+            left_lines.push(Line::from(vec![
+                Span::styled("Branch       ", label_style),
                 Span::styled(
-                    "Messages     ",
-                    Style::default().fg(Color::Rgb(180, 180, 180)),
-                ),
-                Span::styled(
-                    format!("{}", s.messages),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    branch
+                        .as_deref()
+                        .map(|b| truncate_with_ellipsis(b, left_val_width))
+                        .unwrap_or_else(|| "n/a".into()),
+                    Style::default().fg(if branch.is_some() {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    }),
                 ),
             ]));
 
-            final_lines.push(Line::from(vec![
+            left_lines.push(Line::from(vec![
+                Span::styled("Last Active  ", label_style),
                 Span::styled(
-                    "Cost         ",
-                    Style::default().fg(Color::Rgb(180, 180, 180)),
-                ),
-                Span::styled(
-                    format!("${:.2}", s.display_cost()),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]));
-
-            final_lines.push(Line::from(vec![
-                Span::styled(
-                    "Input        ",
-                    Style::default().fg(Color::Rgb(180, 180, 180)),
-                ),
-                Span::styled(
-                    format_number_full(s.tokens.input),
-                    Style::default().fg(Color::Blue),
-                ),
-            ]));
-
-            final_lines.push(Line::from(vec![
-                Span::styled(
-                    "Output       ",
-                    Style::default().fg(Color::Rgb(180, 180, 180)),
-                ),
-                Span::styled(
-                    format_number_full(s.tokens.output),
-                    Style::default().fg(Color::Magenta),
-                ),
-            ]));
-
-            final_lines.push(Line::from(vec![
-                Span::styled(
-                    "Thinking     ",
-                    Style::default().fg(Color::Rgb(180, 180, 180)),
-                ),
-                Span::styled(
-                    format_number_full(s.tokens.reasoning),
-                    Style::default().fg(Color::Rgb(255, 165, 0)),
-                ),
-            ]));
-
-            final_lines.push(Line::from(vec![
-                Span::styled(
-                    "Cache Read   ",
-                    Style::default().fg(Color::Rgb(180, 180, 180)),
-                ),
-                Span::styled(
-                    format_number_full(s.tokens.cache_read),
-                    Style::default().fg(Color::Yellow),
-                ),
-            ]));
-
-            final_lines.push(Line::from(vec![
-                Span::styled(
-                    "Cache Write  ",
-                    Style::default().fg(Color::Rgb(180, 180, 180)),
-                ),
-                Span::styled(
-                    format_number_full(s.tokens.cache_write),
-                    Style::default().fg(Color::Yellow),
-                ),
-            ]));
-
-            final_lines.push(Line::from(vec![
-                Span::styled(
-                    "Activity     ",
-                    Style::default().fg(Color::Rgb(180, 180, 180)),
-                ),
-                Span::styled(
-                    chrono::DateTime::from_timestamp(s.last_activity, 0)
-                        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                    chrono::DateTime::from_timestamp(s.last_activity / 1000, 0)
+                        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
                         .unwrap_or_else(|| "n/a".to_string()),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
+
+            left_lines.push(Line::from(vec![
+                Span::styled("Duration     ", label_style),
+                Span::styled(
+                    format_duration_ms(s.first_activity, s.last_activity)
+                        .unwrap_or_else(|| "n/a".into()),
+                    Style::default().fg(Color::Rgb(100, 200, 255)),
+                ),
+            ]));
+
+            let mut models: Vec<_> = s.models.iter().collect();
+            models.sort();
+            let model_val_width = left_val_width;
+
+
+            if models.is_empty() {
+                left_lines.push(Line::from(vec![
+                    Span::styled("Models       ", label_style),
+                    Span::styled("n/a", Style::default().fg(Color::DarkGray)),
+                ]));
+            } else if models.len() <= 3 {
+                for (i, m) in models.iter().enumerate() {
+                    let prefix = if i == 0 { "Models       " } else { "             " };
+                    left_lines.push(Line::from(vec![
+                        Span::styled(prefix, label_style),
+                        Span::styled(
+                            truncate_with_ellipsis(m, model_val_width),
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
+            } else {
+                for (i, m) in models.iter().take(2).enumerate() {
+                    let prefix = if i == 0 { "Models       " } else { "             " };
+                    left_lines.push(Line::from(vec![
+                        Span::styled(prefix, label_style),
+                        Span::styled(
+                            truncate_with_ellipsis(m, model_val_width),
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
+                left_lines.push(Line::from(vec![
+                    Span::styled("             ", label_style),
+                    Span::styled(
+                        format!("+{}", models.len() - 2),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
+
+            frame.render_widget(Paragraph::new(left_lines), cols[0]);
+
+            let s_responses = s.messages.saturating_sub(s.prompts);
+            let right_lines = vec![
+                Line::from(vec![
+                    Span::styled("Input         ", label_style),
+                    Span::styled(
+                        format_number_full(s.tokens.input),
+                        Style::default().fg(Color::Blue),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Output        ", label_style),
+                    Span::styled(
+                        format_number_full(s.tokens.output),
+                        Style::default().fg(Color::Magenta),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Thinking      ", label_style),
+                    Span::styled(
+                        format_number_full(s.tokens.reasoning),
+                        Style::default().fg(Color::Rgb(255, 165, 0)),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Cache Read    ", label_style),
+                    Span::styled(
+                        format_number_full(s.tokens.cache_read),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Cache Write   ", label_style),
+                    Span::styled(
+                        format_number_full(s.tokens.cache_write),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Prompts       ", label_style),
+                    Span::styled(
+                        format!("{}", s.prompts),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Responses     ", label_style),
+                    Span::styled(
+                        format!("{}", s_responses),
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Cost          ", label_style),
+                    Span::styled(
+                        format!("${:.2}", s.display_cost()),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+            ];
+
+            frame.render_widget(Paragraph::new(right_lines), cols[1]);
         }
-
-        let inner = block.inner(area);
-        self.detail_max_scroll = (final_lines.len().saturating_sub(inner.height as usize)) as u16;
-        self.detail_scroll = self.detail_scroll.min(self.detail_max_scroll);
-
-        frame.render_widget(
-            Paragraph::new(final_lines)
-                .block(block)
-                .scroll((self.detail_scroll, 0)),
-            area,
-        );
     }
 
     fn render_session_list(

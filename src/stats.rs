@@ -64,11 +64,13 @@ pub struct Diffs {
 pub struct SessionStat {
     pub id: Box<str>,
     pub messages: u64,
+    pub prompts: u64,
     pub cost: f64,
     pub tokens: Tokens,
     pub diffs: Diffs,
     pub models: HashSet<Box<str>>,
     pub tools: HashMap<Box<str>, u64>,
+    pub first_activity: i64,
     pub last_activity: i64,
     pub path_cwd: Box<str>,
     pub path_root: Box<str>,
@@ -84,11 +86,13 @@ impl SessionStat {
         Self {
             id: id.into(),
             messages: 0,
+            prompts: 0,
             cost: 0.0,
             tokens: Tokens::default(),
             diffs: Diffs::default(),
             models: HashSet::new(),
             tools: HashMap::new(),
+            first_activity: i64::MAX,
             last_activity: 0,
             path_cwd: String::new().into_boxed_str(),
             path_root: String::new().into_boxed_str(),
@@ -108,6 +112,7 @@ impl SessionStat {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DayStat {
     pub messages: u64,
+    pub prompts: u64,
     pub tokens: Tokens,
     pub diffs: Diffs,
     pub sessions: HashMap<String, Arc<SessionStat>>,
@@ -118,6 +123,7 @@ impl Default for DayStat {
     fn default() -> Self {
         Self {
             messages: 0,
+            prompts: 0,
             tokens: Tokens::default(),
             diffs: Diffs::default(),
             sessions: HashMap::with_capacity(4),
@@ -130,6 +136,7 @@ impl Default for DayStat {
 pub struct Totals {
     pub sessions: HashSet<Box<str>>,
     pub messages: u64,
+    pub prompts: u64,
     pub tokens: Tokens,
     pub diffs: Diffs,
     pub tools: HashMap<Box<str>, u64>,
@@ -141,6 +148,7 @@ impl Default for Totals {
         Self {
             sessions: HashSet::with_capacity(16),
             messages: 0,
+            prompts: 0,
             tokens: Tokens::default(),
             diffs: Diffs::default(),
             tools: HashMap::with_capacity(16),
@@ -308,6 +316,7 @@ pub(crate) struct Summary {
 #[derive(Deserialize, Default)]
 pub(crate) struct TimeData {
     pub(crate) created: Option<LenientI64>,
+    pub(crate) completed: Option<LenientI64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -479,6 +488,27 @@ pub(crate) struct PartData {
     pub(crate) tool: Option<String>,
     pub(crate) thought: Option<String>,
     pub(crate) state: Option<ToolState>,
+}
+
+#[inline]
+pub fn format_duration_ms(first_ms: i64, last_ms: i64) -> Option<String> {
+    if first_ms >= last_ms || first_ms == i64::MAX || last_ms == 0 {
+        return None;
+    }
+    let total_secs = ((last_ms - first_ms) / 1000) as u64;
+    let days = total_secs / 86400;
+    let hours = (total_secs % 86400) / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let secs = total_secs % 60;
+    Some(if days > 0 {
+        format!("{}d {}h {}m", days, hours, mins)
+    } else if hours > 0 {
+        format!("{}h {}m {}s", hours, mins, secs)
+    } else if mins > 0 {
+        format!("{}m {}s", mins, secs)
+    } else {
+        format!("{}s", secs)
+    })
 }
 
 #[inline]
@@ -904,6 +934,9 @@ pub fn collect_stats() -> Stats {
             last_day_str = d.clone();
             d
         };
+        let role = msg.role.as_ref().map(|s| s.0.as_str()).unwrap_or("");
+        let is_user = role == "user";
+        let is_assistant = role == "assistant";
         let model_id = get_model_id(msg);
         let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
 
@@ -917,45 +950,49 @@ pub fn collect_stats() -> Stats {
             totals.sessions.insert(session_id.clone().into_boxed_str());
         }
         totals.messages += 1;
+        if is_user {
+            totals.prompts += 1;
+        }
         totals.cost += cost;
         add_tokens(&mut totals.tokens, &msg.tokens);
 
-        let model_entry = model_stats.entry(model_id.clone()).or_insert_with(|| {
-            let name_str: &str = &model_id;
-            let short: Box<str> = name_str.rsplit('/').next().unwrap_or(name_str).into();
-            let provider: Box<str> = name_str.split('/').next().unwrap_or(name_str).into();
-            ModelUsage {
-                name: model_id.clone(),
-                short_name: short.clone(),
-                provider: provider.clone(),
-                display_name: format!("{}/{}", provider, short).into_boxed_str(),
-                messages: 0,
-                sessions: HashSet::new(),
-                tokens: Tokens::default(),
-                tools: HashMap::new(),
-                agents: HashMap::new(),
-                cost: 0.0,
+        if is_assistant {
+            let model_entry = model_stats.entry(model_id.clone()).or_insert_with(|| {
+                let name_str: &str = &model_id;
+                let short: Box<str> = name_str.rsplit('/').next().unwrap_or(name_str).into();
+                let provider: Box<str> = name_str.split('/').next().unwrap_or(name_str).into();
+                ModelUsage {
+                    name: model_id.clone(),
+                    short_name: short.clone(),
+                    provider: provider.clone(),
+                    display_name: format!("{}/{}", provider, short).into_boxed_str(),
+                    messages: 0,
+                    sessions: HashSet::new(),
+                    tokens: Tokens::default(),
+                    tools: HashMap::new(),
+                    agents: HashMap::new(),
+                    cost: 0.0,
+                }
+            });
+            model_entry.messages += 1;
+            if !session_id.is_empty() && !model_entry.sessions.contains(session_id.as_str()) {
+                model_entry
+                    .sessions
+                    .insert(session_id.clone().into_boxed_str());
             }
-        });
-        model_entry.messages += 1;
-        // Optimization: only insert if not already present (avoid allocation on common path)
-        if !session_id.is_empty() && !model_entry.sessions.contains(session_id.as_str()) {
-            model_entry
-                .sessions
-                .insert(session_id.clone().into_boxed_str());
-        }
-        model_entry.cost += cost;
-        add_tokens(&mut model_entry.tokens, &msg.tokens);
-        if let Some(agent) = msg
-            .agent
-            .as_ref()
-            .map(|s| s.0.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            *model_entry
-                .agents
-                .entry(agent.to_string().into_boxed_str())
-                .or_insert(0) += 1;
+            model_entry.cost += cost;
+            add_tokens(&mut model_entry.tokens, &msg.tokens);
+            if let Some(agent) = msg
+                .agent
+                .as_ref()
+                .map(|s| s.0.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                *model_entry
+                    .agents
+                    .entry(agent.to_string().into_boxed_str())
+                    .or_insert(0) += 1;
+            }
         }
 
         // Optimization: avoid allocation if day already exists
@@ -966,6 +1003,9 @@ pub fn collect_stats() -> Stats {
             per_day.get_mut(&day).unwrap()
         };
         day_stat.messages += 1;
+        if is_user {
+            day_stat.prompts += 1;
+        }
         day_stat.cost += cost;
         add_tokens(&mut day_stat.tokens, &msg.tokens);
 
@@ -993,20 +1033,38 @@ pub fn collect_stats() -> Stats {
         // Accumulate data for this day's session (separate from other days)
         let session_stat = Arc::make_mut(session_stat_arc);
         session_stat.messages += 1;
+        if is_user {
+            session_stat.prompts += 1;
+        }
         session_stat.cost += cost;
-        session_stat.models.insert(model_id);
+        if is_assistant {
+            session_stat.models.insert(model_id.clone());
+        }
         add_tokens(&mut session_stat.tokens, &msg.tokens);
         if let Some(t) = ts_val {
+            if t < session_stat.first_activity {
+                session_stat.first_activity = t;
+            }
+        }
+        let end_ts = msg
+            .time
+            .as_ref()
+            .and_then(|t| t.completed.map(|v| *v))
+            .or(ts_val);
+        if let Some(t) = end_ts {
             if t > session_stat.last_activity {
                 session_stat.last_activity = t;
             }
         }
 
-        // Optimization: reduce clones from 2 to 1 per tool
         for t in data.tools {
             *totals.tools.entry(t.clone()).or_insert(0) += 1;
             *session_stat.tools.entry(t.clone()).or_insert(0) += 1;
-            *model_entry.tools.entry(t).or_insert(0) += 1;
+            if is_assistant {
+                if let Some(model_entry) = model_stats.get_mut(&model_id) {
+                    *model_entry.tools.entry(t).or_insert(0) += 1;
+                }
+            }
         }
 
         if let Some(p) = &msg.path {
@@ -1294,7 +1352,9 @@ pub fn load_session_chat(
 pub struct ModelTokenStats {
     pub name: Box<str>,
     pub messages: u64,
+    pub prompts: u64,
     pub tokens: Tokens,
+    pub cost: f64,
 }
 
 #[derive(Clone, Default)]
@@ -1307,13 +1367,72 @@ pub fn load_session_details(
     files: Option<&[std::path::PathBuf]>,
     day_filter: Option<&str>, // Only load messages from this specific day
 ) -> SessionDetails {
+    struct MsgStats {
+        model: Box<str>,
+        is_user: bool,
+        tokens: Tokens,
+        cost: f64,
+    }
+
+    #[inline]
+    fn fold_msg(mut acc: HashMap<Box<str>, ModelTokenStats>, ms: MsgStats) -> HashMap<Box<str>, ModelTokenStats> {
+        let entry = acc.entry(ms.model.clone()).or_insert_with(|| ModelTokenStats {
+            name: ms.model,
+            messages: 0,
+            prompts: 0,
+            tokens: Tokens::default(),
+            cost: 0.0,
+        });
+        entry.messages += 1;
+        if ms.is_user {
+            entry.prompts += 1;
+        }
+        entry.cost += ms.cost;
+        entry.tokens.input += ms.tokens.input;
+        entry.tokens.output += ms.tokens.output;
+        entry.tokens.reasoning += ms.tokens.reasoning;
+        entry.tokens.cache_read += ms.tokens.cache_read;
+        entry.tokens.cache_write += ms.tokens.cache_write;
+        acc
+    }
+
+    fn reduce_maps(mut a: HashMap<Box<str>, ModelTokenStats>, b: HashMap<Box<str>, ModelTokenStats>) -> HashMap<Box<str>, ModelTokenStats> {
+        for (k, v) in b {
+            let entry = a.entry(k).or_insert_with(|| ModelTokenStats {
+                name: v.name,
+                messages: 0,
+                prompts: 0,
+                tokens: Tokens::default(),
+                cost: 0.0,
+            });
+            entry.messages += v.messages;
+            entry.prompts += v.prompts;
+            entry.cost += v.cost;
+            entry.tokens.input += v.tokens.input;
+            entry.tokens.output += v.tokens.output;
+            entry.tokens.reasoning += v.tokens.reasoning;
+            entry.tokens.cache_read += v.tokens.cache_read;
+            entry.tokens.cache_write += v.tokens.cache_write;
+        }
+        a
+    }
+
+    fn parse_msg(msg: &Message) -> (Box<str>, bool, Tokens, f64) {
+        let role = msg.role.as_ref().map(|s| s.0.as_str()).unwrap_or("");
+        let is_user = role == "user";
+        let model_id = get_model_id(msg);
+        let mut tokens = Tokens::default();
+        add_tokens(&mut tokens, &msg.tokens);
+        let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
+        (model_id, is_user, tokens, cost)
+    }
+
     let model_map: HashMap<Box<str>, ModelTokenStats> = if let Some(f) = files {
         f.par_iter()
             .filter_map(|p| {
                 let bytes = fs::read(p).ok()?;
                 let msg: Message = serde_json::from_slice(&bytes).ok()?;
 
-                // Filter by day if specified
                 if let Some(target_day) = day_filter {
                     let msg_day = get_day(msg.time.as_ref().and_then(|t| t.created.map(|v| *v)));
                     if msg_day != target_day {
@@ -1321,47 +1440,11 @@ pub fn load_session_details(
                     }
                 }
 
-                let model_id = get_model_id(&msg);
-                let mut tokens = Tokens::default();
-                add_tokens(&mut tokens, &msg.tokens);
-                Some((model_id, tokens))
+                let (model, is_user, tokens, cost) = parse_msg(&msg);
+                Some(MsgStats { model, is_user, tokens, cost })
             })
-            .fold(
-                HashMap::new,
-                |mut acc: HashMap<Box<str>, ModelTokenStats>, (model, tokens)| {
-                    let entry = acc.entry(model.clone()).or_insert_with(|| ModelTokenStats {
-                        name: model,
-                        messages: 0,
-                        tokens: Tokens::default(),
-                    });
-                    entry.messages += 1;
-                    entry.tokens.input += tokens.input;
-                    entry.tokens.output += tokens.output;
-                    entry.tokens.reasoning += tokens.reasoning;
-                    entry.tokens.cache_read += tokens.cache_read;
-                    entry.tokens.cache_write += tokens.cache_write;
-                    acc
-                },
-            )
-            .reduce(
-                HashMap::new,
-                |mut a: HashMap<Box<str>, ModelTokenStats>, b| {
-                    for (k, v) in b {
-                        let entry = a.entry(k).or_insert_with(|| ModelTokenStats {
-                            name: v.name,
-                            messages: 0,
-                            tokens: Tokens::default(),
-                        });
-                        entry.messages += v.messages;
-                        entry.tokens.input += v.tokens.input;
-                        entry.tokens.output += v.tokens.output;
-                        entry.tokens.reasoning += v.tokens.reasoning;
-                        entry.tokens.cache_read += v.tokens.cache_read;
-                        entry.tokens.cache_write += v.tokens.cache_write;
-                    }
-                    a
-                },
-            )
+            .fold(HashMap::new, fold_msg)
+            .reduce(HashMap::new, reduce_maps)
     } else {
         let message_path = get_storage_path("message");
         let msg_files = list_message_files(Path::new(&message_path));
@@ -1374,7 +1457,6 @@ pub fn load_session_details(
                     return None;
                 }
 
-                // Filter by day if specified
                 if let Some(target_day) = day_filter {
                     let msg_day = get_day(msg.time.as_ref().and_then(|t| t.created.map(|v| *v)));
                     if msg_day != target_day {
@@ -1382,48 +1464,11 @@ pub fn load_session_details(
                     }
                 }
 
-                let model_id = get_model_id(&msg);
-                let mut tokens = Tokens::default();
-                add_tokens(&mut tokens, &msg.tokens);
-
-                Some((model_id, tokens))
+                let (model, is_user, tokens, cost) = parse_msg(&msg);
+                Some(MsgStats { model, is_user, tokens, cost })
             })
-            .fold(
-                HashMap::new,
-                |mut acc: HashMap<Box<str>, ModelTokenStats>, (model, tokens)| {
-                    let entry = acc.entry(model.clone()).or_insert_with(|| ModelTokenStats {
-                        name: model,
-                        messages: 0,
-                        tokens: Tokens::default(),
-                    });
-                    entry.messages += 1;
-                    entry.tokens.input += tokens.input;
-                    entry.tokens.output += tokens.output;
-                    entry.tokens.reasoning += tokens.reasoning;
-                    entry.tokens.cache_read += tokens.cache_read;
-                    entry.tokens.cache_write += tokens.cache_write;
-                    acc
-                },
-            )
-            .reduce(
-                HashMap::new,
-                |mut a: HashMap<Box<str>, ModelTokenStats>, b| {
-                    for (k, v) in b {
-                        let entry = a.entry(k).or_insert_with(|| ModelTokenStats {
-                            name: v.name,
-                            messages: 0,
-                            tokens: Tokens::default(),
-                        });
-                        entry.messages += v.messages;
-                        entry.tokens.input += v.tokens.input;
-                        entry.tokens.output += v.tokens.output;
-                        entry.tokens.reasoning += v.tokens.reasoning;
-                        entry.tokens.cache_read += v.tokens.cache_read;
-                        entry.tokens.cache_write += v.tokens.cache_write;
-                    }
-                    a
-                },
-            )
+            .fold(HashMap::new, fold_msg)
+            .reduce(HashMap::new, reduce_maps)
     };
 
     let mut model_stats: Vec<ModelTokenStats> = model_map.into_values().collect();

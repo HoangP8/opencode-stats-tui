@@ -536,6 +536,9 @@ impl StatsCache {
 
         let ts = msg.time.as_ref().and_then(|t| t.created.map(|v| *v));
         let day = crate::stats::get_day(ts);
+        let role = msg.role.as_ref().map(|s| s.0.as_str()).unwrap_or("");
+        let is_user = role == "user";
+        let is_assistant = role == "assistant";
         let model_id = crate::stats::get_model_id(&msg);
         let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
 
@@ -565,59 +568,66 @@ impl StatsCache {
         stats.totals.tokens.cache_read += tokens_add.cache_read;
         stats.totals.tokens.cache_write += tokens_add.cache_write;
         stats.totals.messages += 1;
+        if is_user {
+            stats.totals.prompts += 1;
+        }
         stats.totals.cost += cost;
         stats
             .totals
             .sessions
             .insert(session_id.clone().into_boxed_str());
 
-        if let Some(m) = stats.model_usage.iter_mut().find(|m| *m.name == *model_id) {
-            m.messages += 1;
-            m.cost += cost;
-            m.tokens.input += tokens_add.input;
-            m.tokens.output += tokens_add.output;
-            m.tokens.reasoning += tokens_add.reasoning;
-            m.tokens.cache_read += tokens_add.cache_read;
-            m.tokens.cache_write += tokens_add.cache_write;
-            m.sessions.insert(session_id.clone().into_boxed_str());
-        } else {
-            let name_str: &str = &model_id;
-            let parts: Vec<&str> = name_str.split('/').collect();
-            let (p, n) = if parts.len() >= 2 {
-                (parts[0], parts[1])
-            } else {
-                ("unknown", name_str)
-            };
-            stats.model_usage.push(crate::stats::ModelUsage {
-                name: model_id.clone(),
-                short_name: n.into(),
-                provider: p.into(),
-                display_name: format!("{}/{}", p, n).into_boxed_str(),
-                messages: 1,
-                sessions: [session_id.clone().into_boxed_str()].into(),
-                tokens: tokens_add,
-                tools: HashMap::new(),
-                agents: HashMap::new(),
-                cost,
-            });
-        }
-        if let Some(agent) = msg
-            .agent
-            .as_ref()
-            .map(|s| s.0.as_str())
-            .filter(|s| !s.is_empty())
-        {
+        if is_assistant {
             if let Some(m) = stats.model_usage.iter_mut().find(|m| *m.name == *model_id) {
-                *m.agents
-                    .entry(agent.to_string().into_boxed_str())
-                    .or_insert(0) += 1;
+                m.messages += 1;
+                m.cost += cost;
+                m.tokens.input += tokens_add.input;
+                m.tokens.output += tokens_add.output;
+                m.tokens.reasoning += tokens_add.reasoning;
+                m.tokens.cache_read += tokens_add.cache_read;
+                m.tokens.cache_write += tokens_add.cache_write;
+                m.sessions.insert(session_id.clone().into_boxed_str());
+            } else {
+                let name_str: &str = &model_id;
+                let parts: Vec<&str> = name_str.split('/').collect();
+                let (p, n) = if parts.len() >= 2 {
+                    (parts[0], parts[1])
+                } else {
+                    ("unknown", name_str)
+                };
+                stats.model_usage.push(crate::stats::ModelUsage {
+                    name: model_id.clone(),
+                    short_name: n.into(),
+                    provider: p.into(),
+                    display_name: format!("{}/{}", p, n).into_boxed_str(),
+                    messages: 1,
+                    sessions: [session_id.clone().into_boxed_str()].into(),
+                    tokens: tokens_add,
+                    tools: HashMap::new(),
+                    agents: HashMap::new(),
+                    cost,
+                });
+            }
+            if let Some(agent) = msg
+                .agent
+                .as_ref()
+                .map(|s| s.0.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                if let Some(m) = stats.model_usage.iter_mut().find(|m| *m.name == *model_id) {
+                    *m.agents
+                        .entry(agent.to_string().into_boxed_str())
+                        .or_insert(0) += 1;
+                }
             }
         }
 
-        // Scoped block to limit borrows of stats.per_day
         {
             let d = stats.per_day.entry(day.clone()).or_default();
             d.messages += 1;
+            if is_user {
+                d.prompts += 1;
+            }
             d.cost += cost;
             d.tokens.input += tokens_add.input;
             d.tokens.output += tokens_add.output;
@@ -631,14 +641,29 @@ impl StatsCache {
                 .or_insert_with(|| Arc::new(crate::stats::SessionStat::new(session_id.clone())));
             let s = Arc::make_mut(s_arc);
             s.messages += 1;
+            if is_user {
+                s.prompts += 1;
+            }
             s.cost += cost;
-            s.models.insert(model_id);
+            if is_assistant {
+                s.models.insert(model_id.clone());
+            }
             s.tokens.input += tokens_add.input;
             s.tokens.output += tokens_add.output;
             s.tokens.reasoning += tokens_add.reasoning;
             s.tokens.cache_read += tokens_add.cache_read;
             s.tokens.cache_write += tokens_add.cache_write;
             if let Some(t) = ts {
+                if t < s.first_activity {
+                    s.first_activity = t;
+                }
+            }
+            let end_ts = msg
+                .time
+                .as_ref()
+                .and_then(|t| t.completed.map(|v| *v))
+                .or(ts);
+            if let Some(t) = end_ts {
                 if t > s.last_activity {
                     s.last_activity = t;
                 }

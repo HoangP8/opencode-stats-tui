@@ -1,5 +1,6 @@
 use crate::stats::{
-    format_number, load_session_details, ChatMessage, MessageContent, SessionDetails, SessionStat,
+    format_duration_ms, format_number, load_session_details, ChatMessage, MessageContent,
+    SessionDetails, SessionStat,
 };
 use crossterm::event::{KeyCode, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -367,6 +368,16 @@ impl SessionModal {
                 ]));
             }
 
+            if let Some(dur) = format_duration_ms(session.first_activity, session.last_activity) {
+                lines.push(Line::from(vec![
+                    Span::raw("    Duration:"),
+                    Span::styled(
+                        format!(" {}", dur),
+                        Style::default().fg(Color::Rgb(100, 200, 255)),
+                    ),
+                ]));
+            }
+
             lines.push(Line::from(""));
         }
 
@@ -423,11 +434,16 @@ impl SessionModal {
                     ),
                 ];
 
+                let responses = model.messages.saturating_sub(model.prompts);
+                let model_cost = model.cost;
+                let model_est = model_cost + (model.tokens.cache_read as f64 * model_cost / (model.tokens.input + model.tokens.output + model.tokens.reasoning).max(1) as f64);
+                let model_savings = model_est - model_cost;
                 let right_labels = [
-                    ("Messages", model.messages.to_string(), Color::Cyan),
-                    ("Cost", "$0.00".to_string(), Color::White),
-                    ("Est. Cost", "$0.00".to_string(), Color::Rgb(150, 150, 150)),
-                    ("Savings", "$0.00".to_string(), Color::Green),
+                    ("Prompts", model.prompts.to_string(), Color::Cyan),
+                    ("Responses", responses.to_string(), Color::Green),
+                    ("Cost", format!("${:.2}", model_cost), Color::White),
+                    ("Est. Cost", format!("${:.2}", model_est), Color::Rgb(150, 150, 150)),
+                    ("Savings", format!("${:.2}", model_savings), if model_savings > 0.0 { Color::Green } else { Color::DarkGray }),
                 ];
 
                 total_tokens += model.tokens.input
@@ -504,12 +520,22 @@ impl SessionModal {
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
+            let total_responses = session.messages.saturating_sub(session.prompts);
             lines.push(Line::from(vec![
-                Span::styled("      Messages: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("      Prompts:  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
-                    session.messages.to_string(),
+                    session.prompts.to_string(),
                     Style::default()
-                        .fg(Color::White)
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("      Responses:", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(" {}", total_responses),
+                    Style::default()
+                        .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
@@ -522,11 +548,14 @@ impl SessionModal {
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
-            let savings = 0.0f64;
+            let total_cost = session.cost;
+            let total_non_cache = (session.tokens.input + session.tokens.output + session.tokens.reasoning).max(1) as f64;
+            let est_cost = total_cost + (session.tokens.cache_read as f64 * total_cost / total_non_cache);
+            let savings = est_cost - total_cost;
             let (savings_text, savings_color) = if savings < 0.0 {
                 (format!("-${:.2}", savings.abs()), Color::Red)
             } else {
-                (format!("${:.2}", savings), Color::Green)
+                (format!("${:.2}", savings), if savings > 0.0 { Color::Green } else { Color::DarkGray })
             };
             lines.push(Line::from(vec![
                 Span::styled("      Savings:  ", Style::default().fg(Color::DarkGray)),
@@ -863,7 +892,7 @@ impl SessionModal {
             Span::styled("PgUp/Dn", k),
             Span::styled(" page", t),
             sep.clone(),
-            Span::styled("Esc/Right-click", k),
+            Span::styled("Esc/q/Right-click", k),
             Span::styled(" close", t),
         ])];
 
