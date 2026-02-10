@@ -1,3 +1,4 @@
+use fxhash::{FxHashMap, FxHashSet};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -68,8 +69,8 @@ pub struct SessionStat {
     pub cost: f64,
     pub tokens: Tokens,
     pub diffs: Diffs,
-    pub models: HashSet<Box<str>>,
-    pub tools: HashMap<Box<str>, u64>,
+    pub models: FxHashSet<Box<str>>,
+    pub tools: FxHashMap<Box<str>, u64>,
     pub first_activity: i64,
     pub last_activity: i64,
     pub path_cwd: Box<str>,
@@ -90,8 +91,8 @@ impl SessionStat {
             cost: 0.0,
             tokens: Tokens::default(),
             diffs: Diffs::default(),
-            models: HashSet::new(),
-            tools: HashMap::new(),
+            models: FxHashSet::default(),
+            tools: FxHashMap::default(),
             first_activity: i64::MAX,
             last_activity: 0,
             path_cwd: String::new().into_boxed_str(),
@@ -160,13 +161,19 @@ impl Default for Totals {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Stats {
     pub totals: Totals,
-    pub per_day: HashMap<String, DayStat>,
-    pub session_titles: HashMap<Box<str>, String>,
+    pub per_day: FxHashMap<String, DayStat>,
+    pub session_titles: FxHashMap<Box<str>, String>,
     pub model_usage: Vec<ModelUsage>,
-    #[serde(default)]
-    pub session_message_files: HashMap<String, Vec<std::path::PathBuf>>,
-    #[serde(default)]
-    pub processed_message_ids: HashSet<Box<str>>,
+    pub session_message_files: FxHashMap<String, FxHashSet<std::path::PathBuf>>,
+    pub processed_message_ids: FxHashSet<Box<str>>,
+}
+
+/// Key for session-day lookups.
+/// Uses String for now to avoid complex Borrow implementation for (str, str).
+pub type SessDayKey = String;
+
+fn make_sess_day_key(session: &str, day: &str) -> SessDayKey {
+    format!("{}|{}", session, day)
 }
 
 impl Stats {}
@@ -570,7 +577,11 @@ pub fn get_day(ts: Option<i64>) -> String {
         Some(ms) => {
             let secs = ms / 1000;
             chrono::DateTime::from_timestamp(secs, 0)
-                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                .map(|dt| {
+                    dt.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d")
+                        .to_string()
+                })
                 .unwrap_or_else(|| "Unknown".into())
         }
         None => "Unknown".into(),
@@ -583,7 +594,7 @@ pub fn get_day(ts: Option<i64>) -> String {
 fn detect_session_continuation(
     session_id: &str,
     current_day: &str,
-    all_session_first_days: &HashMap<String, String>,
+    all_session_first_days: &FxHashMap<String, String>,
 ) -> (Option<Box<str>>, Option<Box<str>>) {
     // Check if this session was first seen on a different day
     if let Some(first_day) = all_session_first_days.get(session_id) {
@@ -650,11 +661,11 @@ fn list_message_files(root: &Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-fn load_session_titles() -> HashMap<Box<str>, String> {
+fn load_session_titles() -> FxHashMap<Box<str>, String> {
     let session_path = get_storage_path("session");
     let root = Path::new(&session_path);
     let Ok(entries) = fs::read_dir(root) else {
-        return HashMap::new();
+        return FxHashMap::default();
     };
 
     // Collect entries first for better parallel distribution
@@ -712,11 +723,11 @@ fn sort_file_diffs(file_diffs: &mut [FileDiff]) {
     });
 }
 
-pub(crate) fn load_session_diff_map() -> HashMap<String, Vec<FileDiff>> {
+pub(crate) fn load_session_diff_map() -> FxHashMap<String, Vec<FileDiff>> {
     let diff_path = get_storage_path("session_diff");
     let root = Path::new(&diff_path);
     let Ok(entries) = fs::read_dir(root) else {
-        return HashMap::new();
+        return FxHashMap::default();
     };
 
     // Collect entries for parallel processing
@@ -760,35 +771,50 @@ pub(crate) fn load_session_diff_map() -> HashMap<String, Vec<FileDiff>> {
 /// For each file in current, subtract the values from previous (if present)
 #[inline]
 fn compute_incremental_diffs(current: &[FileDiff], previous: &[FileDiff]) -> Vec<FileDiff> {
-    // Build lookup for previous state
-    let prev_map: HashMap<&str, &FileDiff> =
-        previous.iter().map(|d| (d.path.as_ref(), d)).collect();
+    if previous.is_empty() {
+        return current.to_vec();
+    }
 
-    current
-        .iter()
-        .filter_map(|curr| {
-            let (adds, dels, status) = if let Some(prev) = prev_map.get(curr.path.as_ref()) {
-                // File existed before: compute delta
-                let a = curr.additions.saturating_sub(prev.additions);
-                let d = curr.deletions.saturating_sub(prev.deletions);
-                // If no change on this day, skip
-                if a == 0 && d == 0 {
-                    return None;
+    // Optimization: Assume both are already sorted by path (enforced at creation).
+    let mut result = Vec::with_capacity(current.len());
+    let mut i = 0;
+    let mut j = 0;
+
+    while i < current.len() && j < previous.len() {
+        let c = &current[i];
+        let p = &previous[j];
+
+        match c.path.cmp(&p.path) {
+            std::cmp::Ordering::Equal => {
+                let a = c.additions.saturating_sub(p.additions);
+                let d = c.deletions.saturating_sub(p.deletions);
+                if a > 0 || d > 0 {
+                    result.push(FileDiff {
+                        path: c.path.clone(),
+                        additions: a,
+                        deletions: d,
+                        status: c.status.clone(),
+                    });
                 }
-                (a, d, curr.status.clone())
-            } else {
-                // New file on this day
-                (curr.additions, curr.deletions, curr.status.clone())
-            };
+                i += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Less => {
+                result.push(c.clone());
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                j += 1;
+            }
+        }
+    }
 
-            Some(FileDiff {
-                path: curr.path.clone(),
-                additions: adds,
-                deletions: dels,
-                status,
-            })
-        })
-        .collect()
+    while i < current.len() {
+        result.push(current[i].clone());
+        i += 1;
+    }
+
+    result
 }
 
 pub fn collect_stats() -> Stats {
@@ -800,13 +826,17 @@ pub fn collect_stats() -> Stats {
     let part_root = Path::new(&part_path_str);
     let msg_files = list_message_files(Path::new(&message_path));
 
-    let mut per_day: HashMap<String, DayStat> = HashMap::with_capacity(msg_files.len() / 20);
-    let mut model_stats: HashMap<Box<str>, ModelUsage> = HashMap::with_capacity(8);
-    let mut session_message_files: HashMap<String, Vec<std::path::PathBuf>> =
-        HashMap::with_capacity(128);
-    let mut processed_message_ids: HashSet<Box<str>> = HashSet::with_capacity(msg_files.len());
+    let mut per_day: FxHashMap<String, DayStat> =
+        FxHashMap::with_capacity_and_hasher(msg_files.len() / 20, Default::default());
+    let mut model_stats: FxHashMap<Box<str>, ModelUsage> =
+        FxHashMap::with_capacity_and_hasher(8, Default::default());
+    let mut session_message_files: FxHashMap<String, FxHashSet<std::path::PathBuf>> =
+        FxHashMap::with_capacity_and_hasher(128, Default::default());
+    let mut processed_message_ids: FxHashSet<Box<str>> =
+        FxHashSet::with_capacity_and_hasher(msg_files.len(), Default::default());
     // Track first day each session was seen for continuation detection
-    let mut session_first_days: HashMap<String, String> = HashMap::with_capacity(64);
+    let mut session_first_days: FxHashMap<String, String> =
+        FxHashMap::with_capacity_and_hasher(64, Default::default());
 
     struct FullMessageData {
         msg: Message,
@@ -895,10 +925,9 @@ pub fn collect_stats() -> Stats {
     });
 
     // Track union of latest per-file cumulative diff state per session per day
-    // Key: "session_id|day" -> { file_path -> latest FileDiff seen that day }
-    // Each message only contains files from that edit; we union across all messages
-    let mut session_day_union_diffs: HashMap<Box<str>, HashMap<Box<str>, FileDiff>> =
-        HashMap::with_capacity(64);
+    // Key: SessDayKey { session, day } -> { file_path -> latest FileDiff seen that day }
+    let mut session_day_union_diffs: FxHashMap<SessDayKey, FxHashMap<Box<str>, FileDiff>> =
+        FxHashMap::with_capacity_and_hasher(64, Default::default());
 
     let mut last_ts = None;
     let mut last_day_str = String::new();
@@ -910,19 +939,18 @@ pub fn collect_stats() -> Stats {
         }
 
         let msg = &data.msg;
-        let session_id: String = msg
+        let session_id_boxed: Box<str> = msg
             .session_id
             .as_ref()
-            .map(|s| s.0.clone())
-            .unwrap_or_default();
+            .map(|s| s.0.as_str())
+            .unwrap_or_default()
+            .into();
 
-        // Optimization: avoid allocation if key already exists
-        if !session_id.is_empty() {
-            if let Some(files) = session_message_files.get_mut(&session_id) {
-                files.push(data.path);
-            } else {
-                session_message_files.insert(session_id.clone(), vec![data.path]);
-            }
+        if !session_id_boxed.is_empty() {
+            session_message_files
+                .entry(session_id_boxed.to_string())
+                .or_insert_with(|| FxHashSet::with_capacity_and_hasher(16, Default::default()))
+                .insert(data.path);
         }
 
         let ts_val = msg.time.as_ref().and_then(|t| t.created.map(|v| *v));
@@ -941,13 +969,15 @@ pub fn collect_stats() -> Stats {
         let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
 
         // Track first day session was seen for continuation detection
-        if !session_id.is_empty() && !session_first_days.contains_key(&session_id) {
-            session_first_days.insert(session_id.clone(), day.clone());
+        if !session_id_boxed.is_empty()
+            && !session_first_days.contains_key(session_id_boxed.as_ref())
+        {
+            session_first_days.insert(session_id_boxed.to_string(), day.clone());
         }
 
         // Optimization: only insert if not already present (avoid allocation on common path)
-        if !session_id.is_empty() && !totals.sessions.contains(session_id.as_str()) {
-            totals.sessions.insert(session_id.clone().into_boxed_str());
+        if !session_id_boxed.is_empty() && !totals.sessions.contains(session_id_boxed.as_ref()) {
+            totals.sessions.insert(session_id_boxed.clone());
         }
         totals.messages += 1;
         if is_user {
@@ -975,10 +1005,10 @@ pub fn collect_stats() -> Stats {
                 }
             });
             model_entry.messages += 1;
-            if !session_id.is_empty() && !model_entry.sessions.contains(session_id.as_str()) {
-                model_entry
-                    .sessions
-                    .insert(session_id.clone().into_boxed_str());
+            if !session_id_boxed.is_empty()
+                && !model_entry.sessions.contains(session_id_boxed.as_ref())
+            {
+                model_entry.sessions.insert(session_id_boxed.clone());
             }
             model_entry.cost += cost;
             add_tokens(&mut model_entry.tokens, &msg.tokens);
@@ -1011,23 +1041,30 @@ pub fn collect_stats() -> Stats {
 
         // Get or create the session for THIS specific day (each day has its own session entry)
         // Optimization: avoid allocation if session already exists for this day
-        let session_stat_arc = if let Some(existing) = day_stat.sessions.get_mut(&session_id) {
+        let session_stat_arc = if let Some(existing) =
+            day_stat.sessions.get_mut(session_id_boxed.as_ref())
+        {
             existing
         } else {
             // Detect if this is a continuation from a previous day
-            let (original_id, first_created) = if !session_id.is_empty() {
-                detect_session_continuation(&session_id, &day, &session_first_days)
+            let (original_id, first_created) = if !session_id_boxed.is_empty() {
+                detect_session_continuation(session_id_boxed.as_ref(), &day, &session_first_days)
             } else {
                 (None, None)
             };
 
             let is_continued = original_id.is_some();
-            let mut stat = SessionStat::new(session_id.clone());
+            let mut stat = SessionStat::new(session_id_boxed.clone());
             stat.original_session_id = original_id;
             stat.first_created_date = first_created;
             stat.is_continuation = is_continued;
-            day_stat.sessions.insert(session_id.clone(), Arc::new(stat));
-            day_stat.sessions.get_mut(&session_id).unwrap()
+            day_stat
+                .sessions
+                .insert(session_id_boxed.to_string(), Arc::new(stat));
+            day_stat
+                .sessions
+                .get_mut(session_id_boxed.as_ref())
+                .unwrap()
         };
 
         // Accumulate data for this day's session (separate from other days)
@@ -1079,11 +1116,14 @@ pub fn collect_stats() -> Stats {
         // Accumulate per-file diffs from ALL messages of each session/day (union-of-latest)
         // Each message's summary.diffs only lists files from that edit, so we merge
         // across all messages to get the complete picture
-        if !session_id.is_empty() && !data.cumulative_diffs.is_empty() {
-            let key: Box<str> = format!("{}|{}", session_id, day).into_boxed_str();
-            let file_map = session_day_union_diffs
-                .entry(key)
-                .or_insert_with(|| HashMap::with_capacity(data.cumulative_diffs.len()));
+        if !session_id_boxed.is_empty() {
+            let key = make_sess_day_key(session_id_boxed.as_ref(), day.as_str());
+            let file_map = session_day_union_diffs.entry(key).or_insert_with(|| {
+                FxHashMap::with_capacity_and_hasher(
+                    data.cumulative_diffs.len().max(1),
+                    Default::default(),
+                )
+            });
             for d in data.cumulative_diffs {
                 if !d.path.is_empty() {
                     file_map.insert(d.path.clone(), d);
@@ -1093,23 +1133,24 @@ pub fn collect_stats() -> Stats {
     }
 
     // Precompute diff totals from session_diff_map for global totals
-    let precomputed_diff_totals: HashMap<&str, (u64, u64)> = session_diff_map
+    let precomputed_diff_totals: FxHashMap<String, (u64, u64)> = session_diff_map
         .iter()
         .map(|(id, diffs)| {
             let adds: u64 = diffs.iter().map(|d| d.additions).sum();
             let dels: u64 = diffs.iter().map(|d| d.deletions).sum();
-            (id.as_str(), (adds, dels))
+            (id.clone(), (adds, dels))
         })
         .collect();
 
     // Build sorted list of days per session to compute previous day's cumulative state
-    let mut session_sorted_days: HashMap<Box<str>, Vec<Box<str>>> = HashMap::with_capacity(64);
+    let mut session_sorted_days: FxHashMap<String, Vec<String>> =
+        FxHashMap::with_capacity_and_hasher(64, Default::default());
     for key in session_day_union_diffs.keys() {
         if let Some((session_id, day)) = key.split_once('|') {
             session_sorted_days
-                .entry(session_id.into())
+                .entry(session_id.to_string())
                 .or_default()
-                .push(day.into());
+                .push(day.to_string());
         }
     }
     for days in session_sorted_days.values_mut() {
@@ -1117,15 +1158,16 @@ pub fn collect_stats() -> Stats {
     }
 
     // Track which session IDs have been counted in global totals
-    let mut counted_session_diffs: HashSet<Box<str>> = HashSet::with_capacity(64);
+    let mut counted_session_diffs: FxHashSet<String> =
+        FxHashSet::with_capacity_and_hasher(64, Default::default());
 
     for (day_str, day_stat) in per_day.iter_mut() {
         for sess_arc in day_stat.sessions.values_mut() {
-            let sess_id: Box<str> = sess_arc.id.clone();
+            let sess_id: String = sess_arc.id.to_string();
             let sess = Arc::make_mut(sess_arc);
 
-            // Build lookup key once: "session_id|day"
-            let lookup_key: Box<str> = format!("{}|{}", sess_id, day_str).into_boxed_str();
+            // Build lookup key once
+            let lookup_key = make_sess_day_key(&sess_id, day_str.as_str());
 
             // Get union of per-file diff states from ALL messages of THIS day
             let current_day_diffs: Option<Vec<FileDiff>> = session_day_union_diffs
@@ -1135,10 +1177,10 @@ pub fn collect_stats() -> Stats {
             if !sess.is_continuation {
                 // Non-continuation: prefer session_diff (authoritative final state),
                 // fall back to message union diffs, then nothing
-                if let Some(session_diffs) = session_diff_map.get(sess_id.as_ref()) {
+                if let Some(session_diffs) = session_diff_map.get(sess_id.as_str()) {
                     sess.file_diffs = session_diffs.clone();
                     sort_file_diffs(&mut sess.file_diffs);
-                    if let Some(&(adds, dels)) = precomputed_diff_totals.get(sess_id.as_ref()) {
+                    if let Some(&(adds, dels)) = precomputed_diff_totals.get(sess_id.as_str()) {
                         sess.diffs.additions = adds;
                         sess.diffs.deletions = dels;
                     }
@@ -1153,12 +1195,11 @@ pub fn collect_stats() -> Stats {
             } else if let Some(mut diffs) = current_day_diffs {
                 // Continuation sessions: compute incremental diffs per day
                 // by subtracting previous day's cumulative state
-                if let Some(sorted_days) = session_sorted_days.get(&sess_id) {
-                    if let Some(pos) = sorted_days.iter().position(|d| d.as_ref() == day_str) {
+                if let Some(sorted_days) = session_sorted_days.get(sess_id.as_str()) {
+                    if let Some(pos) = sorted_days.iter().position(|d| d.as_str() == day_str) {
                         if pos > 0 {
                             let prev_day = &sorted_days[pos - 1];
-                            let prev_key: Box<str> =
-                                format!("{}|{}", sess_id, prev_day).into_boxed_str();
+                            let prev_key = make_sess_day_key(&sess_id, prev_day.as_str());
                             if let Some(prev_map) = session_day_union_diffs.get(&prev_key) {
                                 let prev_vec: Vec<FileDiff> = prev_map.values().cloned().collect();
                                 diffs = compute_incremental_diffs(&diffs, &prev_vec);
@@ -1180,8 +1221,8 @@ pub fn collect_stats() -> Stats {
             day_stat.diffs.deletions += sess.diffs.deletions;
 
             // Global totals: use session_diff (final state) once per session
-            if !counted_session_diffs.contains(sess_id.as_ref()) {
-                if let Some(&(adds, dels)) = precomputed_diff_totals.get(sess_id.as_ref()) {
+            if !counted_session_diffs.contains(sess_id.as_str()) {
+                if let Some(&(adds, dels)) = precomputed_diff_totals.get(sess_id.as_str()) {
                     totals.diffs.additions += adds;
                     totals.diffs.deletions += dels;
                 }
@@ -1229,7 +1270,11 @@ fn load_session_chat_internal(
 
                 // Filter by timestamp if specified
                 if let Some(since) = since_ts {
-                    let created = msg.time.as_ref().and_then(|t| t.created.map(|v| *v)).unwrap_or(0);
+                    let created = msg
+                        .time
+                        .as_ref()
+                        .and_then(|t| t.created.map(|v| *v))
+                        .unwrap_or(0);
                     if created <= since {
                         return None;
                     }
@@ -1263,7 +1308,11 @@ fn load_session_chat_internal(
 
                 // Filter by timestamp if specified
                 if let Some(since) = since_ts {
-                    let created = msg.time.as_ref().and_then(|t| t.created.map(|v| *v)).unwrap_or(0);
+                    let created = msg
+                        .time
+                        .as_ref()
+                        .and_then(|t| t.created.map(|v| *v))
+                        .unwrap_or(0);
                     if created <= since {
                         return None;
                     }
@@ -1280,15 +1329,72 @@ fn load_session_chat_internal(
             .and_then(|t| t.created.map(|v| *v))
             .unwrap_or(0)
     });
+
     if apply_limit && session_msgs.len() > MAX_MESSAGES_TO_LOAD {
         let start = session_msgs.len() - MAX_MESSAGES_TO_LOAD;
         session_msgs.drain(..start);
     }
 
+    // Now load parts in parallel for only the selected messages
+    let session_msgs_with_parts: Vec<(Message, Vec<MessageContent>)> = session_msgs
+        .into_par_iter()
+        .map(|msg| {
+            let mut parts_vec = Vec::new();
+            if let Some(id) = &msg.id {
+                let id_str = &id.0;
+                if !id_str.is_empty() {
+                    if let Ok(entries) = fs::read_dir(part_root.join(id_str)) {
+                        let mut p_files: Vec<_> = entries.flatten().collect();
+                        p_files.sort_by_key(|e| e.path());
+                        for e in p_files {
+                            if let Ok(bytes) = fs::read(e.path()) {
+                                if let Ok(part) = serde_json::from_slice::<PartData>(&bytes) {
+                                    if part.thought.is_some() {
+                                        parts_vec.push(MessageContent::Thinking(()));
+                                    }
+                                    if let Some(t) = part.text {
+                                        parts_vec.push(MessageContent::Text(truncate_string(
+                                            &t,
+                                            MAX_CHARS_PER_TEXT_PART,
+                                        )));
+                                    }
+                                    if let Some(tool) = part.tool {
+                                        let fp = part
+                                            .state
+                                            .as_ref()
+                                            .and_then(|s| {
+                                                s.input.as_ref().and_then(|i| i.file_path.as_ref())
+                                            })
+                                            .map(|s| s.clone().into());
+                                        let title = part
+                                            .state
+                                            .as_ref()
+                                            .and_then(|s| s.title.as_ref())
+                                            .map(|t| truncate_string(t, MAX_TOOL_TITLE_CHARS));
+                                        parts_vec.push(MessageContent::ToolCall(ToolCallInfo {
+                                            name: tool.into(),
+                                            title,
+                                            file_path: fp,
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            (msg, parts_vec)
+        })
+        .collect();
+
     let mut max_ts = since_ts.unwrap_or(0);
-    let mut merged: Vec<ChatMessage> = Vec::with_capacity(session_msgs.len());
-    for msg in session_msgs {
-        let created = msg.time.as_ref().and_then(|t| t.created.map(|v| *v)).unwrap_or(0);
+    let mut merged: Vec<ChatMessage> = Vec::with_capacity(session_msgs_with_parts.len());
+    for (msg, parts_vec) in session_msgs_with_parts {
+        let created = msg
+            .time
+            .as_ref()
+            .and_then(|t| t.created.map(|v| *v))
+            .unwrap_or(0);
         if created > max_ts {
             max_ts = created;
         }
@@ -1299,50 +1405,7 @@ fn load_session_chat_internal(
             .map(|s| s.as_ref())
             .unwrap_or("unknown")
             .into();
-        let mut parts_vec = Vec::new();
-        if let Some(id) = msg.id {
-            let id_str = &id.0;
-            if !id_str.is_empty() {
-                if let Ok(entries) = fs::read_dir(part_root.join(id_str)) {
-                    let mut p_files: Vec<_> = entries.flatten().collect();
-                    p_files.sort_by_key(|e| e.path());
-                    for e in p_files {
-                        if let Ok(bytes) = fs::read(e.path()) {
-                            if let Ok(part) = serde_json::from_slice::<PartData>(&bytes) {
-                                if part.thought.is_some() {
-                                    parts_vec.push(MessageContent::Thinking(()));
-                                }
-                                if let Some(t) = part.text {
-                                    parts_vec.push(MessageContent::Text(truncate_string(
-                                        &t,
-                                        MAX_CHARS_PER_TEXT_PART,
-                                    )));
-                                }
-                                if let Some(tool) = part.tool {
-                                    let fp = part
-                                        .state
-                                        .as_ref()
-                                        .and_then(|s| {
-                                            s.input.as_ref().and_then(|i| i.file_path.as_ref())
-                                        })
-                                        .map(|s| s.clone().into());
-                                    let title = part
-                                        .state
-                                        .as_ref()
-                                        .and_then(|s| s.title.as_ref())
-                                        .map(|t| truncate_string(t, MAX_TOOL_TITLE_CHARS));
-                                    parts_vec.push(MessageContent::ToolCall(ToolCallInfo {
-                                        name: tool.into(),
-                                        title,
-                                        file_path: fp,
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+
         if let Some(last) = merged.last_mut() {
             if *last.role == *role {
                 last.parts.extend(parts_vec);
@@ -1382,14 +1445,6 @@ pub fn load_session_chat_with_max_ts(
     load_session_chat_internal(Some(session_id), files, day_filter, None, true)
 }
 
-pub fn load_session_chat_incremental(
-    files: &[std::path::PathBuf],
-    day_filter: Option<&str>,
-    since_ts: Option<i64>,
-) -> (Vec<ChatMessage>, i64) {
-    load_session_chat_internal(None, Some(files), day_filter, since_ts, false)
-}
-
 #[derive(Clone)]
 pub struct ModelTokenStats {
     pub name: Box<str>,
@@ -1417,14 +1472,19 @@ pub fn load_session_details(
     }
 
     #[inline]
-    fn fold_msg(mut acc: HashMap<Box<str>, ModelTokenStats>, ms: MsgStats) -> HashMap<Box<str>, ModelTokenStats> {
-        let entry = acc.entry(ms.model.clone()).or_insert_with(|| ModelTokenStats {
-            name: ms.model,
-            messages: 0,
-            prompts: 0,
-            tokens: Tokens::default(),
-            cost: 0.0,
-        });
+    fn fold_msg(
+        mut acc: HashMap<Box<str>, ModelTokenStats>,
+        ms: MsgStats,
+    ) -> HashMap<Box<str>, ModelTokenStats> {
+        let entry = acc
+            .entry(ms.model.clone())
+            .or_insert_with(|| ModelTokenStats {
+                name: ms.model,
+                messages: 0,
+                prompts: 0,
+                tokens: Tokens::default(),
+                cost: 0.0,
+            });
         entry.messages += 1;
         if ms.is_user {
             entry.prompts += 1;
@@ -1438,7 +1498,10 @@ pub fn load_session_details(
         acc
     }
 
-    fn reduce_maps(mut a: HashMap<Box<str>, ModelTokenStats>, b: HashMap<Box<str>, ModelTokenStats>) -> HashMap<Box<str>, ModelTokenStats> {
+    fn reduce_maps(
+        mut a: HashMap<Box<str>, ModelTokenStats>,
+        b: HashMap<Box<str>, ModelTokenStats>,
+    ) -> HashMap<Box<str>, ModelTokenStats> {
         for (k, v) in b {
             let entry = a.entry(k).or_insert_with(|| ModelTokenStats {
                 name: v.name,
@@ -1483,7 +1546,12 @@ pub fn load_session_details(
                 }
 
                 let (model, is_user, tokens, cost) = parse_msg(&msg);
-                Some(MsgStats { model, is_user, tokens, cost })
+                Some(MsgStats {
+                    model,
+                    is_user,
+                    tokens,
+                    cost,
+                })
             })
             .fold(HashMap::new, fold_msg)
             .reduce(HashMap::new, reduce_maps)
@@ -1507,7 +1575,12 @@ pub fn load_session_details(
                 }
 
                 let (model, is_user, tokens, cost) = parse_msg(&msg);
-                Some(MsgStats { model, is_user, tokens, cost })
+                Some(MsgStats {
+                    model,
+                    is_user,
+                    tokens,
+                    cost,
+                })
             })
             .fold(HashMap::new, fold_msg)
             .reduce(HashMap::new, reduce_maps)

@@ -3,20 +3,17 @@ use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::Mutex;
 use std::{
     path::PathBuf,
-    sync::Arc,
+    sync::{mpsc, Arc},
     time::{Duration, Instant},
 };
 
-/// Real-time file watcher with instant updates
+/// Real-time file watcher with instant updates via channel-based wake
 pub struct LiveWatcher {
     watcher: RecommendedWatcher,
     storage_path: PathBuf,
-    /// Debounce timer to prevent excessive updates
-    last_change: Arc<Mutex<Option<Instant>>>,
-    last_event: Arc<Mutex<Option<Instant>>>,
-    /// Files that changed but haven't been processed
+    last_flush: Arc<Mutex<Instant>>,
+    first_pending: Arc<Mutex<Option<Instant>>>,
     changed_files: Arc<Mutex<Vec<PathBuf>>>,
-    /// Callback for when files change (receives list of changed files)
     on_change: Arc<dyn Fn(Vec<PathBuf>) + Send + Sync>,
 }
 
@@ -24,52 +21,55 @@ impl LiveWatcher {
     pub fn new(
         storage_path: PathBuf,
         on_change: Arc<dyn Fn(Vec<PathBuf>) + Send + Sync>,
+        wake_tx: mpsc::Sender<()>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let changed_files = Arc::new(Mutex::new(Vec::new()));
         let changed_files_clone = changed_files.clone();
-        let last_change = Arc::new(Mutex::new(None));
-        let last_event = Arc::new(Mutex::new(None));
-        let last_event_clone = last_event.clone();
 
-        // Create watcher with 100ms poll interval for faster responsiveness
-        let config = Config::default().with_poll_interval(Duration::from_millis(100));
+        let config = Config::default().with_poll_interval(Duration::from_millis(50));
 
-        let watcher = RecommendedWatcher::new(move |res: Result<Event, _>| {
-            if let Ok(event) = res {
-                *last_event_clone.lock() = Some(Instant::now());
-                if event.kind.is_modify() || event.kind.is_create() {
-                    for path in event.paths {
-                        if let Some(path_str) = path.to_str() {
-                            // Skip temporary files
-                            if path_str.contains(".swp")
-                                || path_str.contains(".tmp")
-                                || path_str.contains("~")
-                                || path_str.contains("4913")
-                            {
-                                continue;
-                            }
+        let watcher = RecommendedWatcher::new(
+            move |res: Result<Event, _>| {
+                if let Ok(event) = res {
+                    if event.kind.is_modify() || event.kind.is_create() || event.kind.is_remove() {
+                        let mut any_added = false;
+                        for path in event.paths {
+                            if let Some(path_str) = path.to_str() {
+                                if path_str.contains(".swp")
+                                    || path_str.contains(".tmp")
+                                    || path_str.contains("~")
+                                    || path_str.contains("4913")
+                                {
+                                    continue;
+                                }
 
-                            // Only process JSON files
-                            if path.extension().is_some_and(|e| e == "json") {
-                                let mut files = changed_files_clone.lock();
-                                if !files.contains(&path) {
-                                    files.push(path.clone());
-                                    // debug!("File changed: {}", path_str);
+                                if path.extension().is_some_and(|e| e == "json")
+                                    || event.kind.is_remove()
+                                {
+                                    let mut files = changed_files_clone.lock();
+                                    if !files.contains(&path) {
+                                        files.push(path.clone());
+                                        any_added = true;
+                                    }
                                 }
                             }
                         }
+                        if any_added {
+                            let _ = wake_tx.send(());
+                        }
                     }
+                } else if let Err(e) = res {
+                    error!("File watcher error: {:?}", e);
                 }
-            } else if let Err(e) = res {
-                error!("File watcher error: {:?}", e);
-            }
-        }, config)?;
+            },
+            config,
+        )?;
 
         Ok(Self {
             watcher,
             storage_path,
-            last_change,
-            last_event,
+            last_flush: Arc::new(Mutex::new(Instant::now() - Duration::from_millis(100))),
+            first_pending: Arc::new(Mutex::new(None)),
             changed_files,
             on_change,
         })
@@ -86,7 +86,8 @@ impl LiveWatcher {
         Ok(())
     }
 
-    /// Process pending changes with 80ms debounce for faster live updates
+    /// Process pending changes with bounded coalesce (no silence requirement).
+    /// Flushes immediately if rate limit allows, or after bounded wait.
     pub fn process_changes(&self) {
         let mut files = self.changed_files.lock();
 
@@ -96,16 +97,27 @@ impl LiveWatcher {
 
         let now = Instant::now();
 
-        // Debounce: only process if no new events in 80ms for faster updates
-        if let Some(last_event) = *self.last_event.lock() {
-            if now.duration_since(last_event) < Duration::from_millis(80) {
-                return;
+        {
+            let mut fp = self.first_pending.lock();
+            if fp.is_none() {
+                *fp = Some(now);
             }
         }
 
-        // Process the changes
+        let last_flush = *self.last_flush.lock();
+        let first_pending = *self.first_pending.lock();
+
+        let should_flush = now.duration_since(last_flush) >= Duration::from_millis(30)
+            || first_pending.is_some_and(|t| now.duration_since(t) >= Duration::from_millis(50))
+            || files.len() >= 25;
+
+        if !should_flush {
+            return;
+        }
+
         let changed = std::mem::take(&mut *files);
-        *self.last_change.lock() = Some(now);
+        *self.last_flush.lock() = now;
+        *self.first_pending.lock() = None;
 
         (self.on_change)(changed);
     }

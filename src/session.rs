@@ -3,6 +3,7 @@ use crate::stats::{
     SessionDetails, SessionStat,
 };
 use crossterm::event::{KeyCode, MouseEvent, MouseEventKind};
+use fxhash::FxHashMap;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
@@ -11,7 +12,6 @@ use ratatui::{
     Frame,
 };
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -241,7 +241,7 @@ impl SessionModal {
         frame: &mut Frame,
         area: Rect,
         session: &SessionStat,
-        session_titles: &HashMap<Box<str>, String>,
+        session_titles: &FxHashMap<Box<str>, String>,
     ) {
         // Solid clean background - no blur effect
         let modal_block = Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0)));
@@ -308,7 +308,7 @@ impl SessionModal {
         frame: &mut Frame,
         area: Rect,
         session: &SessionStat,
-        session_titles: &HashMap<Box<str>, String>,
+        session_titles: &FxHashMap<Box<str>, String>,
         border_style: Style,
     ) {
         // Pre-allocate with estimated capacity to avoid reallocations
@@ -437,14 +437,29 @@ impl SessionModal {
 
                 let responses = model.messages.saturating_sub(model.prompts);
                 let model_cost = model.cost;
-                let model_est = model_cost + (model.tokens.cache_read as f64 * model_cost / (model.tokens.input + model.tokens.output + model.tokens.reasoning).max(1) as f64);
+                let model_est = model_cost
+                    + (model.tokens.cache_read as f64 * model_cost
+                        / (model.tokens.input + model.tokens.output + model.tokens.reasoning).max(1)
+                            as f64);
                 let model_savings = model_est - model_cost;
                 let right_labels = [
                     ("Prompts", model.prompts.to_string(), Color::Cyan),
                     ("Responses", responses.to_string(), Color::Green),
                     ("Cost", format!("${:.2}", model_cost), Color::White),
-                    ("Est. Cost", format!("${:.2}", model_est), Color::Rgb(150, 150, 150)),
-                    ("Savings", format!("${:.2}", model_savings), if model_savings > 0.0 { Color::Green } else { Color::DarkGray }),
+                    (
+                        "Est. Cost",
+                        format!("${:.2}", model_est),
+                        Color::Rgb(150, 150, 150),
+                    ),
+                    (
+                        "Savings",
+                        format!("${:.2}", model_savings),
+                        if model_savings > 0.0 {
+                            Color::Green
+                        } else {
+                            Color::DarkGray
+                        },
+                    ),
                 ];
 
                 total_tokens += model.tokens.input
@@ -550,13 +565,23 @@ impl SessionModal {
                 ),
             ]));
             let total_cost = session.cost;
-            let total_non_cache = (session.tokens.input + session.tokens.output + session.tokens.reasoning).max(1) as f64;
-            let est_cost = total_cost + (session.tokens.cache_read as f64 * total_cost / total_non_cache);
+            let total_non_cache =
+                (session.tokens.input + session.tokens.output + session.tokens.reasoning).max(1)
+                    as f64;
+            let est_cost =
+                total_cost + (session.tokens.cache_read as f64 * total_cost / total_non_cache);
             let savings = est_cost - total_cost;
             let (savings_text, savings_color) = if savings < 0.0 {
                 (format!("-${:.2}", savings.abs()), Color::Red)
             } else {
-                (format!("${:.2}", savings), if savings > 0.0 { Color::Green } else { Color::DarkGray })
+                (
+                    format!("${:.2}", savings),
+                    if savings > 0.0 {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    },
+                )
             };
             lines.push(Line::from(vec![
                 Span::styled("      Savings:  ", Style::default().fg(Color::DarkGray)),
@@ -724,6 +749,12 @@ impl SessionModal {
             format!("  {}  ", session.id)
         };
 
+        let title_color = if border_style.fg == Some(Color::Cyan) {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
@@ -732,7 +763,7 @@ impl SessionModal {
                 Line::from(Span::styled(
                     title_text,
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(title_color)
                         .add_modifier(Modifier::BOLD),
                 ))
                 .alignment(ratatui::layout::Alignment::Center),
@@ -853,6 +884,12 @@ impl SessionModal {
         let scroll = self.chat_scroll as usize;
         let visible: Vec<Line> = lines.into_iter().skip(scroll).take(inner_height).collect();
 
+        let title_color = if border_style.fg == Some(Color::Cyan) {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
@@ -861,7 +898,7 @@ impl SessionModal {
                 Line::from(Span::styled(
                     " CHAT ",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(title_color)
                         .add_modifier(Modifier::BOLD),
                 ))
                 .alignment(ratatui::layout::Alignment::Center),

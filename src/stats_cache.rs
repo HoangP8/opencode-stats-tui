@@ -1,37 +1,51 @@
 use bincode::{deserialize, serialize};
+use fxhash::{FxHashMap, FxHashSet};
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
 
 // Type alias for complex return type to reduce complexity
-type SessionDiffs = HashMap<String, HashMap<String, crate::stats::FileDiff>>;
-type SessionSortedDays = HashMap<String, Vec<String>>;
+type SessionDiffs = FxHashMap<String, FxHashMap<String, crate::stats::FileDiff>>;
+type SessionSortedDays = FxHashMap<String, Vec<String>>;
 
-const CACHE_FORMAT_VERSION: u64 = 4;
+const CACHE_FORMAT_VERSION: u64 = 6;
+
+/// Metadata for file validation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMeta {
+    pub mtime: u64,
+    pub size: u64,
+}
 
 /// Cached statistics with version tracking
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedStats {
     pub stats: crate::stats::Stats,
     pub version: u64,
-    pub file_hashes: HashMap<String, u64>,
+    pub file_meta: FxHashMap<String, FileMeta>,
     #[serde(default)]
     pub format_version: u64,
     #[serde(default)]
-    pub session_day_union_diffs: HashMap<String, HashMap<String, crate::stats::FileDiff>>,
+    pub session_day_union_diffs: FxHashMap<String, FxHashMap<String, crate::stats::FileDiff>>,
     #[serde(default)]
-    pub session_sorted_days: HashMap<String, Vec<String>>,
+    pub session_sorted_days: FxHashMap<String, Vec<String>>,
     #[serde(default)]
-    pub session_diff_map: HashMap<String, Vec<crate::stats::FileDiff>>,
+    pub session_diff_map: FxHashMap<String, Vec<crate::stats::FileDiff>>,
     #[serde(default)]
-    pub session_diff_totals: HashMap<String, (u64, u64)>,
+    pub session_diff_totals: FxHashMap<String, (u64, u64)>,
+    #[serde(default)]
+    pub message_contributions: FxHashMap<String, (f64, crate::stats::Tokens)>,
+}
+
+/// Lightweight snapshot returned from update_files to avoid a separate full clone.
+pub struct StatsUpdate {
+    pub affected_sessions: FxHashSet<String>,
+    pub totals: crate::stats::Totals,
+    pub per_day: FxHashMap<String, crate::stats::DayStat>,
+    pub session_titles: FxHashMap<Box<str>, String>,
+    pub model_usage: Vec<crate::stats::ModelUsage>,
+    pub session_message_files: FxHashMap<String, FxHashSet<PathBuf>>,
 }
 
 /// Incremental updater for stats
@@ -60,12 +74,13 @@ impl StatsCache {
             stats: Arc::new(RwLock::new(CachedStats {
                 stats: crate::stats::Stats::default(),
                 version: 0,
-                file_hashes: HashMap::new(),
+                file_meta: FxHashMap::default(),
                 format_version: CACHE_FORMAT_VERSION,
-                session_day_union_diffs: HashMap::new(),
-                session_sorted_days: HashMap::new(),
-                session_diff_map: HashMap::new(),
-                session_diff_totals: HashMap::new(),
+                session_day_union_diffs: FxHashMap::default(),
+                session_sorted_days: FxHashMap::default(),
+                session_diff_map: FxHashMap::default(),
+                session_diff_totals: FxHashMap::default(),
+                message_contributions: FxHashMap::default(),
             })),
         })
     }
@@ -81,7 +96,7 @@ impl StatsCache {
                                 let mut stats_lock = self.stats.write();
                                 stats_lock.stats.clone_from(&cached.stats);
                                 stats_lock.version = cached.version;
-                                stats_lock.file_hashes.clone_from(&cached.file_hashes);
+                                stats_lock.file_meta.clone_from(&cached.file_meta);
                                 stats_lock
                                     .session_day_union_diffs
                                     .clone_from(&cached.session_day_union_diffs);
@@ -94,6 +109,9 @@ impl StatsCache {
                                 stats_lock
                                     .session_diff_totals
                                     .clone_from(&cached.session_diff_totals);
+                                stats_lock
+                                    .message_contributions
+                                    .clone_from(&cached.message_contributions);
                                 return cached.stats.clone();
                             }
                         }
@@ -116,95 +134,79 @@ impl StatsCache {
         if cached.format_version != CACHE_FORMAT_VERSION {
             return false;
         }
-        let cache_meta = match fs::metadata(&self.cache_path) {
-            Ok(m) => m,
-            Err(_) => return false,
-        };
 
-        let cache_age = cache_meta
-            .modified()
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .unwrap_or(Duration::from_secs(121));
-
-        if cache_age > Duration::from_secs(120) {
-            return false;
+        // Optimized: Check a subset of files for changes, but use mtime+size which is very fast
+        // We still don't want to check thousands of files every time, so we sample
+        // but the sample is now more robust.
+        // Also check if the number of files matches.
+        let dirs = ["message", "part", "session", "session_diff"];
+        for dir in dirs {
+            let dp = self._storage_path.join(dir);
+            if !dp.exists() {
+                continue;
+            }
         }
 
-        let message_count = self.count_message_files_fast();
-        if cached.stats.processed_message_ids.len() != message_count {
-            return false;
-        }
-
-        let all_files = match self.list_all_files() {
-            Ok(files) => files,
-            Err(_) => return false,
-        };
-        if all_files.len() != cached.file_hashes.len() {
-            return false;
-        }
-
-        let sample_files: Vec<_> = cached.file_hashes.keys().take(20).collect();
-        for path in sample_files {
-            let Some(current_hash) = self.compute_file_hash(path) else {
+        // More thorough check: sample more files but with cheaper check
+        let sample_size = 50.min(cached.file_meta.len());
+        let mut checked = 0;
+        for (path, meta) in &cached.file_meta {
+            if let Ok(current_meta) = fs::metadata(path) {
+                let current_mtime = current_meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if current_mtime != meta.mtime || current_meta.len() != meta.size {
+                    return false;
+                }
+            } else {
                 return false;
-            };
-            if cached.file_hashes.get(path).copied() != Some(current_hash) {
-                return false;
+            }
+            checked += 1;
+            if checked >= sample_size {
+                break;
             }
         }
 
         true
     }
 
-    fn count_message_files_fast(&self) -> usize {
-        let message_path = self._storage_path.join("message");
-        if !message_path.exists() {
-            return 0;
-        }
-
-        let Ok(entries) = fs::read_dir(&message_path) else {
-            return 0;
-        };
-
-        let dirs: Vec<_> = entries.flatten().collect();
-        dirs.par_iter()
-            .map(|entry| {
-                let path = entry.path();
-                if path.is_dir() {
-                    fs::read_dir(&path)
-                        .map(|sub| {
-                            sub.flatten()
-                                .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
-                                .count()
-                        })
-                        .unwrap_or(0)
-                } else if path.extension().is_some_and(|e| e == "json") {
-                    1
-                } else {
-                    0
-                }
-            })
-            .sum()
-    }
-
-    pub fn update_files(&self, paths: Vec<String>) -> HashSet<String> {
+    pub fn update_files(&self, paths: Vec<String>) -> StatsUpdate {
         let mut stats_lock = self.stats.write();
-        self.update_files_internal(&mut stats_lock, paths)
+        let affected_sessions = self.update_files_internal(&mut stats_lock, paths);
+        StatsUpdate {
+            affected_sessions,
+            totals: stats_lock.stats.totals.clone(),
+            per_day: stats_lock.stats.per_day.clone(),
+            session_titles: stats_lock.stats.session_titles.clone(),
+            model_usage: stats_lock.stats.model_usage.clone(),
+            session_message_files: stats_lock.stats.session_message_files.clone(),
+        }
     }
 
     fn update_files_internal(
         &self,
         cached: &mut CachedStats,
         paths: Vec<String>,
-    ) -> HashSet<String> {
-        let mut affected_sessions = HashSet::new();
-        let has_session_changes = paths
-            .iter()
-            .any(|p| p.contains("session.json") || p.contains("session_diff/"));
+    ) -> FxHashSet<String> {
+        let mut affected_sessions = FxHashSet::default();
 
-        if has_session_changes {
+        let has_session_json_root = paths.iter().any(|p| p.ends_with("session.json"));
+        let has_deletion = paths.iter().any(|p| !std::path::Path::new(p).exists());
+
+        // Only do full recompute if there are deletions or if it's the root session.json
+        // Individual session files should be handled incrementally
+        if has_session_json_root || has_deletion {
             cached.stats = crate::stats::collect_stats();
+            // Invalidate file meta for deleted files
+            for p in &paths {
+                if !std::path::Path::new(p).exists() {
+                    cached.file_meta.remove(p);
+                }
+            }
+            // All sessions might be affected on deletion since we don't know which ones
             for day_stat in cached.stats.per_day.values() {
                 for id in day_stat.sessions.keys() {
                     affected_sessions.insert(id.clone());
@@ -212,12 +214,24 @@ impl StatsCache {
             }
         } else {
             for p in &paths {
-                if p.contains("message/") {
+                if p.contains("session_diff/") {
+                    if let Some(session_id) = self.incrementally_update_session_diff(cached, p) {
+                        affected_sessions.insert(session_id);
+                    }
+                } else if p.contains("message/") {
                     if let Some(session_id) = self.incrementally_update_messages(cached, p) {
                         affected_sessions.insert(session_id);
                     }
                 } else if p.contains("part/") {
                     self.incrementally_update_parts(&mut cached.stats, p);
+                } else if p.contains("session/")
+                    && p.ends_with(".json")
+                    && !p.ends_with("session.json")
+                {
+                    // Handle individual session files incrementally
+                    if let Some(session_id) = self.incrementally_update_session_title(cached, p) {
+                        affected_sessions.insert(session_id);
+                    }
                 }
             }
 
@@ -231,11 +245,24 @@ impl StatsCache {
         cached.format_version = CACHE_FORMAT_VERSION;
 
         for p in &paths {
-            if let Some(h) = self.compute_file_hash(p) {
-                cached.file_hashes.insert(p.clone(), h);
+            if let Ok(m) = fs::metadata(p) {
+                let mtime = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                cached.file_meta.insert(
+                    p.clone(),
+                    FileMeta {
+                        mtime,
+                        size: m.len(),
+                    },
+                );
             }
         }
 
+        // Write cache to disk on any significant change
         if let Ok(data) = serialize(&*cached) {
             let _ = fs::write(&self.cache_path, data);
         }
@@ -257,19 +284,36 @@ impl StatsCache {
             })
             .collect();
         let message_files = self.list_message_files();
-        let (union_diffs, sorted_days) = self.build_session_day_union_diffs(&message_files);
+        let (union_diffs, sorted_days, message_contributions) =
+            self.build_session_day_union_diffs(&message_files);
         cached.session_day_union_diffs = union_diffs;
         cached.session_sorted_days = sorted_days;
+        cached.message_contributions = message_contributions;
         cached.version += 1;
         cached.format_version = CACHE_FORMAT_VERSION;
-        cached.file_hashes.clear();
+        cached.file_meta.clear();
 
         if let Ok(files) = self.list_all_files() {
-            let hashes: HashMap<String, u64> = files
+            let meta: FxHashMap<String, FileMeta> = files
                 .par_iter()
-                .filter_map(|f| self.compute_file_hash(f).map(|h| (f.clone(), h)))
+                .filter_map(|f| {
+                    let m = fs::metadata(f).ok()?;
+                    let mtime = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    Some((
+                        f.clone(),
+                        FileMeta {
+                            mtime,
+                            size: m.len(),
+                        },
+                    ))
+                })
                 .collect();
-            cached.file_hashes = hashes;
+            cached.file_meta = meta;
         }
 
         if let Ok(data) = serialize(&*cached) {
@@ -307,10 +351,17 @@ impl StatsCache {
     fn build_session_day_union_diffs(
         &self,
         files: &[PathBuf],
-    ) -> (SessionDiffs, SessionSortedDays) {
-        let mut union: SessionDiffs = HashMap::new();
-        let mut session_sorted_days: SessionSortedDays = HashMap::new();
-        let mut processed_ids: HashSet<Box<str>> = HashSet::with_capacity(files.len());
+    ) -> (
+        SessionDiffs,
+        SessionSortedDays,
+        FxHashMap<String, (f64, crate::stats::Tokens)>,
+    ) {
+        let mut union: SessionDiffs = FxHashMap::default();
+        let mut session_sorted_days: SessionSortedDays = FxHashMap::default();
+        let mut message_contributions: FxHashMap<String, (f64, crate::stats::Tokens)> =
+            FxHashMap::default();
+        let mut processed_ids: FxHashSet<Box<str>> =
+            FxHashSet::with_capacity_and_hasher(files.len(), Default::default());
 
         let mut messages: Vec<(crate::stats::Message, PathBuf)> = files
             .par_iter()
@@ -333,7 +384,7 @@ impl StatsCache {
                 Some(id) if !id.0.is_empty() => id.0.into_boxed_str(),
                 _ => path.to_string_lossy().to_string().into_boxed_str(),
             };
-            if !processed_ids.insert(message_id) {
+            if !processed_ids.insert(message_id.clone()) {
                 continue;
             }
 
@@ -348,6 +399,37 @@ impl StatsCache {
             let ts = msg.time.as_ref().and_then(|t| t.created.map(|v| *v));
             let day = crate::stats::get_day(ts);
 
+            // Track all days session was seen, regardless of diffs, for continuation detection
+            let days = session_sorted_days.entry(session_id.clone()).or_default();
+            if days.binary_search(&day).is_err() {
+                days.push(day.clone());
+                days.sort_unstable();
+            }
+
+            // Track message contributions for cost and tokens
+            let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
+            let tokens = if let Some(t) = &msg.tokens {
+                crate::stats::Tokens {
+                    input: t.input.map(|v| *v).unwrap_or(0),
+                    output: t.output.map(|v| *v).unwrap_or(0),
+                    reasoning: t.reasoning.map(|v| *v).unwrap_or(0),
+                    cache_read: t
+                        .cache
+                        .as_ref()
+                        .and_then(|c| c.read.map(|v| *v))
+                        .unwrap_or(0),
+                    cache_write: t
+                        .cache
+                        .as_ref()
+                        .and_then(|c| c.write.map(|v| *v))
+                        .unwrap_or(0),
+                }
+            } else {
+                crate::stats::Tokens::default()
+            };
+
+            message_contributions.insert(message_id.to_string(), (cost, tokens));
+
             let diffs = Self::extract_cumulative_diffs(&msg);
             if diffs.is_empty() {
                 continue;
@@ -360,15 +442,9 @@ impl StatsCache {
                 }
                 file_map.insert(d.path.to_string(), d);
             }
-
-            let days = session_sorted_days.entry(session_id).or_default();
-            if days.binary_search(&day).is_err() {
-                days.push(day);
-                days.sort_unstable();
-            }
         }
 
-        (union, session_sorted_days)
+        (union, session_sorted_days, message_contributions)
     }
 
     fn extract_cumulative_diffs(msg: &crate::stats::Message) -> Vec<crate::stats::FileDiff> {
@@ -417,7 +493,7 @@ impl StatsCache {
         current: &[crate::stats::FileDiff],
         previous: &[crate::stats::FileDiff],
     ) -> Vec<crate::stats::FileDiff> {
-        let prev_map: HashMap<&str, &crate::stats::FileDiff> =
+        let prev_map: FxHashMap<&str, &crate::stats::FileDiff> =
             previous.iter().map(|d| (d.path.as_ref(), d)).collect();
 
         current
@@ -442,17 +518,6 @@ impl StatsCache {
                 })
             })
             .collect()
-    }
-
-    fn compute_file_hash(&self, path: &str) -> Option<u64> {
-        let m = fs::metadata(path).ok()?;
-        let mod_time = m
-            .modified()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs();
-        Some(mod_time.wrapping_mul(31).wrapping_add(m.len()))
     }
 
     fn list_all_files(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -517,21 +582,7 @@ impl StatsCache {
             Some(id) if !id.0.is_empty() => id.0.into_boxed_str(),
             _ => path.to_string().into_boxed_str(),
         };
-        if stats.processed_message_ids.contains(&message_id) {
-            return None;
-        }
-        stats.processed_message_ids.insert(message_id);
-
-        let session_id_lenient = msg.session_id.clone().unwrap_or_default();
-        let session_id = session_id_lenient.0.clone();
-
-        if !session_id.is_empty() {
-            stats
-                .session_message_files
-                .entry(session_id.clone())
-                .or_default()
-                .push(PathBuf::from(path));
-        }
+        let message_id_str = message_id.to_string();
 
         let ts = msg.time.as_ref().and_then(|t| t.created.map(|v| *v));
         let day = crate::stats::get_day(ts);
@@ -540,6 +591,9 @@ impl StatsCache {
         let is_assistant = role == "assistant";
         let model_id = crate::stats::get_model_id(&msg);
         let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
+
+        let session_id_lenient = msg.session_id.clone().unwrap_or_default();
+        let session_id = session_id_lenient.0.clone();
 
         let tokens_add = if let Some(t) = &msg.tokens {
             crate::stats::Tokens {
@@ -561,15 +615,97 @@ impl StatsCache {
             crate::stats::Tokens::default()
         };
 
+        let is_new_message = !cached.message_contributions.contains_key(&message_id_str);
+
+        // Handle updates: if we already processed this message, subtract its old contribution
+        if !is_new_message {
+            let (old_cost, old_tokens) = cached.message_contributions.get(&message_id_str).unwrap();
+            let old_cost = *old_cost;
+            let old_tokens = *old_tokens;
+            stats.totals.tokens.input = stats.totals.tokens.input.saturating_sub(old_tokens.input);
+            stats.totals.tokens.output =
+                stats.totals.tokens.output.saturating_sub(old_tokens.output);
+            stats.totals.tokens.reasoning = stats
+                .totals
+                .tokens
+                .reasoning
+                .saturating_sub(old_tokens.reasoning);
+            stats.totals.tokens.cache_read = stats
+                .totals
+                .tokens
+                .cache_read
+                .saturating_sub(old_tokens.cache_read);
+            stats.totals.tokens.cache_write = stats
+                .totals
+                .tokens
+                .cache_write
+                .saturating_sub(old_tokens.cache_write);
+            stats.totals.cost -= old_cost;
+            // Note: we don't subtract messages/prompts count because it's still 1 message
+
+            if is_assistant {
+                if let Some(m) = stats.model_usage.iter_mut().find(|m| *m.name == *model_id) {
+                    m.cost -= old_cost;
+                    m.tokens.input = m.tokens.input.saturating_sub(old_tokens.input);
+                    m.tokens.output = m.tokens.output.saturating_sub(old_tokens.output);
+                    m.tokens.reasoning = m.tokens.reasoning.saturating_sub(old_tokens.reasoning);
+                    m.tokens.cache_read = m.tokens.cache_read.saturating_sub(old_tokens.cache_read);
+                    m.tokens.cache_write =
+                        m.tokens.cache_write.saturating_sub(old_tokens.cache_write);
+                }
+            }
+
+            if let Some(d) = stats.per_day.get_mut(&day) {
+                d.cost -= old_cost;
+                d.tokens.input = d.tokens.input.saturating_sub(old_tokens.input);
+                d.tokens.output = d.tokens.output.saturating_sub(old_tokens.output);
+                d.tokens.reasoning = d.tokens.reasoning.saturating_sub(old_tokens.reasoning);
+                d.tokens.cache_read = d.tokens.cache_read.saturating_sub(old_tokens.cache_read);
+                d.tokens.cache_write = d.tokens.cache_write.saturating_sub(old_tokens.cache_write);
+
+                if let Some(s_arc) = d.sessions.get_mut(&session_id) {
+                    let s = Arc::make_mut(s_arc);
+                    s.cost -= old_cost;
+                    s.tokens.input = s.tokens.input.saturating_sub(old_tokens.input);
+                    s.tokens.output = s.tokens.output.saturating_sub(old_tokens.output);
+                    s.tokens.reasoning = s.tokens.reasoning.saturating_sub(old_tokens.reasoning);
+                    s.tokens.cache_read = s.tokens.cache_read.saturating_sub(old_tokens.cache_read);
+                    s.tokens.cache_write =
+                        s.tokens.cache_write.saturating_sub(old_tokens.cache_write);
+                }
+            }
+        } else {
+            // New message
+            stats.totals.messages += 1;
+            if is_user {
+                stats.totals.prompts += 1;
+            }
+        }
+
+        // CRITICAL: Update message_contributions map to track cost and tokens for this message
+        // This enables proper handling of message updates without double-counting
+        cached
+            .message_contributions
+            .insert(message_id_str, (cost, tokens_add));
+        stats.processed_message_ids.insert(message_id);
+
+        if !session_id.is_empty() {
+            stats
+                .session_message_files
+                .entry(session_id.clone())
+                .or_insert_with(|| FxHashSet::default())
+                .insert(PathBuf::from(path));
+        }
+
         stats.totals.tokens.input += tokens_add.input;
         stats.totals.tokens.output += tokens_add.output;
         stats.totals.tokens.reasoning += tokens_add.reasoning;
         stats.totals.tokens.cache_read += tokens_add.cache_read;
         stats.totals.tokens.cache_write += tokens_add.cache_write;
-        stats.totals.messages += 1;
-        if is_user {
-            stats.totals.prompts += 1;
-        }
+        // stats.totals.messages += 1; // Handled above for updates
+        // if is_user {
+        //     stats.totals.prompts += 1;
+        // }
         stats.totals.cost += cost;
         stats
             .totals
@@ -578,7 +714,9 @@ impl StatsCache {
 
         if is_assistant {
             if let Some(m) = stats.model_usage.iter_mut().find(|m| *m.name == *model_id) {
-                m.messages += 1;
+                if is_new_message {
+                    m.messages += 1;
+                }
                 m.cost += cost;
                 m.tokens.input += tokens_add.input;
                 m.tokens.output += tokens_add.output;
@@ -607,25 +745,29 @@ impl StatsCache {
                     cost,
                 });
             }
-            if let Some(agent) = msg
-                .agent
-                .as_ref()
-                .map(|s| s.0.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                if let Some(m) = stats.model_usage.iter_mut().find(|m| *m.name == *model_id) {
-                    *m.agents
-                        .entry(agent.to_string().into_boxed_str())
-                        .or_insert(0) += 1;
+            if is_new_message {
+                if let Some(agent) = msg
+                    .agent
+                    .as_ref()
+                    .map(|s| s.0.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    if let Some(m) = stats.model_usage.iter_mut().find(|m| *m.name == *model_id) {
+                        *m.agents
+                            .entry(agent.to_string().into_boxed_str())
+                            .or_insert(0) += 1;
+                    }
                 }
             }
         }
 
         {
             let d = stats.per_day.entry(day.clone()).or_default();
-            d.messages += 1;
-            if is_user {
-                d.prompts += 1;
+            if is_new_message {
+                d.messages += 1;
+                if is_user {
+                    d.prompts += 1;
+                }
             }
             d.cost += cost;
             d.tokens.input += tokens_add.input;
@@ -639,11 +781,15 @@ impl StatsCache {
                 .entry(session_id.clone())
                 .or_insert_with(|| Arc::new(crate::stats::SessionStat::new(session_id.clone())));
             let s = Arc::make_mut(s_arc);
-            s.messages += 1;
-            if is_user {
-                s.prompts += 1;
+
+            if is_new_message {
+                s.messages += 1;
+                if is_user {
+                    s.prompts += 1;
+                }
             }
             s.cost += cost;
+
             if is_assistant {
                 s.models.insert(model_id.clone());
             }
@@ -681,12 +827,36 @@ impl StatsCache {
         if !session_id.is_empty() && !cumulative_diffs.is_empty() {
             let key = format!("{}|{}", session_id, day);
             let file_map = cached.session_day_union_diffs.entry(key).or_default();
-            for d in cumulative_diffs {
+            for d in &cumulative_diffs {
                 if d.path.is_empty() {
                     continue;
                 }
-                file_map.insert(d.path.to_string(), d);
+                file_map.insert(d.path.to_string(), d.clone());
             }
+
+            // Update session_diff_map with cumulative diffs from this message
+            // This ensures the session has the most up-to-date diff data
+            cached
+                .session_diff_map
+                .insert(session_id.clone(), cumulative_diffs.clone());
+
+            // Update session_diff_totals and global totals
+            let adds: u64 = cumulative_diffs.iter().map(|d| d.additions).sum();
+            let dels: u64 = cumulative_diffs.iter().map(|d| d.deletions).sum();
+
+            // Update global totals: subtract old session totals, add new ones
+            if let Some(&(old_adds, old_dels)) = cached.session_diff_totals.get(&session_id) {
+                stats.totals.diffs.additions =
+                    stats.totals.diffs.additions.saturating_sub(old_adds);
+                stats.totals.diffs.deletions =
+                    stats.totals.diffs.deletions.saturating_sub(old_dels);
+            }
+            stats.totals.diffs.additions += adds;
+            stats.totals.diffs.deletions += dels;
+
+            cached
+                .session_diff_totals
+                .insert(session_id.clone(), (adds, dels));
         }
 
         if !session_id.is_empty() {
@@ -702,7 +872,17 @@ impl StatsCache {
             if let Some(sorted_days) = cached.session_sorted_days.get(&session_id).cloned() {
                 let start_pos = sorted_days.iter().position(|d| d == &day).unwrap_or(0);
                 let first_day = sorted_days.first().cloned().unwrap_or_else(|| day.clone());
-                for (idx, day_str) in sorted_days.iter().enumerate().skip(start_pos) {
+                let is_last_day = start_pos + 1 >= sorted_days.len();
+                let day_iter: Box<dyn Iterator<Item = (usize, &String)>> = if is_last_day {
+                    Box::new(std::iter::once((
+                        start_pos,
+                        sorted_days.get(start_pos).unwrap_or(&day),
+                    )))
+                } else {
+                    Box::new(sorted_days.iter().enumerate().skip(start_pos))
+                };
+
+                for (idx, day_str) in day_iter {
                     let lookup_key = format!("{}|{}", session_id, day_str);
                     let current_day_diffs: Vec<crate::stats::FileDiff> = cached
                         .session_day_union_diffs
@@ -784,6 +964,138 @@ impl StatsCache {
         Some(session_id)
     }
 
+    fn incrementally_update_session_diff(
+        &self,
+        cached: &mut CachedStats,
+        path: &str,
+    ) -> Option<String> {
+        let p = std::path::Path::new(path);
+        let session_id = p.file_stem()?.to_str()?.to_string();
+
+        let bytes = fs::read(path).ok()?;
+
+        #[derive(serde::Deserialize)]
+        struct DiffEntry {
+            file: Option<crate::stats::LenientString>,
+            additions: Option<crate::stats::LenientU64>,
+            deletions: Option<crate::stats::LenientU64>,
+            status: Option<crate::stats::LenientString>,
+        }
+
+        let entries: Vec<DiffEntry> = serde_json::from_slice(&bytes).ok()?;
+        let mut diffs: Vec<crate::stats::FileDiff> = entries
+            .into_iter()
+            .map(|item| crate::stats::FileDiff {
+                path: item
+                    .file
+                    .map(|s| s.0)
+                    .unwrap_or_else(|| "unknown".into())
+                    .into_boxed_str(),
+                additions: item.additions.map(|v| *v).unwrap_or(0),
+                deletions: item.deletions.map(|v| *v).unwrap_or(0),
+                status: item
+                    .status
+                    .map(|s| s.0)
+                    .unwrap_or_else(|| "modified".into())
+                    .into_boxed_str(),
+            })
+            .collect();
+        Self::sort_file_diffs(&mut diffs);
+
+        let adds: u64 = diffs.iter().map(|d| d.additions).sum();
+        let dels: u64 = diffs.iter().map(|d| d.deletions).sum();
+
+        // Update global totals: subtract old session totals, add new ones
+        if let Some(&(old_adds, old_dels)) = cached.session_diff_totals.get(&session_id) {
+            cached.stats.totals.diffs.additions =
+                cached.stats.totals.diffs.additions.saturating_sub(old_adds);
+            cached.stats.totals.diffs.deletions =
+                cached.stats.totals.diffs.deletions.saturating_sub(old_dels);
+        }
+        cached.stats.totals.diffs.additions += adds;
+        cached.stats.totals.diffs.deletions += dels;
+
+        cached
+            .session_diff_map
+            .insert(session_id.clone(), diffs.clone());
+        cached
+            .session_diff_totals
+            .insert(session_id.clone(), (adds, dels));
+
+        for day_stat in cached.stats.per_day.values_mut() {
+            if let Some(s_arc) = day_stat.sessions.get_mut(&session_id) {
+                let s = std::sync::Arc::make_mut(s_arc);
+                if !s.is_continuation {
+                    s.file_diffs = diffs.clone();
+                    s.diffs.additions = adds;
+                    s.diffs.deletions = dels;
+                }
+                day_stat.diffs.additions = day_stat
+                    .sessions
+                    .values()
+                    .map(|ss| ss.diffs.additions)
+                    .sum();
+                day_stat.diffs.deletions = day_stat
+                    .sessions
+                    .values()
+                    .map(|ss| ss.diffs.deletions)
+                    .sum();
+            }
+        }
+
+        Some(session_id)
+    }
+
+    fn incrementally_update_session_title(
+        &self,
+        cached: &mut CachedStats,
+        path: &str,
+    ) -> Option<String> {
+        let bytes = match fs::read(path) {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+
+        #[derive(serde::Deserialize)]
+        struct SessionData {
+            id: Option<crate::stats::LenientString>,
+            title: Option<crate::stats::LenientString>,
+        }
+
+        let session_data: SessionData = match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+
+        let session_id = session_data
+            .id
+            .map(|s| s.0)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                // Fallback to filename if ID not available
+                std::path::Path::new(path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .into_boxed_str();
+
+        let title = session_data.title.map(|s| s.0).unwrap_or_default();
+
+        if !session_id.is_empty() {
+            cached
+                .stats
+                .session_titles
+                .insert(session_id.clone(), title);
+
+            // Also update the cache version to reflect the change
+            cached.version += 1;
+        }
+
+        Some(session_id.into_string())
+    }
+
     fn incrementally_update_parts(&self, stats: &mut crate::stats::Stats, path: &str) {
         let Ok(bytes) = fs::read(path) else {
             return;
@@ -792,19 +1104,17 @@ impl StatsCache {
             return;
         };
         if let Some(text) = &part.text {
-            let a = text.lines().filter(|l| l.starts_with('+')).count() as u64;
-            let d = text.lines().filter(|l| l.starts_with('-')).count() as u64;
-            stats.totals.diffs.additions += a;
-            stats.totals.diffs.deletions += d;
+            let _a = text.lines().filter(|l| l.starts_with('+')).count() as u64;
+            let _d = text.lines().filter(|l| l.starts_with('-')).count() as u64;
+            // Removed global total updates from parts to stay consistent with authoritative session_diff
+            // stats.totals.diffs.additions += a;
+            // stats.totals.diffs.deletions += d;
         }
+
         if part.part_type.as_deref() == Some("tool") {
             if let Some(tool) = &part.tool {
                 *stats.totals.tools.entry(tool.clone().into()).or_insert(0) += 1;
             }
         }
-    }
-
-    pub fn get_stats(&self) -> crate::stats::Stats {
-        self.stats.read().stats.clone()
     }
 }

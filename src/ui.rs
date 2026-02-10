@@ -1,15 +1,15 @@
 use crate::live_watcher::LiveWatcher;
 use crate::session::SessionModal;
 use crate::stats::{
-    format_duration_ms, format_number, format_number_full, load_session_chat_incremental,
-    load_session_chat_with_max_ts, ChatMessage, DayStat, MessageContent, ModelUsage, ToolUsage,
-    Totals, MAX_MESSAGES_TO_LOAD,
+    format_duration_ms, format_number, format_number_full, load_session_chat_with_max_ts,
+    ChatMessage, DayStat, MessageContent, ModelUsage, ToolUsage, Totals,
 };
 use crate::stats_cache::StatsCache;
 use chrono::Datelike;
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use fxhash::{FxHashMap, FxHashSet};
 use parking_lot::Mutex;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -19,10 +19,9 @@ use ratatui::{
     Frame,
 };
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 
 // Constants for optimized mouse handling
 
@@ -30,8 +29,6 @@ use std::sync::Arc;
 struct CachedChat {
     messages: Arc<Vec<ChatMessage>>,
     total_lines: u16,
-    last_file_count: usize,
-    last_max_ts: i64,
 }
 
 /// Helper to create cache key from session_id and day
@@ -111,16 +108,20 @@ impl PanelRects {
 
 pub struct App {
     totals: Totals,
-    per_day: HashMap<String, DayStat>,
-    session_titles: HashMap<Box<str>, String>,
-    session_message_files: HashMap<String, Vec<PathBuf>>,
+    per_day: FxHashMap<String, DayStat>,
+    session_titles: FxHashMap<Box<str>, String>,
+    session_message_files: FxHashMap<String, FxHashSet<PathBuf>>,
     day_list: Vec<String>,
     day_list_state: ListState,
     session_list: Vec<Arc<crate::stats::SessionStat>>,
     session_list_state: ListState,
-    cached_session_items: Vec<ListItem<'static>>, // Cached rendered list items
+    cached_session_items: Vec<ListItem<'static>>,
     cached_session_width: u16,
-    chat_cache: HashMap<String, CachedChat>,
+    cached_day_items: Vec<ListItem<'static>>,
+    cached_day_width: u16,
+    cached_model_items: Vec<ListItem<'static>>,
+    cached_model_width: u16,
+    chat_cache: FxHashMap<String, CachedChat>,
     chat_cache_order: Vec<String>,
     chat_scroll: u16,
     model_usage: Vec<ModelUsage>,
@@ -136,8 +137,7 @@ pub struct App {
     ranking_max_scroll: usize,
 
     // Phase 2: Render Caching
-    cached_day_strings: HashMap<String, String>, // Pre-formatted day strings with weekday names
-    
+    cached_day_strings: FxHashMap<String, String>, // Pre-formatted day strings with weekday names
 
     chat_max_scroll: u16,
     focus: Focus,
@@ -155,6 +155,9 @@ pub struct App {
     last_mouse_panel: Option<&'static str>, // Cache last panel for faster hit-testing
     last_session_click: Option<(std::time::Instant, usize)>, // Double-click detection for sessions
 
+    // Terminal size cache
+    terminal_size: Rect,
+
     // Cached panel rectangles for optimized mouse hit-testing
     cached_rects: PanelRects,
 
@@ -170,6 +173,7 @@ pub struct App {
     pending_refresh_paths: Vec<PathBuf>,
     last_refresh: Option<std::time::Instant>,
     should_redraw: bool,
+    wake_rx: mpsc::Receiver<()>,
 }
 
 /// Helper: Create a stat paragraph with label and value
@@ -342,14 +346,16 @@ impl App {
                 )
             };
 
-        // Set up live watcher for real-time updates
+        // Set up live watcher with channel-based wake for instant updates
         let needs_refresh = Arc::new(Mutex::new(Vec::new()));
         let needs_refresh_clone = needs_refresh.clone();
+        let (wake_tx, wake_rx) = mpsc::channel();
         let mut live_watcher = LiveWatcher::new(
             storage_path.clone(),
             Arc::new(move |files| {
                 needs_refresh_clone.lock().extend(files);
             }),
+            wake_tx,
         )
         .ok();
 
@@ -393,7 +399,6 @@ impl App {
             day_list_state,
             session_list: Vec::new(),
             session_list_state: ListState::default(),
-            chat_cache: HashMap::new(),
             chat_cache_order: Vec::new(),
             chat_scroll: 0,
             model_usage,
@@ -409,10 +414,15 @@ impl App {
             ranking_max_scroll: 0,
             cached_session_items: Vec::new(),
             cached_session_width: 0,
-            cached_day_strings: HashMap::with_capacity(32),
-
+            cached_day_items: Vec::new(),
+            cached_day_width: 0,
+            cached_model_items: Vec::new(),
+            cached_model_width: 0,
+            cached_day_strings: FxHashMap::default(),
+            chat_cache: FxHashMap::default(),
 
             chat_max_scroll: 0,
+
             focus: Focus::Left,
             left_panel: LeftPanel::Days,
             right_panel: RightPanel::List,
@@ -427,6 +437,8 @@ impl App {
             last_mouse_panel: None,
             last_session_click: None,
 
+            terminal_size: Rect::default(),
+
             cached_rects: PanelRects::default(),
 
             cached_git_branch: None,
@@ -439,10 +451,15 @@ impl App {
             pending_refresh_paths: Vec::new(),
             last_refresh: None,
             should_redraw: true,
+            wake_rx,
         };
+        // Initialize all cached data and derived values
         app.update_session_list();
         app.precompute_day_strings();
         app.recompute_max_cost_width();
+
+        // Ensure all displays are current
+        app.should_redraw = true;
         app
     }
 
@@ -467,10 +484,13 @@ impl App {
     }
 
     fn update_session_list(&mut self) {
-        let prev_selected_id = self.session_list_state.selected()
+        let prev_selected_id = self
+            .session_list_state
+            .selected()
             .and_then(|i| self.session_list.get(i))
             .map(|s| s.id.clone());
 
+        // Always clear and rebuild session list from current data
         self.session_list.clear();
         if let Some(day) = self.selected_day() {
             if let Some(stat) = self.per_day.get(&day) {
@@ -479,6 +499,8 @@ impl App {
                 self.session_list = sessions;
             }
         }
+
+        // Restore previous selection or select first session
         if !self.session_list.is_empty() {
             if let Some(prev_id) = prev_selected_id.as_ref() {
                 if let Some(idx) = self.session_list.iter().position(|s| s.id == *prev_id) {
@@ -492,16 +514,23 @@ impl App {
         } else {
             self.session_list_state.select(None);
         }
-        // Clear cached chat session since session list changed
-        self.current_chat_session_id = None;
-        // Clear cached items; rebuild on render with correct width
+
+        // Only clear current_chat_session_id if modal is NOT open
+        if !self.modal.open {
+            self.current_chat_session_id = None;
+        }
+
         self.cached_session_items.clear();
         self.cached_session_width = 0;
+        self.cached_day_items.clear();
+        self.cached_day_width = 0;
+
         // Invalidate git branch cache since selected session may have changed
         self.cached_git_branch = None;
+
+        log::debug!("Session list updated: {} sessions", self.session_list.len());
     }
 
-    /// Rebuild cached session list items to avoid heavy computation on every render
     fn rebuild_cached_session_items(&mut self, width: u16) {
         self.cached_session_width = width;
         let max_cost_len = self
@@ -528,68 +557,67 @@ impl App {
         let title_width =
             width.saturating_sub((fixed_width).min(u16::MAX as usize) as u16) as usize;
 
-        self.cached_session_items = self
-            .session_list
-            .iter()
-            .map(|s| {
-                // No [Continued] badge - continuation info shown in panel title above
-                let title = self
-                    .session_titles
-                    .get(&s.id)
-                    .map(|t| t.strip_prefix("New session - ").unwrap_or(t).to_string())
-                    .unwrap_or_else(|| s.id.chars().take(14).collect());
+        self.cached_session_items = self.session_list
+                .iter()
+                .map(|s| {
+                    // No [Continued] badge - continuation info shown in panel title above
+                    let title = self
+                        .session_titles
+                        .get(&s.id)
+                        .map(|t| t.strip_prefix("New session - ").unwrap_or(t).to_string())
+                        .unwrap_or_else(|| s.id.chars().take(14).collect());
 
-                let model_count = s.models.len();
-                let model_text = if model_count == 1 {
-                    "1 model".into()
-                } else {
-                    format!("{} models", model_count)
-                };
-                let model_text = format!("{:>width$}", model_text, width = max_models_len);
-                let additions = s.diffs.additions;
-                let deletions = s.diffs.deletions;
+                    let model_count = s.models.len();
+                    let model_text = if model_count == 1 {
+                        "1 model".into()
+                    } else {
+                        format!("{} models", model_count)
+                    };
+                    let model_text = format!("{:>width$}", model_text, width = max_models_len);
+                    let additions = s.diffs.additions;
+                    let deletions = s.diffs.deletions;
 
-                // Gray title for continued sessions to highlight them
-                let title_color = if s.is_continuation {
-                    Color::Rgb(150, 150, 150)
-                } else {
-                    Color::White
-                };
+                    // Gray title for continued sessions to highlight them
+                    let title_color = if s.is_continuation {
+                        Color::Rgb(150, 150, 150)
+                    } else {
+                        Color::White
+                    };
 
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!(
-                            "{:<width$}",
-                            title.chars().take(title_width.max(8)).collect::<String>(),
-                            width = title_width.max(8)
+                    ListItem::new(Line::from(vec![
+                        Span::styled(
+                            format!(
+                                "{:<width$}",
+                                title.chars().take(title_width.max(8)).collect::<String>(),
+                                width = title_width.max(8)
+                            ),
+                            Style::default().fg(title_color),
                         ),
-                        Style::default().fg(title_color),
-                    ),
-                    Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
-                    Span::styled(
-                        format!("{}{:>7}", "+", format_number(additions)),
-                        Style::default().fg(Color::Green),
-                    ),
-                    Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
-                    Span::styled(
-                        format!("{}{:>7}", "-", format_number(deletions)),
-                        Style::default().fg(Color::Red),
-                    ),
-                    Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
-                    Span::styled(
-                        format!("${:>width$.2}", s.display_cost(), width = max_cost_len),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
-                    Span::styled(
-                        format!("{:>4} msg", s.messages),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                    Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
-                    Span::styled(model_text, Style::default().fg(Color::Magenta)),
-                ]))
-            })
-            .collect();
+                        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                        Span::styled(
+                            format!("{}{:>7}", "+", format_number(additions)),
+                            Style::default().fg(Color::Green),
+                        ),
+                        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                        Span::styled(
+                            format!("{}{:>7}", "-", format_number(deletions)),
+                            Style::default().fg(Color::Red),
+                        ),
+                        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                        Span::styled(
+                            format!("${:>width$.2}", s.display_cost(), width = max_cost_len),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                        Span::styled(
+                            format!("{:>4} msg", s.messages),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                        Span::styled(model_text, Style::default().fg(Color::Magenta)),
+                    ]))
+                })
+                .collect();
     }
 
     /// Precompute formatted day strings with weekday names (Phase 2 optimization)
@@ -619,7 +647,9 @@ impl App {
     }
 
     fn open_session_modal(&mut self, area_height: u16) {
-        let session_stat = match self.session_list_state.selected()
+        let session_stat = match self
+            .session_list_state
+            .selected()
             .and_then(|i| self.session_list.get(i))
             .cloned()
         {
@@ -646,25 +676,33 @@ impl App {
             }
             self.chat_cache_order.push(cache_key.clone());
 
+            let files_vec: Vec<PathBuf> = self
+                .session_message_files
+                .get(&session_id_str)
+                .map(|v| v.iter().cloned().collect())
+                .unwrap_or_default();
+
             // Open modal with cached messages (Arc clone, no deep copy)
             self.modal.open_session(
                 &session_id_str,
                 messages_arc,
                 &session_stat,
-                self.session_message_files
-                    .get(&session_id_str)
-                    .map(|v| v.as_slice()),
+                Some(&files_vec),
                 current_day.as_deref(),
             );
             cached.total_lines
         } else {
-            let files = self
+            let files_vec: Vec<PathBuf> = self
                 .session_message_files
                 .get(&session_id_str)
-                .map(|v| v.as_slice());
+                .map(|v| v.iter().cloned().collect())
+                .unwrap_or_default();
             // Pass current day to filter messages to only show this day's messages
-            let (messages, max_ts) =
-                load_session_chat_with_max_ts(&session_id_str, files, current_day.as_deref());
+            let (messages, _max_ts) = load_session_chat_with_max_ts(
+                &session_id_str,
+                Some(&files_vec),
+                current_day.as_deref(),
+            );
             let total_lines: u16 = messages.iter().map(calculate_message_rendered_lines).sum();
             let blank_lines = if !messages.is_empty() {
                 messages.len() - 1
@@ -672,7 +710,6 @@ impl App {
                 0
             };
             let total_lines = total_lines + blank_lines as u16;
-            let file_count = files.map(|f| f.len()).unwrap_or(0);
 
             // Implement LRU cache eviction if cache is too large
             const MAX_CACHE_SIZE: usize = 5;
@@ -690,8 +727,6 @@ impl App {
                 CachedChat {
                     messages: Arc::clone(&messages_arc),
                     total_lines,
-                    last_file_count: file_count,
-                    last_max_ts: max_ts,
                 },
             );
             self.chat_cache_order.push(cache_key.clone());
@@ -701,9 +736,10 @@ impl App {
                 &session_id_str,
                 messages_arc,
                 &session_stat,
-                files,
+                Some(&files_vec),
                 current_day.as_deref(),
             );
+
             total_lines
         };
 
@@ -717,11 +753,15 @@ impl App {
         let i = self.day_list_state.selected().unwrap_or(0);
         self.day_list_state
             .select(Some((i + 1).min(self.day_list.len() - 1)));
+        self.update_session_list();
+        self.should_redraw = true;
     }
 
     fn day_previous(&mut self) {
         let i = self.day_list_state.selected().unwrap_or(0);
         self.day_list_state.select(Some(i.saturating_sub(1)));
+        self.update_session_list();
+        self.should_redraw = true;
     }
 
     fn model_next(&mut self) {
@@ -731,11 +771,13 @@ impl App {
         let i = self.model_list_state.selected().unwrap_or(0);
         self.model_list_state
             .select(Some((i + 1).min(self.model_usage.len() - 1)));
+        self.should_redraw = true;
     }
 
     fn model_previous(&mut self) {
         let i = self.model_list_state.selected().unwrap_or(0);
         self.model_list_state.select(Some(i.saturating_sub(1)));
+        self.should_redraw = true;
     }
 
     fn session_next(&mut self) {
@@ -747,6 +789,7 @@ impl App {
             .select(Some((i + 1).min(self.session_list.len() - 1)));
         // Clear cached chat session since selection changed
         self.current_chat_session_id = None;
+        self.should_redraw = true;
     }
 
     fn session_previous(&mut self) {
@@ -754,6 +797,7 @@ impl App {
         self.session_list_state.select(Some(i.saturating_sub(1)));
         // Clear cached chat session since selection changed
         self.current_chat_session_id = None;
+        self.should_redraw = true;
     }
 
     fn selected_day(&self) -> Option<String> {
@@ -762,12 +806,11 @@ impl App {
             .and_then(|i| self.day_list.get(i).cloned())
     }
 
-
     /// Refresh stats from cache (for live updates)
     pub fn refresh_stats(&mut self, changed_files: Vec<PathBuf>) {
         if let Some(cache) = &self.stats_cache {
             let is_full_refresh = changed_files.is_empty();
-            let mut affected_sessions = std::collections::HashSet::new();
+            let mut affected_sessions = FxHashSet::default();
 
             let (totals, per_day, session_titles, model_usage, session_message_files) =
                 if is_full_refresh {
@@ -784,14 +827,14 @@ impl App {
                         .iter()
                         .filter_map(|p| p.to_str().map(ToString::to_string))
                         .collect();
-                    affected_sessions = cache.update_files(files);
-                    let s = cache.get_stats();
+                    let update = cache.update_files(files);
+                    affected_sessions = update.affected_sessions;
                     (
-                        s.totals,
-                        s.per_day,
-                        s.session_titles,
-                        s.model_usage,
-                        s.session_message_files,
+                        update.totals,
+                        update.per_day,
+                        update.session_titles,
+                        update.model_usage,
+                        update.session_message_files,
                     )
                 };
 
@@ -802,235 +845,176 @@ impl App {
             self.model_usage = model_usage;
             self.session_message_files = session_message_files;
 
-            // Rebuild derived data if full refresh, otherwise partial
-            if is_full_refresh {
-                let prev_selected_day = self.selected_day();
-                self.day_list.clear();
-                self.day_list.extend(self.per_day.keys().cloned());
-                self.day_list.sort_unstable_by(|a, b| b.cmp(a));
-                if let Some(prev) = prev_selected_day.as_ref() {
-                    if let Some(idx) = self.day_list.iter().position(|d| d == prev) {
-                        self.day_list_state.select(Some(idx));
-                    } else if !self.day_list.is_empty() {
-                        self.day_list_state.select(Some(0));
-                    }
-                } else if !self.day_list.is_empty() && self.day_list_state.selected().is_none() {
-                    self.day_list_state.select(Some(0));
-                }
-                self.update_session_list();
-            } else {
-                // For incremental updates, we don't need to rebuild the entire day_list
-                // just ensure it contains any new days (though messages usually arrive on existing days)
-                let mut day_list_changed = false;
-                for day in self.per_day.keys() {
-                    if !self.day_list.contains(day) {
-                        self.day_list.push(day.clone());
-                        day_list_changed = true;
-                    }
-                }
-                if day_list_changed {
-                    let prev_selected_day = self.selected_day();
-                    self.day_list.sort_unstable_by(|a, b| b.cmp(a));
-                    if let Some(prev) = prev_selected_day.as_ref() {
-                        if let Some(idx) = self.day_list.iter().position(|d| d == prev) {
-                            self.day_list_state.select(Some(idx));
-                        }
-                    } else if self.day_list_state.selected().is_none() {
-                        self.day_list_state.select(Some(0));
-                    }
-                }
+            // Always rebuild day list and sessions for consistency
+            self.rebuild_day_and_session_lists(is_full_refresh);
 
-                // Only rebuild session list if the currently selected day was affected
-                let mut current_day_affected = false;
-                if let Some(current_day) = self.selected_day() {
-                    if let Some(day_stat) = self.per_day.get(&current_day) {
-                        for session_id in &affected_sessions {
-                            if day_stat.sessions.contains_key(session_id) {
-                                current_day_affected = true;
-                                break;
-                            }
-                        }
-                    }
-                }
+            // Update derived data that affects display
+            self.update_derived_data();
 
-                if current_day_affected {
-                    self.update_session_list();
+            // Live-refresh the open modal: reload chat + session details fresh.
+            // Simple and reliable — just reload instead of complex incremental merging.
+            if self.modal.open {
+                if let Some(current) = self.current_chat_session_id.clone() {
+                    self.refresh_open_modal(&current);
+                    affected_sessions.remove(&current);
                 }
             }
 
-            // Update tool usage
-            let mut tool_usage: Vec<ToolUsage> = self
-                .totals
-                .tools
-                .iter()
-                .map(|(name, count)| ToolUsage {
-                    name: name.clone(),
-                    count: *count,
-                })
-                .collect();
-            tool_usage.sort_unstable_by(|a, b| b.count.cmp(&a.count));
-            self.tool_usage = tool_usage;
-
-            // Update model list state if needed
-            if !self.model_usage.is_empty() && self.model_list_state.selected().is_none() {
-                self.model_list_state.select(Some(0));
-                self.selected_model_index = Some(0);
-            }
-
-            // Incrementally update open chat modal if its session changed.
-            if let Some(current) = self.current_chat_session_id.as_deref() {
-                if affected_sessions.contains(current) {
-                    let current_day = self.selected_day();
-                    let cache_key = cache_key(current, current_day.as_deref());
-                    if let Some(files) = self.session_message_files.get(current) {
-                        if let Some(cached) = self.chat_cache.get(&cache_key) {
-                            let cached_messages = Arc::clone(&cached.messages);
-                            let cached_total_lines = cached.total_lines;
-                            let cached_last_file_count = cached.last_file_count;
-                            let cached_last_max_ts = cached.last_max_ts;
-                            if cached_last_file_count < files.len() {
-                                let new_files = &files[cached_last_file_count..];
-                                let (mut new_msgs, new_max_ts) =
-                                    load_session_chat_incremental(
-                                        new_files,
-                                        current_day.as_deref(),
-                                        Some(cached_last_max_ts),
-                                    );
-
-                                let mut merged: Vec<ChatMessage> =
-                                    Vec::with_capacity(cached_messages.len() + new_msgs.len());
-                                merged.extend((*cached_messages).clone());
-                                if !new_msgs.is_empty() {
-                                    if let Some(last) = merged.last_mut() {
-                                        if let Some(first) = new_msgs.first() {
-                                            if last.role == first.role {
-                                                last.parts.extend(first.parts.clone());
-                                                new_msgs.remove(0);
-                                            }
-                                        }
-                                    }
-                                    merged.extend(new_msgs);
-                                }
-
-                                if merged.len() > MAX_MESSAGES_TO_LOAD {
-                                    let start = merged.len() - MAX_MESSAGES_TO_LOAD;
-                                    merged.drain(..start);
-                                }
-
-                                let total_lines: u16 =
-                                    merged.iter().map(calculate_message_rendered_lines).sum();
-                                let blank_lines = if !merged.is_empty() {
-                                    merged.len() - 1
-                                } else {
-                                    0
-                                };
-                                let total_lines = total_lines + blank_lines as u16;
-
-                                let messages_arc = Arc::new(merged);
-                                self.chat_cache.insert(
-                                    cache_key.clone(),
-                                    CachedChat {
-                                        messages: Arc::clone(&messages_arc),
-                                        total_lines,
-                                        last_file_count: files.len(),
-                                        last_max_ts: cached_last_max_ts.max(new_max_ts),
-                                    },
-                                );
-                                if let Some(pos) = self
-                                    .chat_cache_order
-                                    .iter()
-                                    .position(|s| s == &cache_key)
-                                {
-                                    self.chat_cache_order.remove(pos);
-                                }
-                                self.chat_cache_order.push(cache_key.clone());
-                                if self.modal.open {
-                                    self.modal.chat_messages = messages_arc;
-                                }
-                                affected_sessions.remove(current);
-                            } else if cached_last_file_count != files.len() {
-                                self.chat_cache.insert(
-                                    cache_key.clone(),
-                                    CachedChat {
-                                        messages: cached_messages,
-                                        total_lines: cached_total_lines,
-                                        last_file_count: files.len(),
-                                        last_max_ts: cached_last_max_ts,
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Invalidate chat cache for remaining affected sessions.
+            // Invalidate chat cache for affected sessions (not the open modal)
             if !affected_sessions.is_empty() {
-                if affected_sessions.len() == 1 {
-                    let only = affected_sessions.iter().next().unwrap();
-                    self.chat_cache.retain(|key, _| {
-                        if key == only {
-                            return false;
-                        }
-                        key.strip_prefix(only)
-                            .and_then(|rest| rest.strip_prefix('|'))
-                            .is_none()
-                    });
-                } else {
-                    self.chat_cache.retain(|key, _| {
-                        let session_id = key.split_once('|').map(|(s, _)| s).unwrap_or(key);
-                        !affected_sessions.contains(session_id)
-                    });
-                }
-                self.chat_cache_order
-                    .retain(|key| self.chat_cache.contains_key(key));
-                if let Some(current) = self.current_chat_session_id.as_deref() {
-                    if affected_sessions.contains(current) {
-                        self.current_chat_session_id = None;
-                    }
-                }
+                self.invalidate_affected_chat_cache(&affected_sessions);
             }
-
-            self.precompute_day_strings();
-            self.recompute_max_cost_width();
 
             log::debug!("Stats refreshed successfully (live update)");
+            self.should_redraw = true;
         }
     }
 
+    /// Rebuild day list and session lists based on current data
+    fn rebuild_day_and_session_lists(&mut self, _is_full_refresh: bool) {
+        let prev_selected_day = self.selected_day();
+
+        // Always rebuild day list to ensure consistency
+        self.day_list.clear();
+        self.day_list.extend(self.per_day.keys().cloned());
+        self.day_list.sort_unstable_by(|a, b| b.cmp(a));
+
+        // Restore previous selection or select first day
+        if let Some(prev) = prev_selected_day.as_ref() {
+            if let Some(idx) = self.day_list.iter().position(|d| d == prev) {
+                self.day_list_state.select(Some(idx));
+            } else if !self.day_list.is_empty() {
+                self.day_list_state.select(Some(0));
+            }
+        } else if !self.day_list.is_empty() && self.day_list_state.selected().is_none() {
+            self.day_list_state.select(Some(0));
+        }
+
+        // Always update session list to reflect current data
+        self.update_session_list();
+    }
+
+    /// Update all derived data that affects display formatting
+    fn update_derived_data(&mut self) {
+        // Always update tool usage to reflect current totals
+        let mut tool_usage: Vec<ToolUsage> = self
+            .totals
+            .tools
+            .iter()
+            .map(|(name, count)| ToolUsage {
+                name: name.clone(),
+                count: *count,
+            })
+            .collect();
+        tool_usage.sort_unstable_by(|a, b| b.count.cmp(&a.count));
+        self.tool_usage = tool_usage;
+
+        // Update model list state if needed
+        if !self.model_usage.is_empty() && self.model_list_state.selected().is_none() {
+            self.model_list_state.select(Some(0));
+            self.selected_model_index = Some(0);
+        }
+
+        // Always recalculate cached values that depend on current data
+        self.precompute_day_strings();
+        self.recompute_max_cost_width();
+
+        self.cached_session_items.clear();
+        self.cached_session_width = 0;
+        self.cached_day_items.clear();
+        self.cached_day_width = 0;
+        self.cached_model_items.clear();
+        self.cached_model_width = 0;
+    }
+
+    /// Refresh the currently open modal with latest data
+    fn refresh_open_modal(&mut self, session_id: &str) {
+        if self.stats_cache.is_some() {
+            let current_day = self.selected_day();
+            let ck = cache_key(session_id, current_day.as_deref());
+            let files = self.session_message_files.get(session_id);
+
+            if let Some(f) = files {
+                let vec: Vec<PathBuf> = f.iter().cloned().collect();
+                let (msgs, _max_ts) =
+                    load_session_chat_with_max_ts(session_id, Some(&vec), current_day.as_deref());
+
+                // If the number of messages increased, only update what's needed
+                let total_lines: u16 = msgs
+                    .iter()
+                    .map(calculate_message_rendered_lines)
+                    .sum::<u16>()
+                    + msgs.len().saturating_sub(1) as u16;
+                let messages_arc = Arc::new(msgs);
+
+                self.chat_cache.insert(
+                    ck.clone(),
+                    CachedChat {
+                        messages: Arc::clone(&messages_arc),
+                        total_lines,
+                    },
+                );
+                self.modal.chat_messages = messages_arc;
+            }
+
+            if let Some(session) = self.session_list.iter().find(|s| &*s.id == session_id) {
+                self.modal.current_session = Some((**session).clone());
+                let files_vec: Vec<PathBuf> = self
+                    .session_message_files
+                    .get(session_id)
+                    .map(|v| v.iter().cloned().collect())
+                    .unwrap_or_default();
+                let details = crate::stats::load_session_details(
+                    session_id,
+                    Some(&files_vec),
+                    current_day.as_deref(),
+                );
+                self.modal.session_details = Some(details);
+            }
+        }
+    }
+
+    /// Invalidate chat cache for affected sessions
+    fn invalidate_affected_chat_cache(&mut self, affected_sessions: &FxHashSet<String>) {
+        self.chat_cache.retain(|key, _| {
+            let session_id = key.split_once('|').map(|(s, _)| s).unwrap_or(key);
+            !affected_sessions.contains(session_id)
+        });
+        self.chat_cache_order
+            .retain(|key| self.chat_cache.contains_key(key));
+    }
+
     pub fn run(&mut self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
-        // Render immediately on startup
         self.should_redraw = true;
+        let size = terminal.size()?;
+        self.terminal_size = Rect::new(0, 0, size.width, size.height);
 
         while !self.exit {
-            // Wait for events with a timeout
-            // This parks the thread and keeps it responsive to OS signals and new input
-            if event::poll(std::time::Duration::from_millis(250))? {
-                // DRAIN ALL EVENTS first to ensure keyboard input (like 'q') is handled immediately
+            // Short poll: 30ms keeps UI responsive while saving CPU.
+            // The wake channel from the file watcher will also wake us.
+            if event::poll(std::time::Duration::from_millis(30))? {
                 while event::poll(std::time::Duration::from_millis(0))? {
                     match event::read()? {
                         Event::Key(key) => {
                             if key.kind == KeyEventKind::Press {
-                                self.handle_key_event(key, terminal.size()?.height)?;
+                                self.handle_key_event(key, self.terminal_size.height)?;
                                 self.should_redraw = true;
                                 if self.exit {
                                     return Ok(());
                                 }
                             }
                         }
-                        Event::Resize(_, _) => {
+                        Event::Resize(w, h) => {
+                            self.terminal_size = Rect::new(0, 0, w, h);
                             self.should_redraw = true;
                         }
                         Event::Mouse(mouse) => {
-                            let size = terminal.size()?;
-                            let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-
                             if self.modal.open {
-                                if self.modal.handle_mouse_event(mouse, area) {
+                                if self.modal.handle_mouse_event(mouse, self.terminal_size) {
                                     self.chat_scroll = self.modal.chat_scroll;
                                     self.should_redraw = true;
                                 }
-                            } else if self.handle_mouse_event(mouse, area) {
+                            } else if self.handle_mouse_event(mouse, self.terminal_size) {
                                 self.should_redraw = true;
                             }
                         }
@@ -1039,13 +1023,15 @@ impl App {
                 }
             }
 
-            // Check for live updates regardless of user input
-            // This ensures background file changes are processed even if the user is idle
+            // Drain wake signals from file watcher (non-blocking)
+            while self.wake_rx.try_recv().is_ok() {}
+
+            // Process coalesced file changes
             if let Some(watcher) = &self.live_watcher {
                 watcher.process_changes();
             }
 
-            // Check if refresh is needed from files collected by watcher
+            // Apply pending refresh with minimal throttle (30ms)
             {
                 let mut lock = self.needs_refresh.lock();
                 if !lock.is_empty() {
@@ -1056,17 +1042,17 @@ impl App {
             let should_refresh = !self.pending_refresh_paths.is_empty()
                 && self
                     .last_refresh
-                    .map(|t| t.elapsed() >= std::time::Duration::from_millis(100))
+                    .map(|t| t.elapsed() >= std::time::Duration::from_millis(30))
                     .unwrap_or(true);
 
             if should_refresh {
                 let paths = std::mem::take(&mut self.pending_refresh_paths);
                 self.refresh_stats(paths);
                 self.last_refresh = Some(std::time::Instant::now());
-                self.should_redraw = true;
+                // should_redraw is now set in refresh_stats method itself
             }
 
-            // Draw only if needed
+            // Ensure we always redraw if needed, including after window resize
             if self.should_redraw {
                 terminal.draw(|frame| self.render(frame))?;
                 self.should_redraw = false;
@@ -1302,7 +1288,7 @@ impl App {
                             for _ in 0..10 {
                                 self.day_previous();
                             }
-                            self.update_session_list();
+                            // update_session_list is called by day_previous()
                         }
                         LeftPanel::Models => {
                             for _ in 0..10 {
@@ -1338,7 +1324,7 @@ impl App {
                             for _ in 0..10 {
                                 self.day_next();
                             }
-                            self.update_session_list();
+                            // update_session_list is called by day_next()
                         }
                         LeftPanel::Models => {
                             for _ in 0..10 {
@@ -1369,6 +1355,7 @@ impl App {
                         LeftPanel::Days => {
                             self.day_list_state.select(Some(0));
                             self.update_session_list();
+                            self.should_redraw = true;
                         }
                         LeftPanel::Models => {
                             self.model_list_state.select(Some(0));
@@ -1404,6 +1391,7 @@ impl App {
                             if !self.day_list.is_empty() {
                                 self.day_list_state.select(Some(self.day_list.len() - 1));
                                 self.update_session_list();
+                                self.should_redraw = true;
                             }
                         }
                         LeftPanel::Models => {
@@ -1891,11 +1879,19 @@ impl App {
             .constraints([Constraint::Length(2), Constraint::Length(2)])
             .split(cols[0]);
         frame.render_widget(
-            stat_widget("Sessions", format!("{}", self.totals.sessions.len()), Color::Cyan),
+            stat_widget(
+                "Sessions",
+                format!("{}", self.totals.sessions.len()),
+                Color::Cyan,
+            ),
             c1[0],
         );
         frame.render_widget(
-            stat_widget("Cost", format!("${:.2}", self.totals.display_cost()), Color::Yellow),
+            stat_widget(
+                "Cost",
+                format!("${:.2}", self.totals.display_cost()),
+                Color::Yellow,
+            ),
             c1[1],
         );
 
@@ -1905,11 +1901,19 @@ impl App {
             .constraints([Constraint::Length(2), Constraint::Length(2)])
             .split(cols[2]);
         frame.render_widget(
-            stat_widget("Input", format_number(self.totals.tokens.input), Color::Blue),
+            stat_widget(
+                "Input",
+                format_number(self.totals.tokens.input),
+                Color::Blue,
+            ),
             c2[0],
         );
         frame.render_widget(
-            stat_widget("Output", format_number(self.totals.tokens.output), Color::Magenta),
+            stat_widget(
+                "Output",
+                format_number(self.totals.tokens.output),
+                Color::Magenta,
+            ),
             c2[1],
         );
 
@@ -1919,11 +1923,19 @@ impl App {
             .constraints([Constraint::Length(2), Constraint::Length(2)])
             .split(cols[3]);
         frame.render_widget(
-            stat_widget("Thinking", format_number(self.totals.tokens.reasoning), Color::Rgb(255, 165, 0)),
+            stat_widget(
+                "Thinking",
+                format_number(self.totals.tokens.reasoning),
+                Color::Rgb(255, 165, 0),
+            ),
             c3[0],
         );
         frame.render_widget(
-            stat_widget("Cache", format_number(self.totals.tokens.cache_read + self.totals.tokens.cache_write), Color::Yellow),
+            stat_widget(
+                "Cache",
+                format_number(self.totals.tokens.cache_read + self.totals.tokens.cache_write),
+                Color::Yellow,
+            ),
             c3[1],
         );
 
@@ -1941,7 +1953,9 @@ impl App {
             Line::from(vec![
                 Span::styled(
                     format!("+{}", format_number(self.totals.diffs.additions)),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" / ", Style::default().fg(Color::Rgb(100, 100, 120))),
                 Span::styled(
@@ -1961,12 +1975,16 @@ impl App {
             Line::from(vec![
                 Span::styled(
                     format!("{}", self.totals.prompts),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(" / ", Style::default().fg(Color::Rgb(100, 100, 120))),
                 Span::styled(
                     format!("{}", total_responses),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]),
         ])
@@ -1982,51 +2000,9 @@ impl App {
         is_highlighted: bool,
         is_active: bool,
     ) {
-        // Pre-allocate Vec with capacity to avoid reallocations
-        let mut items = Vec::with_capacity(self.day_list.len());
-        let cost_width = self.max_cost_width();
-        let sess_width = 4usize;
-        let fixed_width = 3 + 7 + 4 + 7 + 4 + 3 + (cost_width + 1) + 3 + (sess_width + 5);
         let inner_width = area.width.saturating_sub(2);
-        let available =
-            inner_width.saturating_sub((fixed_width + 2).min(u16::MAX as usize) as u16) as usize;
-        let name_width = available.max(8);
-
-        for day in &self.day_list {
-            // Optimized: single HashMap lookup instead of multiple map calls
-            let (sess, input, output, cost) = if let Some(stat) = self.per_day.get(day) {
-                (
-                    stat.sessions.len(),
-                    stat.tokens.input,
-                    stat.tokens.output,
-                    stat.display_cost(),
-                )
-            } else {
-                (0, 0, 0, 0.0)
-            };
-
-            let _in_val = format_number(input);
-            let _out_val = format_number(output);
-
-            // Use cached day string (Phase 2 optimization - avoids date parsing on every render)
-            let day_with_name = self
-                .cached_day_strings
-                .get(day)
-                .cloned()
-                .unwrap_or_else(|| day.clone());
-
-            items.push(ListItem::new(usage_list_row(
-                day_with_name,
-                input,
-                output,
-                cost,
-                sess,
-                &UsageRowFormat {
-                    name_width,
-                    cost_width,
-                    sess_width,
-                },
-            )));
+        if self.cached_day_items.is_empty() || self.cached_day_width != inner_width {
+            self.rebuild_day_list_cache(inner_width);
         }
 
         let title_color = if is_highlighted {
@@ -2034,7 +2010,7 @@ impl App {
         } else {
             Color::DarkGray
         };
-        let list = List::new(items)
+        let list = List::new(self.cached_day_items.clone())
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -2077,6 +2053,51 @@ impl App {
         frame.render_stateful_widget(list, area, &mut self.day_list_state);
     }
 
+    fn rebuild_day_list_cache(&mut self, width: u16) {
+        self.cached_day_width = width;
+        let cost_width = self.max_cost_width();
+        let sess_width = 4usize;
+        let fixed_width = 3 + 7 + 4 + 7 + 4 + 3 + (cost_width + 1) + 3 + (sess_width + 5);
+        let available =
+            width.saturating_sub((fixed_width + 2).min(u16::MAX as usize) as u16) as usize;
+        let name_width = available.max(8);
+
+        self.cached_day_items = self.day_list
+                .iter()
+                .map(|day| {
+                    let (sess, input, output, cost) = if let Some(stat) = self.per_day.get(day) {
+                        (
+                            stat.sessions.len(),
+                            stat.tokens.input,
+                            stat.tokens.output,
+                            stat.display_cost(),
+                        )
+                    } else {
+                        (0, 0, 0, 0.0)
+                    };
+
+                    let day_with_name = self
+                        .cached_day_strings
+                        .get(day)
+                        .cloned()
+                        .unwrap_or_else(|| day.clone());
+
+                    ListItem::new(usage_list_row(
+                        day_with_name,
+                        input,
+                        output,
+                        cost,
+                        sess,
+                        &UsageRowFormat {
+                            name_width,
+                            cost_width,
+                            sess_width,
+                        },
+                    ))
+                })
+                .collect();
+    }
+
     fn render_model_list(
         &mut self,
         frame: &mut Frame,
@@ -2085,31 +2106,9 @@ impl App {
         is_highlighted: bool,
         is_active: bool,
     ) {
-        // Pre-allocate Vec with capacity to avoid reallocations
-        let mut items = Vec::with_capacity(self.model_usage.len());
-        let cost_width = self.max_cost_width();
-        let sess_width = 4usize;
-        let fixed_width = 3 + 7 + 4 + 7 + 4 + 3 + (cost_width + 1) + 3 + (sess_width + 5);
         let inner_width = area.width.saturating_sub(2);
-        let available =
-            inner_width.saturating_sub((fixed_width + 2).min(u16::MAX as usize) as u16) as usize;
-        let name_width = available.max(8);
-
-        for m in &self.model_usage {
-            // Show full model name with provider (e.g., "prox/glm-4.7")
-            let full_name = m.name.to_string();
-            items.push(ListItem::new(usage_list_row(
-                full_name,
-                m.tokens.input,
-                m.tokens.output,
-                m.cost,
-                m.sessions.len(),
-                &UsageRowFormat {
-                    name_width,
-                    cost_width,
-                    sess_width,
-                },
-            )));
+        if self.cached_model_items.is_empty() || self.cached_model_width != inner_width {
+            self.rebuild_model_list_cache(inner_width);
         }
 
         let title_color = if is_highlighted {
@@ -2117,7 +2116,7 @@ impl App {
         } else {
             Color::DarkGray
         };
-        let list = List::new(items)
+        let list = List::new(self.cached_model_items.clone())
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -2158,6 +2157,35 @@ impl App {
             .highlight_spacing(HighlightSpacing::Always);
 
         frame.render_stateful_widget(list, area, &mut self.model_list_state);
+    }
+
+    fn rebuild_model_list_cache(&mut self, width: u16) {
+        self.cached_model_width = width;
+        let cost_width = self.max_cost_width();
+        let sess_width = 4usize;
+        let fixed_width = 3 + 7 + 4 + 7 + 4 + 3 + (cost_width + 1) + 3 + (sess_width + 5);
+        let available =
+            width.saturating_sub((fixed_width + 2).min(u16::MAX as usize) as u16) as usize;
+        let name_width = available.max(8);
+
+        self.cached_model_items = self.model_usage
+                .iter()
+                .map(|m| {
+                    let full_name = m.name.to_string();
+                    ListItem::new(usage_list_row(
+                        full_name,
+                        m.tokens.input,
+                        m.tokens.output,
+                        m.cost,
+                        m.sessions.len(),
+                        &UsageRowFormat {
+                            name_width,
+                            cost_width,
+                            sess_width,
+                        },
+                    ))
+                })
+                .collect();
     }
 
     fn render_right_panel(&mut self, frame: &mut Frame, area: Rect) {
@@ -2373,7 +2401,7 @@ impl App {
                         .fg(if info_focused {
                             Color::Cyan
                         } else {
-                            Color::Yellow
+                            Color::DarkGray
                         })
                         .add_modifier(Modifier::BOLD),
                 ))
@@ -2421,7 +2449,8 @@ impl App {
                 truncate_with_ellipsis(text, avail.max(1))
             };
 
-            let non_cache = (model.tokens.input + model.tokens.output + model.tokens.reasoning).max(1) as f64;
+            let non_cache =
+                (model.tokens.input + model.tokens.output + model.tokens.reasoning).max(1) as f64;
             let est_cost = model.cost + (model.tokens.cache_read as f64 * model.cost / non_cache);
             let savings = est_cost - model.cost;
 
@@ -2458,7 +2487,11 @@ impl App {
                     Span::styled(
                         format!("${:.2}", savings),
                         Style::default()
-                            .fg(if savings > 0.0 { Color::Green } else { Color::DarkGray })
+                            .fg(if savings > 0.0 {
+                                Color::Green
+                            } else {
+                                Color::DarkGray
+                            })
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]),
@@ -2583,7 +2616,7 @@ impl App {
                         .fg(if tools_focused {
                             Color::Cyan
                         } else {
-                            Color::Yellow
+                            Color::DarkGray
                         })
                         .add_modifier(Modifier::BOLD),
                 ))
@@ -2656,7 +2689,7 @@ impl App {
                         .fg(if ranking_focused {
                             Color::Cyan
                         } else {
-                            Color::Yellow
+                            Color::DarkGray
                         })
                         .add_modifier(Modifier::BOLD),
                 ))
@@ -2805,7 +2838,7 @@ impl App {
                         .fg(if is_highlighted {
                             Color::Cyan
                         } else {
-                            Color::Yellow
+                            Color::DarkGray
                         })
                         .add_modifier(Modifier::BOLD),
                 ))
@@ -2886,7 +2919,11 @@ impl App {
                 Span::styled("Last Active  ", label_style),
                 Span::styled(
                     chrono::DateTime::from_timestamp(s.last_activity / 1000, 0)
-                        .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+                        .map(|t| {
+                            t.with_timezone(&chrono::Local)
+                                .format("%H:%M:%S")
+                                .to_string()
+                        })
                         .unwrap_or_else(|| "n/a".to_string()),
                     Style::default().fg(Color::DarkGray),
                 ),
@@ -2905,7 +2942,6 @@ impl App {
             models.sort();
             let model_val_width = left_val_width;
 
-
             if models.is_empty() {
                 left_lines.push(Line::from(vec![
                     Span::styled("Models       ", label_style),
@@ -2913,7 +2949,11 @@ impl App {
                 ]));
             } else if models.len() <= 3 {
                 for (i, m) in models.iter().enumerate() {
-                    let prefix = if i == 0 { "Models       " } else { "             " };
+                    let prefix = if i == 0 {
+                        "Models       "
+                    } else {
+                        "             "
+                    };
                     left_lines.push(Line::from(vec![
                         Span::styled(prefix, label_style),
                         Span::styled(
@@ -2926,7 +2966,11 @@ impl App {
                 }
             } else {
                 for (i, m) in models.iter().take(2).enumerate() {
-                    let prefix = if i == 0 { "Models       " } else { "             " };
+                    let prefix = if i == 0 {
+                        "Models       "
+                    } else {
+                        "             "
+                    };
                     left_lines.push(Line::from(vec![
                         Span::styled(prefix, label_style),
                         Span::styled(
@@ -3036,12 +3080,10 @@ impl App {
         let title_color = if is_highlighted {
             Color::Cyan
         } else {
-            Color::Yellow
+            Color::DarkGray
         };
 
-        let items: Vec<ListItem> = self.cached_session_items.clone();
-
-        let list = List::new(items)
+        let list = List::new(self.cached_session_items.clone())
             .block(
                 Block::default()
                     .borders(Borders::ALL)
