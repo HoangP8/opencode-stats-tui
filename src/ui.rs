@@ -1,7 +1,7 @@
 use crate::live_watcher::LiveWatcher;
 use crate::session::SessionModal;
 use crate::stats::{
-    format_duration_ms, format_number, format_number_full, load_session_chat_with_max_ts,
+    format_active_duration, format_number, format_number_full, load_session_chat_with_max_ts,
     ChatMessage, DayStat, MessageContent, ModelUsage, ToolUsage, Totals,
 };
 use crate::stats_cache::StatsCache;
@@ -111,6 +111,8 @@ pub struct App {
     per_day: FxHashMap<String, DayStat>,
     session_titles: FxHashMap<Box<str>, String>,
     session_message_files: FxHashMap<String, FxHashSet<PathBuf>>,
+    parent_map: FxHashMap<Box<str>, Box<str>>,
+    children_map: FxHashMap<Box<str>, Vec<Box<str>>>,
     day_list: Vec<String>,
     day_list_state: ListState,
     session_list: Vec<Arc<crate::stats::SessionStat>>,
@@ -325,26 +327,37 @@ impl App {
         let stats_cache = StatsCache::new(storage_path.clone()).ok();
         log::info!("Initialized stats cache for: {}", storage_path.display());
 
-        let (totals, per_day, session_titles, model_usage, session_message_files) =
-            if let Some(cache) = &stats_cache {
-                let s = cache.load_or_compute();
-                (
-                    s.totals,
-                    s.per_day,
-                    s.session_titles,
-                    s.model_usage,
-                    s.session_message_files,
-                )
-            } else {
-                let s = crate::stats::collect_stats();
-                (
-                    s.totals,
-                    s.per_day,
-                    s.session_titles,
-                    s.model_usage,
-                    s.session_message_files,
-                )
-            };
+        let (
+            totals,
+            per_day,
+            session_titles,
+            model_usage,
+            session_message_files,
+            parent_map,
+            children_map,
+        ) = if let Some(cache) = &stats_cache {
+            let s = cache.load_or_compute();
+            (
+                s.totals,
+                s.per_day,
+                s.session_titles,
+                s.model_usage,
+                s.session_message_files,
+                s.parent_map,
+                s.children_map,
+            )
+        } else {
+            let s = crate::stats::collect_stats();
+            (
+                s.totals,
+                s.per_day,
+                s.session_titles,
+                s.model_usage,
+                s.session_message_files,
+                s.parent_map,
+                s.children_map,
+            )
+        };
 
         // Set up live watcher with channel-based wake for instant updates
         let needs_refresh = Arc::new(Mutex::new(Vec::new()));
@@ -395,6 +408,8 @@ impl App {
             per_day,
             session_titles,
             session_message_files,
+            parent_map,
+            children_map,
             day_list,
             day_list_state,
             session_list: Vec::new(),
@@ -557,67 +572,68 @@ impl App {
         let title_width =
             width.saturating_sub((fixed_width).min(u16::MAX as usize) as u16) as usize;
 
-        self.cached_session_items = self.session_list
-                .iter()
-                .map(|s| {
-                    // No [Continued] badge - continuation info shown in panel title above
-                    let title = self
-                        .session_titles
-                        .get(&s.id)
-                        .map(|t| t.strip_prefix("New session - ").unwrap_or(t).to_string())
-                        .unwrap_or_else(|| s.id.chars().take(14).collect());
+        self.cached_session_items = self
+            .session_list
+            .iter()
+            .map(|s| {
+                // No [Continued] badge - continuation info shown in panel title above
+                let title = self
+                    .session_titles
+                    .get(&s.id)
+                    .map(|t| t.strip_prefix("New session - ").unwrap_or(t).to_string())
+                    .unwrap_or_else(|| s.id.chars().take(14).collect());
 
-                    let model_count = s.models.len();
-                    let model_text = if model_count == 1 {
-                        "1 model".into()
-                    } else {
-                        format!("{} models", model_count)
-                    };
-                    let model_text = format!("{:>width$}", model_text, width = max_models_len);
-                    let additions = s.diffs.additions;
-                    let deletions = s.diffs.deletions;
+                let model_count = s.models.len();
+                let model_text = if model_count == 1 {
+                    "1 model".into()
+                } else {
+                    format!("{} models", model_count)
+                };
+                let model_text = format!("{:>width$}", model_text, width = max_models_len);
+                let additions = s.diffs.additions;
+                let deletions = s.diffs.deletions;
 
-                    // Gray title for continued sessions to highlight them
-                    let title_color = if s.is_continuation {
-                        Color::Rgb(150, 150, 150)
-                    } else {
-                        Color::White
-                    };
+                // Gray title for continued sessions to highlight them
+                let title_color = if s.is_continuation {
+                    Color::Rgb(150, 150, 150)
+                } else {
+                    Color::White
+                };
 
-                    ListItem::new(Line::from(vec![
-                        Span::styled(
-                            format!(
-                                "{:<width$}",
-                                title.chars().take(title_width.max(8)).collect::<String>(),
-                                width = title_width.max(8)
-                            ),
-                            Style::default().fg(title_color),
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!(
+                            "{:<width$}",
+                            title.chars().take(title_width.max(8)).collect::<String>(),
+                            width = title_width.max(8)
                         ),
-                        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
-                        Span::styled(
-                            format!("{}{:>7}", "+", format_number(additions)),
-                            Style::default().fg(Color::Green),
-                        ),
-                        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
-                        Span::styled(
-                            format!("{}{:>7}", "-", format_number(deletions)),
-                            Style::default().fg(Color::Red),
-                        ),
-                        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
-                        Span::styled(
-                            format!("${:>width$.2}", s.display_cost(), width = max_cost_len),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
-                        Span::styled(
-                            format!("{:>4} msg", s.messages),
-                            Style::default().fg(Color::Cyan),
-                        ),
-                        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
-                        Span::styled(model_text, Style::default().fg(Color::Magenta)),
-                    ]))
-                })
-                .collect();
+                        Style::default().fg(title_color),
+                    ),
+                    Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled(
+                        format!("{}{:>7}", "+", format_number(additions)),
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled(
+                        format!("{}{:>7}", "-", format_number(deletions)),
+                        Style::default().fg(Color::Red),
+                    ),
+                    Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled(
+                        format!("${:>width$.2}", s.display_cost(), width = max_cost_len),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled(
+                        format!("{:>4} msg", s.messages),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+                    Span::styled(model_text, Style::default().fg(Color::Magenta)),
+                ]))
+            })
+            .collect();
     }
 
     /// Precompute formatted day strings with weekday names (Phase 2 optimization)
@@ -638,12 +654,48 @@ impl App {
                     chrono::Weekday::Sat => "Sat",
                     chrono::Weekday::Sun => "Sun",
                 };
-                let formatted = format!("{} ({})", day, day_abbr);
+                let month_abbr = match parsed.month() {
+                    1 => "Jan",
+                    2 => "Feb",
+                    3 => "Mar",
+                    4 => "Apr",
+                    5 => "May",
+                    6 => "Jun",
+                    7 => "Jul",
+                    8 => "Aug",
+                    9 => "Sep",
+                    10 => "Oct",
+                    11 => "Nov",
+                    _ => "Dec",
+                };
+                let formatted = format!(
+                    "{} {:02}, {} {}",
+                    month_abbr,
+                    parsed.day(),
+                    parsed.year(),
+                    day_abbr
+                );
                 self.cached_day_strings.insert(day.clone(), formatted);
             } else {
                 self.cached_day_strings.insert(day.clone(), day.clone());
             }
         }
+    }
+
+    fn combined_session_files(&self, session_id: &str) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = self
+            .session_message_files
+            .get(session_id)
+            .map(|v| v.iter().cloned().collect())
+            .unwrap_or_default();
+        if let Some(child_ids) = self.children_map.get(session_id) {
+            for child_id in child_ids {
+                if let Some(child_files) = self.session_message_files.get(child_id.as_ref()) {
+                    files.extend(child_files.iter().cloned());
+                }
+            }
+        }
+        files
     }
 
     fn open_session_modal(&mut self, area_height: u16) {
@@ -676,11 +728,7 @@ impl App {
             }
             self.chat_cache_order.push(cache_key.clone());
 
-            let files_vec: Vec<PathBuf> = self
-                .session_message_files
-                .get(&session_id_str)
-                .map(|v| v.iter().cloned().collect())
-                .unwrap_or_default();
+            let files_vec = self.combined_session_files(&session_id_str);
 
             // Open modal with cached messages (Arc clone, no deep copy)
             self.modal.open_session(
@@ -692,17 +740,35 @@ impl App {
             );
             cached.total_lines
         } else {
-            let files_vec: Vec<PathBuf> = self
-                .session_message_files
-                .get(&session_id_str)
-                .map(|v| v.iter().cloned().collect())
-                .unwrap_or_default();
+            let files_vec = self.combined_session_files(&session_id_str);
             // Pass current day to filter messages to only show this day's messages
-            let (messages, _max_ts) = load_session_chat_with_max_ts(
-                &session_id_str,
-                Some(&files_vec),
-                current_day.as_deref(),
-            );
+            let messages = if let Some(child_ids) = self.children_map.get(session_id.as_ref()) {
+                let children: Vec<(Box<str>, Box<str>)> = child_ids
+                    .iter()
+                    .map(|cid| {
+                        let agent_name = self
+                            .session_titles
+                            .get(cid)
+                            .map(|t| crate::stats::extract_agent_name(t))
+                            .unwrap_or_else(|| "subagent".into());
+                        (cid.clone(), agent_name)
+                    })
+                    .collect();
+                let (msgs, _max_ts) = crate::stats::load_combined_session_chat(
+                    &session_id_str,
+                    &children,
+                    &self.session_message_files,
+                    current_day.as_deref(),
+                );
+                msgs
+            } else {
+                let (msgs, _max_ts) = load_session_chat_with_max_ts(
+                    &session_id_str,
+                    Some(&files_vec),
+                    current_day.as_deref(),
+                );
+                msgs
+            };
             let total_lines: u16 = messages.iter().map(calculate_message_rendered_lines).sum();
             let blank_lines = if !messages.is_empty() {
                 messages.len() - 1
@@ -812,31 +878,42 @@ impl App {
             let is_full_refresh = changed_files.is_empty();
             let mut affected_sessions = FxHashSet::default();
 
-            let (totals, per_day, session_titles, model_usage, session_message_files) =
-                if is_full_refresh {
-                    let s = cache.load_or_compute();
-                    (
-                        s.totals,
-                        s.per_day,
-                        s.session_titles,
-                        s.model_usage,
-                        s.session_message_files,
-                    )
-                } else {
-                    let files: Vec<String> = changed_files
-                        .iter()
-                        .filter_map(|p| p.to_str().map(ToString::to_string))
-                        .collect();
-                    let update = cache.update_files(files);
-                    affected_sessions = update.affected_sessions;
-                    (
-                        update.totals,
-                        update.per_day,
-                        update.session_titles,
-                        update.model_usage,
-                        update.session_message_files,
-                    )
-                };
+            let (
+                totals,
+                per_day,
+                session_titles,
+                model_usage,
+                session_message_files,
+                parent_map,
+                children_map,
+            ) = if is_full_refresh {
+                let s = cache.load_or_compute();
+                (
+                    s.totals,
+                    s.per_day,
+                    s.session_titles,
+                    s.model_usage,
+                    s.session_message_files,
+                    s.parent_map,
+                    s.children_map,
+                )
+            } else {
+                let files: Vec<String> = changed_files
+                    .iter()
+                    .filter_map(|p| p.to_str().map(ToString::to_string))
+                    .collect();
+                let update = cache.update_files(files);
+                affected_sessions = update.affected_sessions;
+                (
+                    update.totals,
+                    update.per_day,
+                    update.session_titles,
+                    update.model_usage,
+                    update.session_message_files,
+                    update.parent_map,
+                    update.children_map,
+                )
+            };
 
             // Update all stats
             self.totals = totals;
@@ -844,6 +921,8 @@ impl App {
             self.session_titles = session_titles;
             self.model_usage = model_usage;
             self.session_message_files = session_message_files;
+            self.parent_map = parent_map;
+            self.children_map = children_map;
 
             // Always rebuild day list and sessions for consistency
             self.rebuild_day_and_session_lists(is_full_refresh);
@@ -936,8 +1015,33 @@ impl App {
 
             if let Some(f) = files {
                 let vec: Vec<PathBuf> = f.iter().cloned().collect();
-                let (msgs, _max_ts) =
-                    load_session_chat_with_max_ts(session_id, Some(&vec), current_day.as_deref());
+                let msgs = if let Some(child_ids) = self.children_map.get(session_id) {
+                    let children: Vec<(Box<str>, Box<str>)> = child_ids
+                        .iter()
+                        .map(|cid| {
+                            let agent_name = self
+                                .session_titles
+                                .get(cid)
+                                .map(|t| crate::stats::extract_agent_name(t))
+                                .unwrap_or_else(|| "subagent".into());
+                            (cid.clone(), agent_name)
+                        })
+                        .collect();
+                    let (msgs, _) = crate::stats::load_combined_session_chat(
+                        session_id,
+                        &children,
+                        &self.session_message_files,
+                        current_day.as_deref(),
+                    );
+                    msgs
+                } else {
+                    let (msgs, _) = load_session_chat_with_max_ts(
+                        session_id,
+                        Some(&vec),
+                        current_day.as_deref(),
+                    );
+                    msgs
+                };
 
                 // If the number of messages increased, only update what's needed
                 let total_lines: u16 = msgs
@@ -959,11 +1063,8 @@ impl App {
 
             if let Some(session) = self.session_list.iter().find(|s| &*s.id == session_id) {
                 self.modal.current_session = Some((**session).clone());
-                let files_vec: Vec<PathBuf> = self
-                    .session_message_files
-                    .get(session_id)
-                    .map(|v| v.iter().cloned().collect())
-                    .unwrap_or_default();
+                let files_vec = self.combined_session_files(session_id);
+                let current_day = self.selected_day();
                 let details = crate::stats::load_session_details(
                     session_id,
                     Some(&files_vec),
@@ -2062,40 +2163,61 @@ impl App {
             width.saturating_sub((fixed_width + 2).min(u16::MAX as usize) as u16) as usize;
         let name_width = available.max(8);
 
-        self.cached_day_items = self.day_list
-                .iter()
-                .map(|day| {
-                    let (sess, input, output, cost) = if let Some(stat) = self.per_day.get(day) {
+        self.cached_day_items = self
+            .day_list
+            .iter()
+            .map(|day| {
+                let (sess, input, output, cost, duration) =
+                    if let Some(stat) = self.per_day.get(day) {
+                        let dur: i64 = stat.sessions.values().map(|s| s.active_duration_ms).sum();
                         (
                             stat.sessions.len(),
                             stat.tokens.input,
                             stat.tokens.output,
                             stat.display_cost(),
+                            dur,
                         )
                     } else {
-                        (0, 0, 0, 0.0)
+                        (0, 0, 0, 0.0, 0)
                     };
 
-                    let day_with_name = self
-                        .cached_day_strings
-                        .get(day)
-                        .cloned()
-                        .unwrap_or_else(|| day.clone());
+                let day_with_name = self
+                    .cached_day_strings
+                    .get(day)
+                    .cloned()
+                    .unwrap_or_else(|| day.clone());
 
-                    ListItem::new(usage_list_row(
-                        day_with_name,
-                        input,
-                        output,
-                        cost,
-                        sess,
-                        &UsageRowFormat {
-                            name_width,
-                            cost_width,
-                            sess_width,
-                        },
-                    ))
-                })
-                .collect();
+                let total_secs = (duration / 1000) as u64;
+                let dur_str = if total_secs >= 3600 {
+                    let h = total_secs / 3600;
+                    let m = (total_secs % 3600) / 60;
+                    format!(" · {}h{}m", h, m)
+                } else if total_secs >= 60 {
+                    let m = total_secs / 60;
+                    let s = total_secs % 60;
+                    format!(" · {}m{}s", m, s)
+                } else if total_secs > 0 {
+                    format!(" · {}s", total_secs)
+                } else {
+                    String::new()
+                };
+
+                let name_with_dur = format!("{}{}", day_with_name, dur_str);
+
+                ListItem::new(usage_list_row(
+                    name_with_dur,
+                    input,
+                    output,
+                    cost,
+                    sess,
+                    &UsageRowFormat {
+                        name_width,
+                        cost_width,
+                        sess_width,
+                    },
+                ))
+            })
+            .collect();
     }
 
     fn render_model_list(
@@ -2168,24 +2290,25 @@ impl App {
             width.saturating_sub((fixed_width + 2).min(u16::MAX as usize) as u16) as usize;
         let name_width = available.max(8);
 
-        self.cached_model_items = self.model_usage
-                .iter()
-                .map(|m| {
-                    let full_name = m.name.to_string();
-                    ListItem::new(usage_list_row(
-                        full_name,
-                        m.tokens.input,
-                        m.tokens.output,
-                        m.cost,
-                        m.sessions.len(),
-                        &UsageRowFormat {
-                            name_width,
-                            cost_width,
-                            sess_width,
-                        },
-                    ))
-                })
-                .collect();
+        self.cached_model_items = self
+            .model_usage
+            .iter()
+            .map(|m| {
+                let full_name = m.name.to_string();
+                ListItem::new(usage_list_row(
+                    full_name,
+                    m.tokens.input,
+                    m.tokens.output,
+                    m.cost,
+                    m.sessions.len(),
+                    &UsageRowFormat {
+                        name_width,
+                        cost_width,
+                        sess_width,
+                    },
+                ))
+            })
+            .collect();
     }
 
     fn render_right_panel(&mut self, frame: &mut Frame, area: Rect) {
@@ -2230,8 +2353,6 @@ impl App {
                 );
 
                 let list_highlighted = is_focused && self.right_panel == RightPanel::List;
-                // Sessions panel should be highlighted when active or when left panel isDays
-                let list_active = list_highlighted && self.is_active;
                 self.render_session_list(
                     frame,
                     chunks[1],
@@ -2241,7 +2362,7 @@ impl App {
                         Style::default().fg(Color::DarkGray)
                     },
                     list_highlighted,
-                    list_active,
+                    self.is_active,
                 );
             }
             LeftPanel::Models => {
@@ -2932,11 +3053,61 @@ impl App {
             left_lines.push(Line::from(vec![
                 Span::styled("Duration     ", label_style),
                 Span::styled(
-                    format_duration_ms(s.first_activity, s.last_activity)
-                        .unwrap_or_else(|| "n/a".into()),
+                    format_active_duration(s.active_duration_ms),
                     Style::default().fg(Color::Rgb(100, 200, 255)),
                 ),
             ]));
+
+            // Agents row - inline comma-separated, truncate with +X if needed
+            if s.agents.is_empty() {
+                left_lines.push(Line::from(vec![
+                    Span::styled("Agents       ", label_style),
+                    Span::styled("n/a", Style::default().fg(Color::DarkGray)),
+                ]));
+            } else {
+                let mut agent_refs: Vec<(&str, bool, u64)> = s
+                    .agents
+                    .iter()
+                    .map(|a| (a.name.as_ref(), a.is_main, a.tokens.total()))
+                    .collect();
+                agent_refs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+                agent_refs.dedup_by(|a, b| a.0 == b.0);
+                let agent_names: Vec<&str> = agent_refs.iter().map(|(n, _, _)| *n).collect();
+                let avail = left_val_width;
+                let mut display = String::new();
+                let mut shown = 0usize;
+                for (i, name) in agent_names.iter().enumerate() {
+                    let candidate = if i == 0 {
+                        name.to_string()
+                    } else {
+                        format!(", {}", name)
+                    };
+                    let remaining = agent_names.len() - i;
+                    let plus_suffix = if remaining > 1 {
+                        format!(", +{}", remaining - 1)
+                    } else {
+                        String::new()
+                    };
+                    if display.len() + candidate.len() + plus_suffix.len() > avail && shown > 0 {
+                        display.push_str(&format!(", +{}", agent_names.len() - shown));
+                        break;
+                    }
+                    display.push_str(&candidate);
+                    shown += 1;
+                }
+                if shown == agent_names.len() && display.len() > avail {
+                    display = truncate_with_ellipsis(&display, avail);
+                }
+                left_lines.push(Line::from(vec![
+                    Span::styled("Agents       ", label_style),
+                    Span::styled(
+                        display,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
 
             let mut models: Vec<_> = s.models.iter().collect();
             models.sort();
@@ -2947,7 +3118,7 @@ impl App {
                     Span::styled("Models       ", label_style),
                     Span::styled("n/a", Style::default().fg(Color::DarkGray)),
                 ]));
-            } else if models.len() <= 3 {
+            } else if models.len() <= 2 {
                 for (i, m) in models.iter().enumerate() {
                     let prefix = if i == 0 {
                         "Models       "
@@ -2965,26 +3136,19 @@ impl App {
                     ]));
                 }
             } else {
-                for (i, m) in models.iter().take(2).enumerate() {
-                    let prefix = if i == 0 {
-                        "Models       "
-                    } else {
-                        "             "
-                    };
-                    left_lines.push(Line::from(vec![
-                        Span::styled(prefix, label_style),
-                        Span::styled(
-                            truncate_with_ellipsis(m, model_val_width),
-                            Style::default()
-                                .fg(Color::Magenta)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
-                }
+                left_lines.push(Line::from(vec![
+                    Span::styled("Models       ", label_style),
+                    Span::styled(
+                        truncate_with_ellipsis(models[0], model_val_width),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
                 left_lines.push(Line::from(vec![
                     Span::styled("             ", label_style),
                     Span::styled(
-                        format!("+{}", models.len() - 2),
+                        format!("+{}", models.len() - 1),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),

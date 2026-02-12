@@ -9,7 +9,7 @@ use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
 type SessionDiffs = FxHashMap<String, FxHashMap<String, crate::stats::FileDiff>>;
 type SessionSortedDays = FxHashMap<String, Vec<String>>;
 
-const CACHE_FORMAT_VERSION: u64 = 6;
+const CACHE_FORMAT_VERSION: u64 = 8;
 
 /// Metadata for file validation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,7 +35,11 @@ pub struct CachedStats {
     #[serde(default)]
     pub session_diff_totals: FxHashMap<String, (u64, u64)>,
     #[serde(default)]
-    pub message_contributions: FxHashMap<String, (f64, crate::stats::Tokens)>,
+    pub message_contributions: FxHashMap<String, (f64, crate::stats::Tokens, i64)>,
+    #[serde(default)]
+    pub parent_map: FxHashMap<Box<str>, Box<str>>,
+    #[serde(default)]
+    pub children_map: FxHashMap<Box<str>, Vec<Box<str>>>,
 }
 
 /// Lightweight snapshot returned from update_files to avoid a separate full clone.
@@ -46,6 +50,8 @@ pub struct StatsUpdate {
     pub session_titles: FxHashMap<Box<str>, String>,
     pub model_usage: Vec<crate::stats::ModelUsage>,
     pub session_message_files: FxHashMap<String, FxHashSet<PathBuf>>,
+    pub parent_map: FxHashMap<Box<str>, Box<str>>,
+    pub children_map: FxHashMap<Box<str>, Vec<Box<str>>>,
 }
 
 /// Incremental updater for stats
@@ -81,6 +87,8 @@ impl StatsCache {
                 session_diff_map: FxHashMap::default(),
                 session_diff_totals: FxHashMap::default(),
                 message_contributions: FxHashMap::default(),
+                parent_map: FxHashMap::default(),
+                children_map: FxHashMap::default(),
             })),
         })
     }
@@ -112,6 +120,8 @@ impl StatsCache {
                                 stats_lock
                                     .message_contributions
                                     .clone_from(&cached.message_contributions);
+                                stats_lock.parent_map.clone_from(&cached.parent_map);
+                                stats_lock.children_map.clone_from(&cached.children_map);
                                 return cached.stats.clone();
                             }
                         }
@@ -183,6 +193,8 @@ impl StatsCache {
             session_titles: stats_lock.stats.session_titles.clone(),
             model_usage: stats_lock.stats.model_usage.clone(),
             session_message_files: stats_lock.stats.session_message_files.clone(),
+            parent_map: stats_lock.stats.parent_map.clone(),
+            children_map: stats_lock.stats.children_map.clone(),
         }
     }
 
@@ -200,6 +212,8 @@ impl StatsCache {
         // Individual session files should be handled incrementally
         if has_session_json_root || has_deletion {
             cached.stats = crate::stats::collect_stats();
+            cached.parent_map = cached.stats.parent_map.clone();
+            cached.children_map = cached.stats.children_map.clone();
             // Invalidate file meta for deleted files
             for p in &paths {
                 if !std::path::Path::new(p).exists() {
@@ -273,6 +287,8 @@ impl StatsCache {
     fn update_cache(&self, stats: &crate::stats::Stats) {
         let mut cached = self.stats.write();
         cached.stats.clone_from(stats);
+        cached.parent_map = stats.parent_map.clone();
+        cached.children_map = stats.children_map.clone();
         cached.session_diff_map = crate::stats::load_session_diff_map();
         cached.session_diff_totals = cached
             .session_diff_map
@@ -354,11 +370,11 @@ impl StatsCache {
     ) -> (
         SessionDiffs,
         SessionSortedDays,
-        FxHashMap<String, (f64, crate::stats::Tokens)>,
+        FxHashMap<String, (f64, crate::stats::Tokens, i64)>,
     ) {
         let mut union: SessionDiffs = FxHashMap::default();
         let mut session_sorted_days: SessionSortedDays = FxHashMap::default();
-        let mut message_contributions: FxHashMap<String, (f64, crate::stats::Tokens)> =
+        let mut message_contributions: FxHashMap<String, (f64, crate::stats::Tokens, i64)> =
             FxHashMap::default();
         let mut processed_ids: FxHashSet<Box<str>> =
             FxHashSet::with_capacity_and_hasher(files.len(), Default::default());
@@ -428,7 +444,18 @@ impl StatsCache {
                 crate::stats::Tokens::default()
             };
 
-            message_contributions.insert(message_id.to_string(), (cost, tokens));
+            let mut duration = 0;
+            if msg.role.as_ref().map(|r| r.0.as_str()) == Some("assistant") {
+                if let Some(t) = &msg.time {
+                    if let (Some(created), Some(completed)) = (t.created, t.completed) {
+                        if *completed > *created {
+                            duration = *completed - *created;
+                        }
+                    }
+                }
+            }
+
+            message_contributions.insert(message_id.to_string(), (cost, tokens, duration));
 
             let diffs = Self::extract_cumulative_diffs(&msg);
             if diffs.is_empty() {
@@ -592,8 +619,22 @@ impl StatsCache {
         let model_id = crate::stats::get_model_id(&msg);
         let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
 
+        let agent_name: Box<str> = msg
+            .agent
+            .as_ref()
+            .filter(|a| !a.0.is_empty())
+            .map(|a| a.0.clone().into_boxed_str())
+            .unwrap_or_else(|| "unknown".into());
+
         let session_id_lenient = msg.session_id.clone().unwrap_or_default();
-        let session_id = session_id_lenient.0.clone();
+        let original_session_id = session_id_lenient.0.clone();
+        let original_boxed: Box<str> = original_session_id.clone().into_boxed_str();
+        let session_id = cached
+            .parent_map
+            .get(&original_boxed)
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| original_session_id.clone());
+        let is_subagent_msg = cached.parent_map.contains_key(&original_boxed);
 
         let tokens_add = if let Some(t) = &msg.tokens {
             crate::stats::Tokens {
@@ -617,11 +658,24 @@ impl StatsCache {
 
         let is_new_message = !cached.message_contributions.contains_key(&message_id_str);
 
+        let mut duration_add = 0;
+        if is_assistant {
+            if let Some(t) = &msg.time {
+                if let (Some(created), Some(completed)) = (t.created, t.completed) {
+                    if *completed > *created {
+                        duration_add = *completed - *created;
+                    }
+                }
+            }
+        }
+
         // Handle updates: if we already processed this message, subtract its old contribution
         if !is_new_message {
-            let (old_cost, old_tokens) = cached.message_contributions.get(&message_id_str).unwrap();
+            let (old_cost, old_tokens, old_duration) =
+                cached.message_contributions.get(&message_id_str).unwrap();
             let old_cost = *old_cost;
             let old_tokens = *old_tokens;
+            let old_duration = *old_duration;
             stats.totals.tokens.input = stats.totals.tokens.input.saturating_sub(old_tokens.input);
             stats.totals.tokens.output =
                 stats.totals.tokens.output.saturating_sub(old_tokens.output);
@@ -641,7 +695,6 @@ impl StatsCache {
                 .cache_write
                 .saturating_sub(old_tokens.cache_write);
             stats.totals.cost -= old_cost;
-            // Note: we don't subtract messages/prompts count because it's still 1 message
 
             if is_assistant {
                 if let Some(m) = stats.model_usage.iter_mut().find(|m| *m.name == *model_id) {
@@ -672,27 +725,42 @@ impl StatsCache {
                     s.tokens.cache_read = s.tokens.cache_read.saturating_sub(old_tokens.cache_read);
                     s.tokens.cache_write =
                         s.tokens.cache_write.saturating_sub(old_tokens.cache_write);
+                    s.active_duration_ms = s.active_duration_ms.saturating_sub(old_duration);
+
+                    if let Some(agent) = s.agents.iter_mut().find(|a| *a.name == *agent_name) {
+                        agent.tokens.input = agent.tokens.input.saturating_sub(old_tokens.input);
+                        agent.tokens.output = agent.tokens.output.saturating_sub(old_tokens.output);
+                        agent.tokens.reasoning =
+                            agent.tokens.reasoning.saturating_sub(old_tokens.reasoning);
+                        agent.tokens.cache_read = agent
+                            .tokens
+                            .cache_read
+                            .saturating_sub(old_tokens.cache_read);
+                        agent.tokens.cache_write = agent
+                            .tokens
+                            .cache_write
+                            .saturating_sub(old_tokens.cache_write);
+                        agent.active_duration_ms =
+                            agent.active_duration_ms.saturating_sub(old_duration);
+                    }
                 }
             }
         } else {
-            // New message
             stats.totals.messages += 1;
             if is_user {
                 stats.totals.prompts += 1;
             }
         }
 
-        // CRITICAL: Update message_contributions map to track cost and tokens for this message
-        // This enables proper handling of message updates without double-counting
         cached
             .message_contributions
-            .insert(message_id_str, (cost, tokens_add));
+            .insert(message_id_str, (cost, tokens_add, duration_add));
         stats.processed_message_ids.insert(message_id);
 
-        if !session_id.is_empty() {
+        if !original_session_id.is_empty() {
             stats
                 .session_message_files
-                .entry(session_id.clone())
+                .entry(original_session_id.clone())
                 .or_insert_with(|| FxHashSet::default())
                 .insert(PathBuf::from(path));
         }
@@ -702,10 +770,6 @@ impl StatsCache {
         stats.totals.tokens.reasoning += tokens_add.reasoning;
         stats.totals.tokens.cache_read += tokens_add.cache_read;
         stats.totals.tokens.cache_write += tokens_add.cache_write;
-        // stats.totals.messages += 1; // Handled above for updates
-        // if is_user {
-        //     stats.totals.prompts += 1;
-        // }
         stats.totals.cost += cost;
         stats
             .totals
@@ -724,6 +788,9 @@ impl StatsCache {
                 m.tokens.cache_read += tokens_add.cache_read;
                 m.tokens.cache_write += tokens_add.cache_write;
                 m.sessions.insert(session_id.clone().into_boxed_str());
+                if is_new_message {
+                    *m.agents.entry(agent_name.clone()).or_insert(0) += 1;
+                }
             } else {
                 let name_str: &str = &model_id;
                 let parts: Vec<&str> = name_str.split('/').collect();
@@ -732,6 +799,8 @@ impl StatsCache {
                 } else {
                     ("unknown", name_str)
                 };
+                let mut agents = HashMap::new();
+                agents.insert(agent_name.clone(), 1);
                 stats.model_usage.push(crate::stats::ModelUsage {
                     name: model_id.clone(),
                     short_name: n.into(),
@@ -741,23 +810,9 @@ impl StatsCache {
                     sessions: [session_id.clone().into_boxed_str()].into(),
                     tokens: tokens_add,
                     tools: HashMap::new(),
-                    agents: HashMap::new(),
+                    agents,
                     cost,
                 });
-            }
-            if is_new_message {
-                if let Some(agent) = msg
-                    .agent
-                    .as_ref()
-                    .map(|s| s.0.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    if let Some(m) = stats.model_usage.iter_mut().find(|m| *m.name == *model_id) {
-                        *m.agents
-                            .entry(agent.to_string().into_boxed_str())
-                            .or_insert(0) += 1;
-                    }
-                }
             }
         }
 
@@ -789,6 +844,7 @@ impl StatsCache {
                 }
             }
             s.cost += cost;
+            s.active_duration_ms += duration_add;
 
             if is_assistant {
                 s.models.insert(model_id.clone());
@@ -819,6 +875,49 @@ impl StatsCache {
                 }
                 if let Some(root) = &p.root {
                     s.path_root = root.clone().into();
+                }
+            }
+
+            {
+                let agent_entry = s.agents.iter_mut().find(|a| *a.name == *agent_name);
+                if let Some(agent) = agent_entry {
+                    if is_new_message {
+                        agent.messages += 1;
+                    }
+                    agent.tokens.input += tokens_add.input;
+                    agent.tokens.output += tokens_add.output;
+                    agent.tokens.reasoning += tokens_add.reasoning;
+                    agent.tokens.cache_read += tokens_add.cache_read;
+                    agent.tokens.cache_write += tokens_add.cache_write;
+                    if is_assistant {
+                        agent.models.insert(model_id.clone());
+                    }
+                    if let Some(t) = ts {
+                        if t < agent.first_activity {
+                            agent.first_activity = t;
+                        }
+                    }
+                    if let Some(t) = end_ts {
+                        if t > agent.last_activity {
+                            agent.last_activity = t;
+                        }
+                    }
+                    agent.active_duration_ms += duration_add;
+                } else if is_new_message {
+                    let mut models = fxhash::FxHashSet::default();
+                    if is_assistant {
+                        models.insert(model_id.clone());
+                    }
+                    s.agents.push(crate::stats::AgentInfo {
+                        name: agent_name.clone(),
+                        is_main: !is_subagent_msg,
+                        models,
+                        messages: 1,
+                        tokens: tokens_add,
+                        first_activity: ts.unwrap_or(i64::MAX),
+                        last_activity: end_ts.unwrap_or(0),
+                        active_duration_ms: duration_add,
+                    });
                 }
             }
         }
@@ -1060,6 +1159,8 @@ impl StatsCache {
         struct SessionData {
             id: Option<crate::stats::LenientString>,
             title: Option<crate::stats::LenientString>,
+            #[serde(rename = "parentID")]
+            parent_id: Option<crate::stats::LenientString>,
         }
 
         let session_data: SessionData = match serde_json::from_slice(&bytes) {
@@ -1089,7 +1190,27 @@ impl StatsCache {
                 .session_titles
                 .insert(session_id.clone(), title);
 
-            // Also update the cache version to reflect the change
+            if let Some(pid) = session_data.parent_id.as_ref().filter(|p| !p.0.is_empty()) {
+                let parent_id: Box<str> = pid.0.clone().into_boxed_str();
+                if !cached.parent_map.contains_key(&session_id) {
+                    cached
+                        .parent_map
+                        .insert(session_id.clone(), parent_id.clone());
+                    cached
+                        .stats
+                        .parent_map
+                        .insert(session_id.clone(), parent_id.clone());
+                    let children = cached.children_map.entry(parent_id.clone()).or_default();
+                    if !children.contains(&session_id) {
+                        children.push(session_id.clone());
+                    }
+                    let stats_children = cached.stats.children_map.entry(parent_id).or_default();
+                    if !stats_children.contains(&session_id) {
+                        stats_children.push(session_id.clone());
+                    }
+                }
+            }
+
             cached.version += 1;
         }
 

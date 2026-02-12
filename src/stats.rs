@@ -80,6 +80,20 @@ pub struct SessionStat {
     pub original_session_id: Option<Box<str>>,
     pub first_created_date: Option<Box<str>>,
     pub is_continuation: bool,
+    pub agents: Vec<AgentInfo>,
+    pub active_duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub name: Box<str>,
+    pub is_main: bool,
+    pub models: FxHashSet<Box<str>>,
+    pub messages: u64,
+    pub tokens: Tokens,
+    pub first_activity: i64,
+    pub last_activity: i64,
+    pub active_duration_ms: i64,
 }
 
 impl SessionStat {
@@ -101,6 +115,8 @@ impl SessionStat {
             original_session_id: None,
             first_created_date: None,
             is_continuation: false,
+            agents: Vec::new(),
+            active_duration_ms: 0,
         }
     }
 
@@ -166,6 +182,8 @@ pub struct Stats {
     pub model_usage: Vec<ModelUsage>,
     pub session_message_files: FxHashMap<String, FxHashSet<std::path::PathBuf>>,
     pub processed_message_ids: FxHashSet<Box<str>>,
+    pub parent_map: FxHashMap<Box<str>, Box<str>>,
+    pub children_map: FxHashMap<Box<str>, Vec<Box<str>>>,
 }
 
 /// Key for session-day lookups.
@@ -217,6 +235,8 @@ pub struct ChatMessage {
     pub role: Box<str>,
     pub model: Option<Box<str>>,
     pub parts: Vec<MessageContent>,
+    pub is_subagent: bool,
+    pub agent_label: Option<Box<str>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -473,6 +493,8 @@ struct SessionDiffEntry {
 struct SessionData {
     id: Option<LenientString>,
     title: Option<LenientString>,
+    #[serde(rename = "parentID")]
+    parent_id: Option<LenientString>,
 }
 
 #[derive(Deserialize, Default)]
@@ -498,16 +520,16 @@ pub(crate) struct PartData {
 }
 
 #[inline]
-pub fn format_duration_ms(first_ms: i64, last_ms: i64) -> Option<String> {
-    if first_ms >= last_ms || first_ms == i64::MAX || last_ms == 0 {
-        return None;
+pub fn format_active_duration(ms: i64) -> String {
+    if ms <= 0 {
+        return "0s".into();
     }
-    let total_secs = ((last_ms - first_ms) / 1000) as u64;
+    let total_secs = (ms / 1000) as u64;
     let days = total_secs / 86400;
     let hours = (total_secs % 86400) / 3600;
     let mins = (total_secs % 3600) / 60;
     let secs = total_secs % 60;
-    Some(if days > 0 {
+    if days > 0 {
         format!("{}d {}h {}m", days, hours, mins)
     } else if hours > 0 {
         format!("{}h {}m {}s", hours, mins, secs)
@@ -515,7 +537,7 @@ pub fn format_duration_ms(first_ms: i64, last_ms: i64) -> Option<String> {
         format!("{}m {}s", mins, secs)
     } else {
         format!("{}s", secs)
-    })
+    }
 }
 
 #[inline]
@@ -661,17 +683,16 @@ fn list_message_files(root: &Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-fn load_session_titles() -> FxHashMap<Box<str>, String> {
+fn load_session_titles() -> (FxHashMap<Box<str>, String>, FxHashMap<Box<str>, Box<str>>) {
     let session_path = get_storage_path("session");
     let root = Path::new(&session_path);
     let Ok(entries) = fs::read_dir(root) else {
-        return FxHashMap::default();
+        return (FxHashMap::default(), FxHashMap::default());
     };
 
-    // Collect entries first for better parallel distribution
     let top_entries: Vec<_> = entries.flatten().collect();
 
-    top_entries
+    let all_sessions: Vec<(Box<str>, String, Option<Box<str>>)> = top_entries
         .par_iter()
         .flat_map(|entry| {
             let path = entry.path();
@@ -682,10 +703,11 @@ fn load_session_titles() -> FxHashMap<Box<str>, String> {
                             .filter_map(|se| {
                                 let bytes = fs::read(se.path()).ok()?;
                                 let session = serde_json::from_slice::<SessionData>(&bytes).ok()?;
-                                Some((
-                                    session.id.map(|s| s.0).unwrap_or_default().into_boxed_str(),
-                                    session.title.map(|s| s.0).unwrap_or_default(),
-                                ))
+                                let id =
+                                    session.id.map(|s| s.0).unwrap_or_default().into_boxed_str();
+                                let title = session.title.map(|s| s.0).unwrap_or_default();
+                                let parent = session.parent_id.map(|s| s.0.into_boxed_str());
+                                Some((id, title, parent))
                             })
                             .collect::<Vec<_>>()
                     })
@@ -695,17 +717,42 @@ fn load_session_titles() -> FxHashMap<Box<str>, String> {
                     .ok()
                     .and_then(|bytes| serde_json::from_slice::<SessionData>(&bytes).ok())
                     .map(|session| {
-                        vec![(
-                            session.id.map(|s| s.0).unwrap_or_default().into_boxed_str(),
-                            session.title.map(|s| s.0).unwrap_or_default(),
-                        )]
+                        let id = session.id.map(|s| s.0).unwrap_or_default().into_boxed_str();
+                        let title = session.title.map(|s| s.0).unwrap_or_default();
+                        let parent = session.parent_id.map(|s| s.0.into_boxed_str());
+                        vec![(id, title, parent)]
                     })
                     .unwrap_or_default()
             } else {
                 Vec::new()
             }
         })
-        .collect()
+        .collect();
+
+    let mut titles = FxHashMap::with_capacity_and_hasher(all_sessions.len(), Default::default());
+    let mut parent_map = FxHashMap::default();
+    for (id, title, parent) in all_sessions {
+        if let Some(pid) = parent {
+            if !pid.is_empty() {
+                parent_map.insert(id.clone(), pid);
+            }
+        }
+        titles.insert(id, title);
+    }
+    (titles, parent_map)
+}
+
+pub fn extract_agent_name(title: &str) -> Box<str> {
+    if let Some(start) = title.find("(@") {
+        if let Some(end) = title[start..].find(" subagent)") {
+            return title[start + 1..start + end].to_string().into_boxed_str();
+        }
+    }
+    if title.len() > 20 {
+        title[..20].to_string().into_boxed_str()
+    } else {
+        title.to_string().into_boxed_str()
+    }
 }
 
 #[inline]
@@ -819,7 +866,14 @@ fn compute_incremental_diffs(current: &[FileDiff], previous: &[FileDiff]) -> Vec
 
 pub fn collect_stats() -> Stats {
     let mut totals = Totals::default();
-    let session_titles = load_session_titles();
+    let (session_titles, parent_map) = load_session_titles();
+    let mut children_map: FxHashMap<Box<str>, Vec<Box<str>>> = FxHashMap::default();
+    for (child, parent) in &parent_map {
+        children_map
+            .entry(parent.clone())
+            .or_default()
+            .push(child.clone());
+    }
     let session_diff_map = load_session_diff_map();
     let message_path = get_storage_path("message");
     let part_path_str = get_storage_path("part");
@@ -931,6 +985,8 @@ pub fn collect_stats() -> Stats {
 
     let mut last_ts = None;
     let mut last_day_str = String::new();
+    let mut last_user_ts: FxHashMap<Box<str>, i64> = FxHashMap::default();
+    let mut session_overall_start: FxHashMap<Box<str>, i64> = FxHashMap::default();
 
     for data in processed_data {
         // Skip duplicate messages (same message_id seen before)
@@ -946,6 +1002,21 @@ pub fn collect_stats() -> Stats {
             .unwrap_or_default()
             .into();
 
+        // Resolve child session to parent
+        let effective_session_id: Box<str> = parent_map
+            .get(&session_id_boxed)
+            .cloned()
+            .unwrap_or_else(|| session_id_boxed.clone());
+        let is_subagent_msg = parent_map.contains_key(&session_id_boxed);
+
+        let agent_name: Box<str> = msg
+            .agent
+            .as_ref()
+            .filter(|a| !a.0.is_empty())
+            .map(|a| a.0.clone().into_boxed_str())
+            .unwrap_or_else(|| "unknown".into());
+
+        // Track message files by ORIGINAL session id
         if !session_id_boxed.is_empty() {
             session_message_files
                 .entry(session_id_boxed.to_string())
@@ -968,16 +1039,39 @@ pub fn collect_stats() -> Stats {
         let model_id = get_model_id(msg);
         let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
 
-        // Track first day session was seen for continuation detection
-        if !session_id_boxed.is_empty()
-            && !session_first_days.contains_key(session_id_boxed.as_ref())
+        // Compute tokens for agent tracking
+        let tokens_from_msg = if let Some(t) = &msg.tokens {
+            Tokens {
+                input: t.input.map(|v| *v).unwrap_or(0),
+                output: t.output.map(|v| *v).unwrap_or(0),
+                reasoning: t.reasoning.map(|v| *v).unwrap_or(0),
+                cache_read: t
+                    .cache
+                    .as_ref()
+                    .and_then(|c| c.read.map(|v| *v))
+                    .unwrap_or(0),
+                cache_write: t
+                    .cache
+                    .as_ref()
+                    .and_then(|c| c.write.map(|v| *v))
+                    .unwrap_or(0),
+            }
+        } else {
+            Tokens::default()
+        };
+
+        // Track first day session was seen for continuation detection (use effective)
+        if !effective_session_id.is_empty()
+            && !session_first_days.contains_key(effective_session_id.as_ref())
         {
-            session_first_days.insert(session_id_boxed.to_string(), day.clone());
+            session_first_days.insert(effective_session_id.to_string(), day.clone());
         }
 
-        // Optimization: only insert if not already present (avoid allocation on common path)
-        if !session_id_boxed.is_empty() && !totals.sessions.contains(session_id_boxed.as_ref()) {
-            totals.sessions.insert(session_id_boxed.clone());
+        // Only count main sessions in totals
+        if !effective_session_id.is_empty()
+            && !totals.sessions.contains(effective_session_id.as_ref())
+        {
+            totals.sessions.insert(effective_session_id.clone());
         }
         totals.messages += 1;
         if is_user {
@@ -1005,10 +1099,10 @@ pub fn collect_stats() -> Stats {
                 }
             });
             model_entry.messages += 1;
-            if !session_id_boxed.is_empty()
-                && !model_entry.sessions.contains(session_id_boxed.as_ref())
+            if !effective_session_id.is_empty()
+                && !model_entry.sessions.contains(effective_session_id.as_ref())
             {
-                model_entry.sessions.insert(session_id_boxed.clone());
+                model_entry.sessions.insert(effective_session_id.clone());
             }
             model_entry.cost += cost;
             add_tokens(&mut model_entry.tokens, &msg.tokens);
@@ -1039,33 +1133,35 @@ pub fn collect_stats() -> Stats {
         day_stat.cost += cost;
         add_tokens(&mut day_stat.tokens, &msg.tokens);
 
-        // Get or create the session for THIS specific day (each day has its own session entry)
-        // Optimization: avoid allocation if session already exists for this day
-        let session_stat_arc = if let Some(existing) =
-            day_stat.sessions.get_mut(session_id_boxed.as_ref())
-        {
-            existing
-        } else {
-            // Detect if this is a continuation from a previous day
-            let (original_id, first_created) = if !session_id_boxed.is_empty() {
-                detect_session_continuation(session_id_boxed.as_ref(), &day, &session_first_days)
+        // Get or create the session for THIS specific day using effective_session_id
+        let session_stat_arc =
+            if let Some(existing) = day_stat.sessions.get_mut(effective_session_id.as_ref()) {
+                existing
             } else {
-                (None, None)
-            };
+                // Detect if this is a continuation from a previous day
+                let (original_id, first_created) = if !effective_session_id.is_empty() {
+                    detect_session_continuation(
+                        effective_session_id.as_ref(),
+                        &day,
+                        &session_first_days,
+                    )
+                } else {
+                    (None, None)
+                };
 
-            let is_continued = original_id.is_some();
-            let mut stat = SessionStat::new(session_id_boxed.clone());
-            stat.original_session_id = original_id;
-            stat.first_created_date = first_created;
-            stat.is_continuation = is_continued;
-            day_stat
-                .sessions
-                .insert(session_id_boxed.to_string(), Arc::new(stat));
-            day_stat
-                .sessions
-                .get_mut(session_id_boxed.as_ref())
-                .unwrap()
-        };
+                let is_continued = original_id.is_some();
+                let mut stat = SessionStat::new(effective_session_id.clone());
+                stat.original_session_id = original_id;
+                stat.first_created_date = first_created;
+                stat.is_continuation = is_continued;
+                day_stat
+                    .sessions
+                    .insert(effective_session_id.to_string(), Arc::new(stat));
+                day_stat
+                    .sessions
+                    .get_mut(effective_session_id.as_ref())
+                    .unwrap()
+            };
 
         // Accumulate data for this day's session (separate from other days)
         let session_stat = Arc::make_mut(session_stat_arc);
@@ -1082,6 +1178,13 @@ pub fn collect_stats() -> Stats {
             if t < session_stat.first_activity {
                 session_stat.first_activity = t;
             }
+            // Track overall session start across all days
+            let start_entry = session_overall_start
+                .entry(effective_session_id.clone())
+                .or_insert(t);
+            if t < *start_entry {
+                *start_entry = t;
+            }
         }
         let end_ts = msg
             .time
@@ -1091,6 +1194,101 @@ pub fn collect_stats() -> Stats {
         if let Some(t) = end_ts {
             if t > session_stat.last_activity {
                 session_stat.last_activity = t;
+            }
+        }
+
+        if is_user {
+            if let Some(t) = ts_val {
+                last_user_ts.insert(effective_session_id.clone(), t);
+            }
+        } else if is_assistant {
+            let mut dur = 0;
+            if let Some(&user_t) = last_user_ts.get(&effective_session_id) {
+                if let Some(completed) = end_ts {
+                    if completed > user_t {
+                        dur = completed - user_t;
+                    }
+                }
+                // Don't remove last_user_ts yet, multiple agents might respond to same prompt
+            } else if let (Some(created), Some(completed)) = (ts_val, end_ts) {
+                if completed > created {
+                    dur = completed - created;
+                }
+            }
+            session_stat.active_duration_ms += dur;
+
+            // Update agent info
+            let agent_entry = session_stat
+                .agents
+                .iter_mut()
+                .find(|a| *a.name == *agent_name);
+            if let Some(agent) = agent_entry {
+                agent.messages += 1;
+                agent.tokens.input += tokens_from_msg.input;
+                agent.tokens.output += tokens_from_msg.output;
+                agent.tokens.reasoning += tokens_from_msg.reasoning;
+                agent.tokens.cache_read += tokens_from_msg.cache_read;
+                agent.tokens.cache_write += tokens_from_msg.cache_write;
+                agent.models.insert(model_id.clone());
+                if let Some(t) = ts_val {
+                    if t < agent.first_activity {
+                        agent.first_activity = t;
+                    }
+                }
+                if let Some(t) = end_ts {
+                    if t > agent.last_activity {
+                        agent.last_activity = t;
+                    }
+                }
+                agent.active_duration_ms += dur;
+            } else {
+                let mut models = FxHashSet::default();
+                models.insert(model_id.clone());
+                session_stat.agents.push(AgentInfo {
+                    name: agent_name.clone(),
+                    is_main: !is_subagent_msg,
+                    models,
+                    messages: 1,
+                    tokens: tokens_from_msg,
+                    first_activity: ts_val.unwrap_or(i64::MAX),
+                    last_activity: end_ts.unwrap_or(0),
+                    active_duration_ms: dur,
+                });
+            }
+        } else {
+            // Update non-assistant agent info (e.g. "unknown" for user)
+            let agent_entry = session_stat
+                .agents
+                .iter_mut()
+                .find(|a| *a.name == *agent_name);
+            if let Some(agent) = agent_entry {
+                agent.messages += 1;
+                agent.tokens.input += tokens_from_msg.input;
+                agent.tokens.output += tokens_from_msg.output;
+                agent.tokens.reasoning += tokens_from_msg.reasoning;
+                agent.tokens.cache_read += tokens_from_msg.cache_read;
+                agent.tokens.cache_write += tokens_from_msg.cache_write;
+                if let Some(t) = ts_val {
+                    if t < agent.first_activity {
+                        agent.first_activity = t;
+                    }
+                }
+                if let Some(t) = end_ts {
+                    if t > agent.last_activity {
+                        agent.last_activity = t;
+                    }
+                }
+            } else {
+                session_stat.agents.push(AgentInfo {
+                    name: agent_name.clone(),
+                    is_main: !is_subagent_msg,
+                    models: FxHashSet::default(),
+                    messages: 1,
+                    tokens: tokens_from_msg,
+                    first_activity: ts_val.unwrap_or(i64::MAX),
+                    last_activity: end_ts.unwrap_or(0),
+                    active_duration_ms: 0,
+                });
             }
         }
 
@@ -1113,11 +1311,9 @@ pub fn collect_stats() -> Stats {
             }
         }
 
-        // Accumulate per-file diffs from ALL messages of each session/day (union-of-latest)
-        // Each message's summary.diffs only lists files from that edit, so we merge
-        // across all messages to get the complete picture
-        if !session_id_boxed.is_empty() {
-            let key = make_sess_day_key(session_id_boxed.as_ref(), day.as_str());
+        // Accumulate per-file diffs using effective_session_id
+        if !effective_session_id.is_empty() {
+            let key = make_sess_day_key(effective_session_id.as_ref(), day.as_str());
             let file_map = session_day_union_diffs.entry(key).or_insert_with(|| {
                 FxHashMap::with_capacity_and_hasher(
                     data.cumulative_diffs.len().max(1),
@@ -1165,6 +1361,13 @@ pub fn collect_stats() -> Stats {
         for sess_arc in day_stat.sessions.values_mut() {
             let sess_id: String = sess_arc.id.to_string();
             let sess = Arc::make_mut(sess_arc);
+
+            // Update session-wide first_activity if it's a continuation
+            if let Some(&overall_start) = session_overall_start.get(sess.id.as_ref()) {
+                if overall_start < sess.first_activity {
+                    sess.first_activity = overall_start;
+                }
+            }
 
             // Build lookup key once
             let lookup_key = make_sess_day_key(&sess_id, day_str.as_str());
@@ -1234,6 +1437,22 @@ pub fn collect_stats() -> Stats {
     let mut model_usage: Vec<ModelUsage> = model_stats.into_values().collect();
     model_usage.sort_unstable_by(|a, b| b.tokens.total().cmp(&a.tokens.total()));
 
+    // Sort agents in each session: main agent first, then alphabetically
+    for day_stat in per_day.values_mut() {
+        for sess_arc in day_stat.sessions.values_mut() {
+            let sess = Arc::make_mut(sess_arc);
+            sess.agents.sort_by(|a, b| {
+                if a.is_main && !b.is_main {
+                    std::cmp::Ordering::Less
+                } else if !a.is_main && b.is_main {
+                    std::cmp::Ordering::Greater
+                } else {
+                    a.name.cmp(&b.name)
+                }
+            });
+        }
+    }
+
     Stats {
         totals,
         per_day,
@@ -1241,6 +1460,8 @@ pub fn collect_stats() -> Stats {
         model_usage,
         session_message_files,
         processed_message_ids,
+        parent_map,
+        children_map,
     }
 }
 
@@ -1432,6 +1653,8 @@ fn load_session_chat_internal(
             role,
             model: full_model,
             parts: parts_vec,
+            is_subagent: false,
+            agent_label: None,
         });
     }
     (merged, max_ts)
@@ -1462,7 +1685,7 @@ pub struct SessionDetails {
 pub fn load_session_details(
     session_id: &str,
     files: Option<&[std::path::PathBuf]>,
-    day_filter: Option<&str>, // Only load messages from this specific day
+    day_filter: Option<&str>,
 ) -> SessionDetails {
     struct MsgStats {
         model: Box<str>,
@@ -1590,6 +1813,172 @@ pub fn load_session_details(
     model_stats.sort_unstable_by(|a, b| b.tokens.total().cmp(&a.tokens.total()));
 
     SessionDetails { model_stats }
+}
+
+pub fn load_combined_session_chat(
+    parent_session_id: &str,
+    children: &[(Box<str>, Box<str>)],
+    session_message_files: &FxHashMap<String, FxHashSet<std::path::PathBuf>>,
+    day_filter: Option<&str>,
+) -> (Vec<ChatMessage>, i64) {
+    let mut all_files: Vec<std::path::PathBuf> = session_message_files
+        .get(parent_session_id)
+        .map(|f| f.iter().cloned().collect())
+        .unwrap_or_default();
+
+    let child_agent_map: FxHashMap<&str, &str> = children
+        .iter()
+        .map(|(id, name)| (id.as_ref(), name.as_ref()))
+        .collect();
+
+    for (child_id, _) in children {
+        if let Some(files) = session_message_files.get(child_id.as_ref()) {
+            all_files.extend(files.iter().cloned());
+        }
+    }
+
+    if all_files.is_empty() {
+        return (Vec::new(), 0);
+    }
+
+    let part_path_str = get_storage_path("part");
+    let part_root = std::path::Path::new(&part_path_str);
+
+    let mut all_messages: Vec<(Message, Vec<MessageContent>, bool, Option<Box<str>>)> = all_files
+        .par_iter()
+        .filter_map(|p| {
+            let bytes = std::fs::read(p).ok()?;
+            let msg: Message = serde_json::from_slice(&bytes).ok()?;
+
+            if let Some(target_day) = day_filter {
+                let msg_day = get_day(msg.time.as_ref().and_then(|t| t.created.map(|v| *v)));
+                if msg_day != target_day {
+                    return None;
+                }
+            }
+
+            let msg_session = msg.session_id.as_ref().map(|s| s.0.as_str()).unwrap_or("");
+            let (is_sub, agent_lbl) = if let Some(agent_name) = child_agent_map.get(msg_session) {
+                (true, Some((*agent_name).to_string().into_boxed_str()))
+            } else {
+                (false, None)
+            };
+
+            let mut parts_vec = Vec::new();
+            if let Some(id) = &msg.id {
+                let id_str = &id.0;
+                if !id_str.is_empty() {
+                    if let Ok(entries) = std::fs::read_dir(part_root.join(id_str)) {
+                        let mut p_files: Vec<_> = entries.flatten().collect();
+                        p_files.sort_by_key(|e| e.path());
+                        for e in p_files {
+                            if let Ok(bytes) = std::fs::read(e.path()) {
+                                if let Ok(part) = serde_json::from_slice::<PartData>(&bytes) {
+                                    if part.thought.is_some() {
+                                        parts_vec.push(MessageContent::Thinking(()));
+                                    }
+                                    if let Some(t) = part.text {
+                                        parts_vec.push(MessageContent::Text(truncate_string(
+                                            &t,
+                                            MAX_CHARS_PER_TEXT_PART,
+                                        )));
+                                    }
+                                    if let Some(tool) = part.tool {
+                                        let fp = part
+                                            .state
+                                            .as_ref()
+                                            .and_then(|s| {
+                                                s.input.as_ref().and_then(|i| i.file_path.as_ref())
+                                            })
+                                            .map(|s| s.clone().into());
+                                        let title = part
+                                            .state
+                                            .as_ref()
+                                            .and_then(|s| s.title.as_ref())
+                                            .map(|t| truncate_string(t, MAX_TOOL_TITLE_CHARS));
+                                        parts_vec.push(MessageContent::ToolCall(ToolCallInfo {
+                                            name: tool.into(),
+                                            title,
+                                            file_path: fp,
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Some((msg, parts_vec, is_sub, agent_lbl))
+        })
+        .collect();
+
+    all_messages.sort_unstable_by_key(|(m, _, _, _)| {
+        m.time
+            .as_ref()
+            .and_then(|t| t.created.map(|v| *v))
+            .unwrap_or(0)
+    });
+
+    if all_messages.len() > MAX_MESSAGES_TO_LOAD {
+        let start = all_messages.len() - MAX_MESSAGES_TO_LOAD;
+        all_messages.drain(..start);
+    }
+
+    let mut max_ts: i64 = 0;
+    let mut merged: Vec<ChatMessage> = Vec::with_capacity(all_messages.len());
+
+    for (msg, parts_vec, is_sub, agent_lbl) in all_messages {
+        let created = msg
+            .time
+            .as_ref()
+            .and_then(|t| t.created.map(|v| *v))
+            .unwrap_or(0);
+        if created > max_ts {
+            max_ts = created;
+        }
+
+        let role: Box<str> = msg
+            .role
+            .as_ref()
+            .map(|s| s.as_ref())
+            .unwrap_or("unknown")
+            .into();
+
+        if let Some(last) = merged.last_mut() {
+            if *last.role == *role && last.is_subagent == is_sub && last.agent_label == agent_lbl {
+                last.parts.extend(parts_vec);
+                continue;
+            }
+        }
+
+        let full_model = match (
+            msg.provider_id.as_ref().map(|s| s.0.clone()).or_else(|| {
+                msg.model
+                    .as_ref()
+                    .and_then(|m| m.provider_id.as_ref().map(|s| s.0.clone()))
+            }),
+            msg.model_id.as_ref().map(|s| s.0.clone()).or_else(|| {
+                msg.model
+                    .as_ref()
+                    .and_then(|m| m.model_id.as_ref().map(|s| s.0.clone()))
+            }),
+        ) {
+            (Some(p), Some(m)) => Some(format!("{}/{}", p, m).into()),
+            (None, Some(m)) => Some(m.into()),
+            _ => None,
+        };
+
+        merged.push(ChatMessage {
+            role,
+            model: full_model,
+            parts: parts_vec,
+            is_subagent: is_sub,
+            agent_label: agent_lbl,
+        });
+    }
+
+    (merged, max_ts)
 }
 
 #[inline]
