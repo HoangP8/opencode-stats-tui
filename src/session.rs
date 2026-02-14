@@ -313,6 +313,8 @@ impl SessionModal {
     ) {
         // Pre-allocate with estimated capacity to avoid reallocations
         let mut lines = Vec::with_capacity(50);
+        let device = crate::device::get_device_info();
+        let device_display = device.display_name();
 
         let title = session_titles
             .get(&session.id)
@@ -376,6 +378,63 @@ impl SessionModal {
                     Style::default().fg(Color::Rgb(100, 200, 255)),
                 ),
             ]));
+
+            // Models: inline comma-separated with +N overflow
+            {
+                let mut all_models: Vec<&str> =
+                    session.models.iter().map(|m| m.as_ref()).collect();
+                all_models.sort_unstable();
+                if !all_models.is_empty() {
+                    let label = "    Models:  ";
+                    let avail = value_width;
+                    let mut display = String::new();
+                    let mut shown = 0usize;
+                    for (i, model) in all_models.iter().enumerate() {
+                        let candidate = if display.is_empty() {
+                            (*model).to_string()
+                        } else {
+                            format!(", {}", model)
+                        };
+                        // Reserve space for possible "+N" suffix
+                        let remaining = all_models.len() - i - 1;
+                        let suffix_len = if remaining > 0 {
+                            format!(", +{}", remaining).len()
+                        } else {
+                            0
+                        };
+                        if display.len() + candidate.len() + suffix_len <= avail || i == 0 {
+                            display.push_str(&candidate);
+                            shown += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let overflow = all_models.len() - shown;
+                    if overflow > 0 {
+                        display.push_str(&format!(", +{}", overflow));
+                    }
+                    lines.push(Line::from(vec![
+                        Span::raw(label),
+                        Span::styled(display, Style::default().fg(Color::Magenta)),
+                    ]));
+                }
+            }
+
+            // Device / Server line
+            {
+                let (label, color) = if device.kind == "server" {
+                    ("    Server:  ", Color::Rgb(255, 165, 0))
+                } else {
+                    ("    Device:  ", Color::Rgb(100, 200, 255))
+                };
+                lines.push(Line::from(vec![
+                    Span::raw(label),
+                    Span::styled(
+                        safe_truncate_plain(&device_display, value_width),
+                        Style::default().fg(color),
+                    ),
+                ]));
+            }
 
             lines.push(Line::from(""));
         }

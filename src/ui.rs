@@ -3109,49 +3109,67 @@ impl App {
                 ]));
             }
 
-            let mut models: Vec<_> = s.models.iter().collect();
-            models.sort();
-            let model_val_width = left_val_width;
-
-            if models.is_empty() {
-                left_lines.push(Line::from(vec![
-                    Span::styled("Models       ", label_style),
-                    Span::styled("n/a", Style::default().fg(Color::DarkGray)),
-                ]));
-            } else if models.len() <= 2 {
-                for (i, m) in models.iter().enumerate() {
-                    let prefix = if i == 0 {
-                        "Models       "
-                    } else {
-                        "             "
-                    };
+            // Models: single line, comma-separated with +N overflow
+            {
+                let mut models: Vec<_> = s.models.iter().map(|m| m.as_ref()).collect();
+                models.sort_unstable();
+                let avail = left_val_width;
+                if models.is_empty() {
                     left_lines.push(Line::from(vec![
-                        Span::styled(prefix, label_style),
+                        Span::styled("Models       ", label_style),
+                        Span::styled("n/a", Style::default().fg(Color::DarkGray)),
+                    ]));
+                } else {
+                    let mut display = String::new();
+                    let mut shown = 0usize;
+                    for (i, model) in models.iter().enumerate() {
+                        let candidate = if display.is_empty() {
+                            (*model).to_string()
+                        } else {
+                            format!(", {}", model)
+                        };
+                        let remaining = models.len() - i - 1;
+                        let suffix_len = if remaining > 0 {
+                            format!(", +{}", remaining).len()
+                        } else {
+                            0
+                        };
+                        if display.len() + candidate.len() + suffix_len <= avail || i == 0 {
+                            display.push_str(&candidate);
+                            shown += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let overflow = models.len() - shown;
+                    if overflow > 0 {
+                        display.push_str(&format!(", +{}", overflow));
+                    }
+                    left_lines.push(Line::from(vec![
+                        Span::styled("Models       ", label_style),
                         Span::styled(
-                            truncate_with_ellipsis(m, model_val_width),
+                            truncate_with_ellipsis(&display, avail),
                             Style::default()
                                 .fg(Color::Magenta)
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ]));
                 }
-            } else {
+            }
+
+            // Device / Server line
+            {
+                let device = crate::device::get_device_info();
+                let (label, color) = if device.kind == "server" {
+                    ("Server       ", Color::Rgb(255, 165, 0))
+                } else {
+                    ("Device       ", Color::Rgb(100, 200, 255))
+                };
                 left_lines.push(Line::from(vec![
-                    Span::styled("Models       ", label_style),
+                    Span::styled(label, label_style),
                     Span::styled(
-                        truncate_with_ellipsis(models[0], model_val_width),
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                left_lines.push(Line::from(vec![
-                    Span::styled("             ", label_style),
-                    Span::styled(
-                        format!("+{}", models.len() - 1),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
+                        truncate_with_ellipsis(&device.display_name(), left_val_width),
+                        Style::default().fg(color),
                     ),
                 ]));
             }

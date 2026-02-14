@@ -1,4 +1,5 @@
 use std::io;
+mod device;
 mod live_watcher;
 mod session;
 mod stats;
@@ -138,6 +139,10 @@ fn flush_stdin_buffer() {}
 
 fn main() -> io::Result<()> {
     setup_panic_hook();
+
+    // Kick off device detection in background thread immediately.
+    // Uses OnceLock internally — resolves in parallel while TUI initializes.
+    std::thread::spawn(|| { device::get_device_info(); });
 
     // OPTIMIZATION: Skip startup drain entirely for modern terminals
     // Modern terminals don't leave junk in stdin, and we have proper cleanup on exit
