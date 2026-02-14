@@ -3,13 +3,19 @@ use fxhash::{FxHashMap, FxHashSet};
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 // Type alias for complex return type to reduce complexity
 type SessionDiffs = FxHashMap<String, FxHashMap<String, crate::stats::FileDiff>>;
 type SessionSortedDays = FxHashMap<String, Vec<String>>;
 
-const CACHE_FORMAT_VERSION: u64 = 9;
+const CACHE_FORMAT_VERSION: u64 = 11;
 
 /// Metadata for file validation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +151,13 @@ impl StatsCache {
             return false;
         }
 
+        if crate::stats::is_db_mode() {
+            let db = crate::stats::get_opencode_db_path();
+            if !db.exists() {
+                return false;
+            }
+        }
+
         // Optimized: Check a subset of files for changes, but use mtime+size which is very fast
         // We still don't want to check thousands of files every time, so we sample
         // but the sample is now more robust.
@@ -204,6 +217,60 @@ impl StatsCache {
         paths: Vec<String>,
     ) -> FxHashSet<String> {
         let mut affected_sessions = FxHashSet::default();
+
+        // DB mode: sqlite writes update opencode.db(-wal/-shm), not storage/* files.
+        // Preserve existing logic by doing a full refresh when DB files change.
+        if crate::stats::is_db_mode() {
+            let db_path = crate::stats::get_opencode_db_path();
+            let db_s = db_path.to_string_lossy();
+            let touched_db = paths.iter().any(|p| {
+                p == db_s.as_ref()
+                    || p.ends_with("opencode.db")
+                    || p.ends_with("opencode.db-wal")
+                    || p.ends_with("opencode.db-shm")
+            });
+
+            if touched_db {
+                cached.stats = crate::stats::collect_stats();
+                cached.parent_map = cached.stats.parent_map.clone();
+                cached.children_map = cached.stats.children_map.clone();
+
+                for day_stat in cached.stats.per_day.values() {
+                    for id in day_stat.sessions.keys() {
+                        affected_sessions.insert(id.clone());
+                    }
+                }
+
+                cached.version += 1;
+                cached.format_version = CACHE_FORMAT_VERSION;
+
+                if let Ok(files) = self.list_all_files() {
+                    for p in files {
+                        if let Ok(m) = fs::metadata(&p) {
+                            let mtime = m
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            cached.file_meta.insert(
+                                p,
+                                FileMeta {
+                                    mtime,
+                                    size: m.len(),
+                                },
+                            );
+                        }
+                    }
+                }
+
+                if let Ok(data) = serialize(&*cached) {
+                    let _ = fs::write(&self.cache_path, data);
+                }
+            }
+
+            return affected_sessions;
+        }
 
         let has_session_json_root = paths.iter().any(|p| p.ends_with("session.json"));
         let has_deletion = paths.iter().any(|p| !std::path::Path::new(p).exists());
@@ -290,15 +357,8 @@ impl StatsCache {
         cached.parent_map = stats.parent_map.clone();
         cached.children_map = stats.children_map.clone();
         cached.session_diff_map = crate::stats::load_session_diff_map();
-        cached.session_diff_totals = cached
-            .session_diff_map
-            .iter()
-            .map(|(id, diffs)| {
-                let adds: u64 = diffs.iter().map(|d| d.additions).sum();
-                let dels: u64 = diffs.iter().map(|d| d.deletions).sum();
-                (id.clone(), (adds, dels))
-            })
-            .collect();
+        cached.session_diff_totals =
+            crate::stats::load_session_diff_totals(&cached.session_diff_map);
         let message_files = self.list_message_files();
         let (union_diffs, sorted_days, message_contributions) =
             self.build_session_day_union_diffs(&message_files);
@@ -339,29 +399,7 @@ impl StatsCache {
 
     fn list_message_files(&self) -> Vec<PathBuf> {
         let message_path = self._storage_path.join("message");
-        if !message_path.exists() {
-            return Vec::new();
-        }
-        let Ok(entries) = fs::read_dir(&message_path) else {
-            return Vec::new();
-        };
-        let mut files = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Ok(sub_entries) = fs::read_dir(&path) {
-                    for sub in sub_entries.flatten() {
-                        let sp = sub.path();
-                        if sp.extension().is_some_and(|e| e == "json") {
-                            files.push(sp);
-                        }
-                    }
-                }
-            } else if path.extension().is_some_and(|e| e == "json") {
-                files.push(path);
-            }
-        }
-        files
+        crate::stats::list_message_files(Path::new(&message_path))
     }
 
     fn build_session_day_union_diffs(
@@ -382,8 +420,7 @@ impl StatsCache {
         let mut messages: Vec<(crate::stats::Message, PathBuf)> = files
             .par_iter()
             .filter_map(|p| {
-                let bytes = fs::read(p).ok()?;
-                let msg: crate::stats::Message = serde_json::from_slice(&bytes).ok()?;
+                let msg: crate::stats::Message = crate::stats::load_message_from_path(p)?;
                 Some((msg, p.clone()))
             })
             .collect();
@@ -548,6 +585,27 @@ impl StatsCache {
     }
 
     fn list_all_files(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        if crate::stats::is_db_mode() {
+            let db = crate::stats::get_opencode_db_path();
+            let mut files = Vec::new();
+            if let Some(s) = db.to_str() {
+                files.push(s.to_string());
+            }
+            let wal = db.with_extension("db-wal");
+            if wal.exists() {
+                if let Some(s) = wal.to_str() {
+                    files.push(s.to_string());
+                }
+            }
+            let shm = db.with_extension("db-shm");
+            if shm.exists() {
+                if let Some(s) = shm.to_str() {
+                    files.push(s.to_string());
+                }
+            }
+            return Ok(files);
+        }
+
         let dirs = ["message", "part", "session", "session_diff"];
         let files: Vec<String> = dirs
             .par_iter()
@@ -597,6 +655,13 @@ impl StatsCache {
         cached: &mut CachedStats,
         path: &str,
     ) -> Option<String> {
+        if crate::stats::is_db_mode() {
+            cached.stats = crate::stats::collect_stats();
+            cached.parent_map = cached.stats.parent_map.clone();
+            cached.children_map = cached.stats.children_map.clone();
+            return None;
+        }
+
         let stats = &mut cached.stats;
         let Ok(bytes) = fs::read(path) else {
             return None;
@@ -1068,6 +1133,13 @@ impl StatsCache {
         cached: &mut CachedStats,
         path: &str,
     ) -> Option<String> {
+        if crate::stats::is_db_mode() {
+            cached.stats = crate::stats::collect_stats();
+            cached.parent_map = cached.stats.parent_map.clone();
+            cached.children_map = cached.stats.children_map.clone();
+            return None;
+        }
+
         let p = std::path::Path::new(path);
         let session_id = p.file_stem()?.to_str()?.to_string();
 
@@ -1150,6 +1222,13 @@ impl StatsCache {
         cached: &mut CachedStats,
         path: &str,
     ) -> Option<String> {
+        if crate::stats::is_db_mode() {
+            cached.stats = crate::stats::collect_stats();
+            cached.parent_map = cached.stats.parent_map.clone();
+            cached.children_map = cached.stats.children_map.clone();
+            return None;
+        }
+
         let bytes = match fs::read(path) {
             Ok(b) => b,
             Err(_) => return None,
@@ -1218,6 +1297,11 @@ impl StatsCache {
     }
 
     fn incrementally_update_parts(&self, stats: &mut crate::stats::Stats, path: &str) {
+        if crate::stats::is_db_mode() {
+            *stats = crate::stats::collect_stats();
+            return;
+        }
+
         let Ok(bytes) = fs::read(path) else {
             return;
         };

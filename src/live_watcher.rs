@@ -43,9 +43,17 @@ impl LiveWatcher {
                                     continue;
                                 }
 
-                                if path.extension().is_some_and(|e| e == "json")
-                                    || event.kind.is_remove()
-                                {
+                                let is_json = path.extension().is_some_and(|e| e == "json");
+                                // SQLite mode writes mostly hit opencode.db-wal/opencode.db-shm
+                                // (and sometimes opencode.db). Include these so live refresh stays reliable.
+                                let is_sqlite_file =
+                                    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                                        n == "opencode.db"
+                                            || n == "opencode.db-wal"
+                                            || n == "opencode.db-shm"
+                                    });
+
+                                if is_json || is_sqlite_file || event.kind.is_remove() {
                                     let mut files = changed_files_clone.lock();
                                     if !files.contains(&path) {
                                         files.push(path.clone());

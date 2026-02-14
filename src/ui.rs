@@ -317,11 +317,15 @@ impl App {
         // Initialize logger
         // env_logger::init();
 
-        // Get storage path
-        let storage_path = std::env::var("XDG_DATA_HOME")
-            .unwrap_or_else(|_| format!("{}/.local/share", std::env::var("HOME").unwrap()))
-            .to_string();
-        let storage_path = PathBuf::from(storage_path).join("opencode").join("storage");
+        // Get data source root path
+        let storage_path = if crate::stats::is_db_mode() {
+            crate::stats::get_opencode_root_path()
+        } else {
+            let storage_path = std::env::var("XDG_DATA_HOME")
+                .unwrap_or_else(|_| format!("{}/.local/share", std::env::var("HOME").unwrap()))
+                .to_string();
+            PathBuf::from(storage_path).join("opencode").join("storage")
+        };
 
         // Initialize cache
         let stats_cache = StatsCache::new(storage_path.clone()).ok();

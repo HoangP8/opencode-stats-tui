@@ -171,10 +171,7 @@ fn probe_editor_clis() -> Option<String> {
 /// Find the editor CLI binary. Check PATH first (instant), then scan server dir.
 fn find_editor_binary(name: &str, server_dir: &PathBuf) -> Option<PathBuf> {
     // Fast: check if it's in PATH
-    if let Ok(output) = Command::new("which")
-        .arg(name)
-        .output()
-    {
+    if let Ok(output) = Command::new("which").arg(name).output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path.is_empty() {
@@ -346,7 +343,12 @@ fn get_machine_id() -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         if let Ok(output) = Command::new("reg")
-            .args(["query", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"])
+            .args([
+                "query",
+                r"HKLM\SOFTWARE\Microsoft\Cryptography",
+                "/v",
+                "MachineGuid",
+            ])
             .output()
         {
             if output.status.success() {

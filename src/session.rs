@@ -381,8 +381,7 @@ impl SessionModal {
 
             // Models: inline comma-separated with +N overflow
             {
-                let mut all_models: Vec<&str> =
-                    session.models.iter().map(|m| m.as_ref()).collect();
+                let mut all_models: Vec<&str> = session.models.iter().map(|m| m.as_ref()).collect();
                 all_models.sort_unstable();
                 if !all_models.is_empty() {
                     let label = "    Models:  ";
