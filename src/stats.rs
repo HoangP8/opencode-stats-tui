@@ -985,8 +985,13 @@ pub fn collect_stats() -> Stats {
 
     let mut last_ts = None;
     let mut last_day_str = String::new();
-    let mut last_user_ts: FxHashMap<Box<str>, i64> = FxHashMap::default();
     let mut session_overall_start: FxHashMap<Box<str>, i64> = FxHashMap::default();
+    // Collect (created, completed) intervals per (effective_session_id, day) for merged duration
+    let mut session_day_intervals: FxHashMap<SessDayKey, Vec<(i64, i64)>> =
+        FxHashMap::with_capacity_and_hasher(64, Default::default());
+    // Collect (created, completed) intervals per (effective_session_id, day, agent_name)
+    let mut agent_intervals: FxHashMap<String, Vec<(i64, i64)>> =
+        FxHashMap::with_capacity_and_hasher(64, Default::default());
 
     for data in processed_data {
         // Skip duplicate messages (same message_id seen before)
@@ -1197,27 +1202,28 @@ pub fn collect_stats() -> Stats {
             }
         }
 
-        if is_user {
-            if let Some(t) = ts_val {
-                last_user_ts.insert(effective_session_id.clone(), t);
-            }
-        } else if is_assistant {
-            let mut dur = 0;
-            if let Some(&user_t) = last_user_ts.get(&effective_session_id) {
-                if let Some(completed) = end_ts {
-                    if completed > user_t {
-                        dur = completed - user_t;
-                    }
-                }
-                // Don't remove last_user_ts yet, multiple agents might respond to same prompt
-            } else if let (Some(created), Some(completed)) = (ts_val, end_ts) {
+        if is_assistant {
+            // Collect interval for merged duration calculation (done after the loop)
+            if let (Some(created), Some(completed)) = (ts_val, end_ts) {
                 if completed > created {
-                    dur = completed - created;
+                    let key = make_sess_day_key(effective_session_id.as_ref(), day.as_str());
+                    session_day_intervals
+                        .entry(key)
+                        .or_default()
+                        .push((created, completed));
+                    // Also collect per-agent interval
+                    let agent_key = format!(
+                        "{}|{}|{}",
+                        effective_session_id, day, agent_name
+                    );
+                    agent_intervals
+                        .entry(agent_key)
+                        .or_default()
+                        .push((created, completed));
                 }
             }
-            session_stat.active_duration_ms += dur;
 
-            // Update agent info
+            // Update agent info (duration will be set after the loop)
             let agent_entry = session_stat
                 .agents
                 .iter_mut()
@@ -1240,7 +1246,6 @@ pub fn collect_stats() -> Stats {
                         agent.last_activity = t;
                     }
                 }
-                agent.active_duration_ms += dur;
             } else {
                 let mut models = FxHashSet::default();
                 models.insert(model_id.clone());
@@ -1252,7 +1257,7 @@ pub fn collect_stats() -> Stats {
                     tokens: tokens_from_msg,
                     first_activity: ts_val.unwrap_or(i64::MAX),
                     last_activity: end_ts.unwrap_or(0),
-                    active_duration_ms: dur,
+                    active_duration_ms: 0,
                 });
             }
         } else {
@@ -1323,6 +1328,73 @@ pub fn collect_stats() -> Stats {
             for d in data.cumulative_diffs {
                 if !d.path.is_empty() {
                     file_map.insert(d.path.clone(), d);
+                }
+            }
+        }
+    }
+
+    // Compute merged active durations from collected intervals
+    // Merge overlapping intervals to get true wall-clock time (handles parallel sub-agents)
+    fn merge_intervals_duration(intervals: &mut Vec<(i64, i64)>) -> i64 {
+        if intervals.is_empty() {
+            return 0;
+        }
+        intervals.sort_unstable_by_key(|&(start, _)| start);
+        let mut total: i64 = 0;
+        let mut cur_start = intervals[0].0;
+        let mut cur_end = intervals[0].1;
+        for &(start, end) in &intervals[1..] {
+            if start <= cur_end {
+                // Overlapping or adjacent - extend
+                if end > cur_end {
+                    cur_end = end;
+                }
+            } else {
+                // Gap - finalize previous interval
+                total += cur_end - cur_start;
+                cur_start = start;
+                cur_end = end;
+            }
+        }
+        total += cur_end - cur_start;
+        total
+    }
+
+    // Apply merged session durations to session stats
+    for (key, mut intervals) in session_day_intervals {
+        let merged_dur = merge_intervals_duration(&mut intervals);
+        if let Some((session_id, day_str)) = key.split_once('|') {
+            if let Some(day_stat) = per_day.get_mut(day_str) {
+                if let Some(sess_arc) = day_stat.sessions.get_mut(session_id) {
+                    let sess = Arc::make_mut(sess_arc);
+                    sess.active_duration_ms = merged_dur;
+                }
+            }
+        }
+    }
+
+    // Apply merged agent durations
+    for (key, mut intervals) in agent_intervals {
+        let merged_dur = merge_intervals_duration(&mut intervals);
+        // key format: "session_id|day|agent_name"
+        let mut parts = key.splitn(3, '|');
+        let session_id = match parts.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let day_str = match parts.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        let agent_name_str = match parts.next() {
+            Some(s) => s,
+            None => continue,
+        };
+        if let Some(day_stat) = per_day.get_mut(day_str) {
+            if let Some(sess_arc) = day_stat.sessions.get_mut(session_id) {
+                let sess = Arc::make_mut(sess_arc);
+                if let Some(agent) = sess.agents.iter_mut().find(|a| *a.name == *agent_name_str) {
+                    agent.active_duration_ms = merged_dur;
                 }
             }
         }

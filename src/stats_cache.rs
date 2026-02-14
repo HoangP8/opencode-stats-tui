@@ -9,7 +9,7 @@ use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
 type SessionDiffs = FxHashMap<String, FxHashMap<String, crate::stats::FileDiff>>;
 type SessionSortedDays = FxHashMap<String, Vec<String>>;
 
-const CACHE_FORMAT_VERSION: u64 = 8;
+const CACHE_FORMAT_VERSION: u64 = 9;
 
 /// Metadata for file validation
 #[derive(Debug, Clone, Serialize, Deserialize)]
