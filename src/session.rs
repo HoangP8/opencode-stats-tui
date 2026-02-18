@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Scroll increment for smooth scrolling experience (1 line = smoothest)
-const SCROLL_INCREMENT: u16 = 1;
+/// Scroll increment for faster scrolling experience
+const SCROLL_INCREMENT: u16 = 3;
 
 /// Cached column rectangles and scroll bounds for optimized modal rendering
 #[derive(Default, Clone, Copy)]
@@ -1243,6 +1243,7 @@ fn render_tool_stats_box<'a>(
 ) {
     let inner_w = card_w.saturating_sub(6);
     let frame_color = Color::Rgb(50, 50, 60);
+    let tool_text_color = Color::Rgb(180, 180, 200);
     let toggle_label = if is_expanded {
         "▼ collapse"
     } else {
@@ -1257,7 +1258,6 @@ fn render_tool_stats_box<'a>(
         ),
     ]));
 
-    // Record click target for the tool box header
     click_targets.push((lines.len() as u16, ChatClickTarget::ToolBox(target_id)));
 
     let header = format!("tools used ({})", total_tools);
@@ -1268,7 +1268,7 @@ fn render_tool_stats_box<'a>(
         Span::styled(
             header,
             Style::default()
-                .fg(Color::Rgb(170, 170, 185))
+                .fg(tool_text_color)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ".repeat(dash_len), Style::default().fg(frame_color)),
@@ -1289,27 +1289,25 @@ fn render_tool_stats_box<'a>(
     let mut tools: Vec<(&String, &ToolStatsEntry)> = tool_stats.iter().collect();
     tools.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(&b.0)));
 
-    for (name, entry) in tools {
-        // Summary line intentionally keeps only tool name + count.
-        // File/path details are shown in expanded rows below.
-        let row = format!("{} {}: x{}", tool_icon(name), name, entry.count);
+    let tools_len = tools.len();
+    for (idx, (name, entry)) in tools.iter().enumerate() {
+        // Tool line: emoji + name (xN) format
+        let tool_line = format!("{} {} (x{})", tool_icon(name), name, entry.count);
         push_tool_line(
             lines,
             prefix,
             dim_color,
             frame_color,
             inner_w,
-            &row,
-            Color::Rgb(140, 140, 155),
+            &tool_line,
+            tool_text_color,
         );
 
         if is_expanded {
-            let detail_w = inner_w.saturating_sub(6);
-            // Group by file for file-centric tools, even with a single invocation,
-            // to keep output layout consistent and avoid odd indentation shifts.
+            let is_read = *name == "read";
             let is_file_tool = matches!(name.as_str(), "read" | "edit" | "write" | "apply_patch");
             if is_file_tool {
-                // Group by file path
+                // Group invocations by file path
                 let mut file_groups: Vec<(String, Vec<&ToolInvocation>)> = Vec::new();
                 let mut file_order: Vec<String> = Vec::new();
                 let mut file_map: FxHashMap<String, Vec<&ToolInvocation>> = FxHashMap::default();
@@ -1321,93 +1319,85 @@ fn render_tool_stats_box<'a>(
                     file_map.entry(key).or_default().push(inv);
                 }
                 for key in file_order {
-                    file_groups.push((key.clone(), file_map.remove(&key).unwrap_or_default()));
+                    let val = file_map.remove(&key).unwrap_or_default();
+                    file_groups.push((key, val));
                 }
-                for (fp, invs) in &file_groups {
-                    let short_fp = short_file_path(Some(fp));
-                    // Consistent layout: always file header then per-call details.
-                    let header = format!("  {} (x{})", short_fp, invs.len());
+                let group_count = file_groups.len();
+                for (g_idx, (fp, invs)) in file_groups.iter().enumerate() {
+                    let is_last_group = g_idx == group_count - 1;
+                    let tree_char = if is_last_group { "└" } else { "├" };
+                    let file_line = if is_read {
+                        format!("  {} {}", tree_char, short_file_path(Some(fp)))
+                    } else {
+                        format!(
+                            "  {} {} (x{})",
+                            tree_char,
+                            short_file_path(Some(fp)),
+                            invs.len()
+                        )
+                    };
                     push_tool_line(
                         lines,
                         prefix,
                         dim_color,
                         frame_color,
                         inner_w,
-                        &header,
-                        Color::Rgb(140, 140, 150),
+                        &file_line,
+                        tool_text_color,
                     );
-
-                    // Keep file-only tools clean: show file counts only.
-                    // Detailed per-invocation lines are useful for read, but
-                    // often repetitive/noisy for edit/write/apply_patch.
-                    let show_per_call_details = matches!(name.as_str(), "read");
-                    if !show_per_call_details {
-                        continue;
-                    }
-
-                    let mut seen_subdetails: FxHashSet<String> = FxHashSet::default();
-                    let mut rendered_subdetail = false;
-                    for inv in invs {
-                        let detail =
-                            tool_invocation_secondary_detail(name, inv, detail_w.saturating_sub(6))
-                                .or_else(|| {
-                                    tool_invocation_primary_detail(
-                                        name,
-                                        inv,
-                                        detail_w.saturating_sub(6),
-                                    )
-                                });
-
-                        if let Some(sub_detail) = detail {
-                            let normalized = sub_detail.trim().to_string();
-                            let is_redundant_path = normalized == short_fp;
-                            let is_redundant_write =
-                                matches!(name.as_str(), "edit" | "write" | "apply_patch")
-                                    && matches!(normalized.as_str(), "write" | "edit");
-                            if is_redundant_path || is_redundant_write {
-                                continue;
+                    if is_read {
+                        // For read, show each invocation as a bullet point (dedup'd)
+                        let mut seen_details: FxHashSet<String> = FxHashSet::default();
+                        let mut rendered_any = false;
+                        let detail_max = inner_w.saturating_sub(1).saturating_sub(6);
+                        for inv in invs {
+                            let detail = tool_invocation_secondary_detail(name, inv, detail_max)
+                                .or_else(|| tool_invocation_primary_detail(name, inv, detail_max));
+                            if let Some(d) = detail {
+                                if !seen_details.insert(d.clone()) {
+                                    continue;
+                                }
+                                let bullet_line = format!("    • {}", d);
+                                push_tool_line(
+                                    lines,
+                                    prefix,
+                                    dim_color,
+                                    frame_color,
+                                    inner_w,
+                                    &bullet_line,
+                                    tool_text_color,
+                                );
+                                rendered_any = true;
                             }
-                            if !seen_subdetails.insert(normalized.clone()) {
-                                continue;
-                            }
-                            let sub_line = format!("    - {}", sub_detail);
+                        }
+                        if !rendered_any {
+                            let fallback = if fp == "(unknown)" {
+                                "    • no file metadata"
+                            } else {
+                                "    • no per-call detail"
+                            };
                             push_tool_line(
                                 lines,
                                 prefix,
                                 dim_color,
                                 frame_color,
                                 inner_w,
-                                &sub_line,
-                                Color::Rgb(120, 120, 130),
+                                fallback,
+                                tool_text_color,
                             );
-                            rendered_subdetail = true;
                         }
-                    }
-
-                    if !rendered_subdetail {
-                        let fallback = if *fp == "(unknown)" {
-                            "    - no file metadata"
-                        } else {
-                            "    - no per-call detail"
-                        };
-                        push_tool_line(
-                            lines,
-                            prefix,
-                            dim_color,
-                            frame_color,
-                            inner_w,
-                            fallback,
-                            Color::Rgb(105, 105, 115),
-                        );
                     }
                 }
             } else {
-                // Non-file tools or single invocation: show each invocation on one line
-                for inv in &entry.invocations {
-                    let detail =
-                        tool_invocation_primary_detail(name, inv, detail_w.saturating_sub(4))
-                            .unwrap_or_else(|| format!("{} call", name));
-                    let line_text = format!("  - {}", detail);
+                // Non-file-centric tools: each invocation as a separate line (no bullet)
+                let inv_count = entry.invocations.len();
+                let desc_max = inner_w.saturating_sub(1).saturating_sub(4);
+                for (inv_idx, inv) in entry.invocations.iter().enumerate() {
+                    let is_last_inv = inv_idx == inv_count - 1;
+                    let tree_char = if is_last_inv { "└" } else { "├" };
+                    let description = tool_invocation_primary_detail(name, inv, desc_max)
+                        .unwrap_or_else(|| format!("{} call", name));
+                    let line_text = format!("  {} {}", tree_char, description);
                     push_tool_line(
                         lines,
                         prefix,
@@ -1415,11 +1405,21 @@ fn render_tool_stats_box<'a>(
                         frame_color,
                         inner_w,
                         &line_text,
-                        Color::Rgb(140, 140, 150),
+                        tool_text_color,
                     );
                 }
             }
         }
+
+        // Add padding between tools (except last) when expanded
+        if is_expanded && idx < tools_len - 1 {
+            push_tool_padding(lines, prefix, dim_color, frame_color, inner_w);
+        }
+    }
+
+    // Final padding before bottom border
+    if is_expanded {
+        push_tool_padding(lines, prefix, dim_color, frame_color, inner_w);
     }
 
     lines.push(Line::from(vec![
@@ -1483,7 +1483,7 @@ fn render_user_box<'a>(
     } else {
         "▶ expand"
     };
-    let label = " [U] USER ";
+    let label = " 👤 USER ";
     let dash_len = box_w.saturating_sub(label.chars().count() + 2 + toggle_label.len() + 1);
     lines.push(Line::from(vec![
         Span::raw(" "),
@@ -1833,10 +1833,27 @@ fn push_tool_line<'a>(
     text_color: Color,
 ) {
     let fitted = fit_display_width(text, inner_w.saturating_sub(1));
+    let style = Style::default().fg(text_color);
+
     lines.push(Line::from(vec![
         Span::styled(prefix, Style::default().fg(dim_color)),
         Span::styled("│ ", Style::default().fg(frame_color)),
-        Span::styled(fitted, Style::default().fg(text_color)),
+        Span::styled(fitted, style),
+        Span::styled("│", Style::default().fg(frame_color)),
+    ]));
+}
+
+fn push_tool_padding<'a>(
+    lines: &mut Vec<Line<'a>>,
+    prefix: &'a str,
+    dim_color: Color,
+    frame_color: Color,
+    inner_w: usize,
+) {
+    lines.push(Line::from(vec![
+        Span::styled(prefix, Style::default().fg(dim_color)),
+        Span::styled("│ ", Style::default().fg(frame_color)),
+        Span::styled(" ".repeat(inner_w.saturating_sub(1)), Style::default()),
         Span::styled("│", Style::default().fg(frame_color)),
     ]));
 }
@@ -1858,9 +1875,17 @@ fn format_tool_invocation_short(tool_name: &str, input: &str, max_w: usize) -> S
                 let off = extract_json_field(input, "offset");
                 let lim = extract_json_field(input, "limit");
                 match (off, lim) {
-                    (Some(o), Some(l)) => Some(format!("offset {}, limit {}", o, l)),
-                    (Some(o), None) => Some(format!("offset {}", o)),
-                    (None, Some(l)) => Some(format!("limit {}", l)),
+                    (Some(o), Some(l)) => {
+                        let start: usize = o.parse().unwrap_or(1);
+                        let count: usize = l.parse().unwrap_or(0);
+                        if count > 0 {
+                            Some(format!("lines {}-{}", start, start + count - 1))
+                        } else {
+                            Some(format!("line {}", start))
+                        }
+                    }
+                    (Some(o), None) => Some(format!("from line {}", o)),
+                    (None, Some(l)) => Some(format!("limit {} lines", l)),
                     _ => None,
                 }
             });
