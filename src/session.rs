@@ -3,7 +3,7 @@ use crate::stats::{
     SessionDetails, SessionStat,
 };
 use crossterm::event::{KeyCode, MouseEvent, MouseEventKind};
-use fxhash::FxHashMap;
+use fxhash::{FxHashMap, FxHashSet};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
@@ -15,6 +15,7 @@ use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Scroll increment for smooth scrolling experience (1 line = smoothest)
 const SCROLL_INCREMENT: u16 = 1;
@@ -39,6 +40,19 @@ pub struct SessionModal {
     pub selected_column: ModalColumn, // Track which column is focused
     // Cached modal rectangles for optimized mouse hit-testing
     cached_rects: ModalRects,
+    // Tracks which agents or message indices are expanded in the chat panel
+    pub expanded_agents: FxHashSet<Box<str>>,
+    pub expanded_messages: FxHashSet<usize>,
+    pub expanded_tools: FxHashSet<Box<str>>,
+    // Clickable chat header line indices (content-space y, ClickTarget)
+    chat_click_targets: Vec<(u16, ChatClickTarget)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatClickTarget {
+    Agent(Box<str>),
+    Message(usize),
+    ToolBox(Box<str>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +73,10 @@ impl SessionModal {
             chat_max_scroll: 0,
             selected_column: ModalColumn::Info,
             cached_rects: ModalRects::default(),
+            expanded_agents: FxHashSet::default(),
+            expanded_messages: FxHashSet::default(),
+            expanded_tools: FxHashSet::default(),
+            chat_click_targets: Vec::new(),
         }
     }
 
@@ -80,6 +98,10 @@ impl SessionModal {
         self.chat_max_scroll = 0; // Will be calculated during render
         self.open = true;
         self.selected_column = ModalColumn::Info;
+        self.expanded_agents.clear();
+        self.expanded_messages.clear();
+        self.expanded_tools.clear();
+        self.chat_click_targets.clear();
     }
 
     /// Close modal and reset state
@@ -93,6 +115,10 @@ impl SessionModal {
         self.chat_max_scroll = 0;
         self.selected_column = ModalColumn::Info;
         self.cached_rects = ModalRects::default();
+        self.expanded_agents.clear();
+        self.expanded_messages.clear();
+        self.expanded_tools.clear();
+        self.chat_click_targets.clear();
     }
 
     /// Handle keyboard events when modal is open
@@ -205,21 +231,47 @@ impl SessionModal {
                 true
             }
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                // Use cached rectangles for optimal hit-testing
                 let (x, y) = (mouse.column, mouse.row);
-
-                // Check Info column (most common click target)
                 if Self::contains_point(self.cached_rects.info, x, y) {
                     self.selected_column = ModalColumn::Info;
                     return true;
                 }
-
-                // Check Chat column
                 if Self::contains_point(self.cached_rects.chat, x, y) {
                     self.selected_column = ModalColumn::Chat;
+                    if let Some(chat_rect) = self.cached_rects.chat {
+                        let content_y =
+                            (y.saturating_sub(chat_rect.y + 1)) as u16 + self.chat_scroll;
+                        // Binary search since targets are sorted by line index
+                        if let Ok(pos) = self
+                            .chat_click_targets
+                            .binary_search_by_key(&content_y, |(line_idx, _)| *line_idx)
+                        {
+                            let target = &self.chat_click_targets[pos].1;
+                            match target {
+                                ChatClickTarget::Agent(name) => {
+                                    let name = name.clone();
+                                    if !self.expanded_agents.remove(&name) {
+                                        self.expanded_agents.insert(name);
+                                    }
+                                }
+                                ChatClickTarget::Message(idx) => {
+                                    let idx = *idx;
+                                    if !self.expanded_messages.remove(&idx) {
+                                        self.expanded_messages.insert(idx);
+                                    }
+                                }
+                                ChatClickTarget::ToolBox(id) => {
+                                    let id = id.clone();
+                                    if !self.expanded_tools.remove(&id) {
+                                        self.expanded_tools.insert(id);
+                                    }
+                                }
+                            }
+                            return true;
+                        }
+                    }
                     return true;
                 }
-
                 false
             }
             MouseEventKind::Down(crossterm::event::MouseButton::Right) => {
@@ -243,37 +295,24 @@ impl SessionModal {
         session: &SessionStat,
         session_titles: &FxHashMap<Box<str>, String>,
     ) {
-        // Solid clean background - no blur effect
         let modal_block = Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0)));
-
-        // Fill the entire area with solid black background
         frame.render_widget(modal_block, area);
-
         let modal_area = area.inner(Margin {
             vertical: 1,
             horizontal: 2,
         });
-
-        // Add instruction bar at the bottom
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(0), Constraint::Length(2)])
             .split(modal_area);
-
         let content_area = chunks[0];
         let instruction_area = chunks[1];
-
-        // Split content area into two columns
         let column_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(content_area);
-
-        // Cache column rectangles for mouse hit-testing
         self.cached_rects.info = Some(column_chunks[0]);
         self.cached_rects.chat = Some(column_chunks[1]);
-
-        // Determine border styles based on selection
         let (info_border_style, chat_border_style) = match self.selected_column {
             ModalColumn::Info => (
                 Style::default()
@@ -288,7 +327,6 @@ impl SessionModal {
                     .add_modifier(Modifier::BOLD),
             ),
         };
-
         self.render_modal_info(
             frame,
             column_chunks[0],
@@ -297,8 +335,6 @@ impl SessionModal {
             info_border_style,
         );
         self.render_modal_chat(frame, column_chunks[1], chat_border_style);
-
-        // Render instruction bar
         self.render_instructions(frame, instruction_area);
     }
 
@@ -311,20 +347,14 @@ impl SessionModal {
         session_titles: &FxHashMap<Box<str>, String>,
         border_style: Style,
     ) {
-        // Pre-allocate with estimated capacity to avoid reallocations
         let mut lines = Vec::with_capacity(50);
         let device = crate::device::get_device_info();
         let device_display = device.display_name();
-
         let title = session_titles
             .get(&session.id)
             .map(|t| t.strip_prefix("New session - ").unwrap_or(t))
             .unwrap_or("Untitled");
-
-        // Separator line after title
         lines.push(Line::from(""));
-
-        // Project section (best-effort git branch detection)
         let project = session.path_root.as_ref();
         if !project.is_empty() {
             lines.push(Line::from(vec![Span::styled(
@@ -333,17 +363,15 @@ impl SessionModal {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )]));
-            // Title with wrapping - prefix is "    Title:   " = 13 chars
-            let prefix_len: usize = 13; // "    Title:   "
-            let inner_width = area.width.saturating_sub(2) as usize; // borders
-            let first_line_width = inner_width.saturating_sub(prefix_len);
-            let continuation_width = inner_width.saturating_sub(prefix_len);
+            let prefix_len: usize = 14;
+            let inner_width = area.width.saturating_sub(2) as usize;
+            let value_width = inner_width.saturating_sub(prefix_len);
             let wrapped_title =
-                wrap_text_with_indent(title, first_line_width.max(1), continuation_width.max(1));
+                wrap_text_with_indent(title, value_width.max(1), value_width.max(1));
             for (i, line) in wrapped_title.into_iter().enumerate() {
                 if i == 0 {
                     lines.push(Line::from(vec![
-                        Span::raw("    Title:   "),
+                        Span::raw("    Title:    "),
                         Span::styled(line, Style::default().fg(Color::White)),
                     ]));
                 } else {
@@ -353,78 +381,25 @@ impl SessionModal {
                     ]));
                 }
             }
-            let value_width = inner_width.saturating_sub(prefix_len);
             lines.push(Line::from(vec![
-                Span::raw("    Project: "),
+                Span::raw("    Project:  "),
                 Span::styled(
                     safe_truncate_plain(project, value_width),
                     Style::default().fg(Color::White),
                 ),
             ]));
-
             if let Some(branch) = detect_git_branch(project) {
                 let branch_display = safe_truncate_plain(&branch, value_width).into_owned();
                 lines.push(Line::from(vec![
-                    Span::raw("    Branch:  "),
+                    Span::raw("    Branch:   "),
                     Span::styled(branch_display, Style::default().fg(Color::Cyan)),
                 ]));
             }
-
-            let active_dur = format_active_duration(session.active_duration_ms);
-            lines.push(Line::from(vec![
-                Span::raw("    Duration:"),
-                Span::styled(
-                    format!(" {}", active_dur),
-                    Style::default().fg(Color::Rgb(100, 200, 255)),
-                ),
-            ]));
-
-            // Models: inline comma-separated with +N overflow
-            {
-                let mut all_models: Vec<&str> = session.models.iter().map(|m| m.as_ref()).collect();
-                all_models.sort_unstable();
-                if !all_models.is_empty() {
-                    let label = "    Models:  ";
-                    let avail = value_width;
-                    let mut display = String::new();
-                    let mut shown = 0usize;
-                    for (i, model) in all_models.iter().enumerate() {
-                        let candidate = if display.is_empty() {
-                            (*model).to_string()
-                        } else {
-                            format!(", {}", model)
-                        };
-                        // Reserve space for possible "+N" suffix
-                        let remaining = all_models.len() - i - 1;
-                        let suffix_len = if remaining > 0 {
-                            format!(", +{}", remaining).len()
-                        } else {
-                            0
-                        };
-                        if display.len() + candidate.len() + suffix_len <= avail || i == 0 {
-                            display.push_str(&candidate);
-                            shown += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    let overflow = all_models.len() - shown;
-                    if overflow > 0 {
-                        display.push_str(&format!(", +{}", overflow));
-                    }
-                    lines.push(Line::from(vec![
-                        Span::raw(label),
-                        Span::styled(display, Style::default().fg(Color::Magenta)),
-                    ]));
-                }
-            }
-
-            // Device / Server line
             {
                 let (label, color) = if device.kind == "server" {
-                    ("    Server:  ", Color::Rgb(255, 165, 0))
+                    ("    Server:   ", Color::Rgb(255, 165, 0))
                 } else {
-                    ("    Device:  ", Color::Rgb(100, 200, 255))
+                    ("    Device:   ", Color::Rgb(100, 200, 255))
                 };
                 lines.push(Line::from(vec![
                     Span::raw(label),
@@ -434,18 +409,36 @@ impl SessionModal {
                     ),
                 ]));
             }
-
+            let active_dur = format_active_duration(session.active_duration_ms);
+            lines.push(Line::from(vec![
+                Span::raw("    Duration: "),
+                Span::styled(active_dur, Style::default().fg(Color::Rgb(100, 200, 255))),
+            ]));
+            {
+                let mut all_models: Vec<&str> = session.models.iter().map(|m| m.as_ref()).collect();
+                all_models.sort_unstable();
+                for (i, model) in all_models.iter().enumerate() {
+                    let label = if i == 0 {
+                        "    Models:   "
+                    } else {
+                        "              "
+                    };
+                    lines.push(Line::from(vec![
+                        Span::raw(label),
+                        Span::styled(
+                            safe_truncate_plain(model, value_width),
+                            Style::default().fg(Color::Magenta),
+                        ),
+                    ]));
+                }
+            }
             lines.push(Line::from(""));
         }
-
-        // Separator line after PROJECT section
         lines.push(Line::from(vec![Span::styled(
             "─".repeat((area.width - 2) as usize),
             Style::default().fg(Color::Rgb(50, 50, 70)),
         )]));
         lines.push(Line::from(""));
-
-        // AGENTS section
         if !session.agents.is_empty() {
             lines.push(Line::from(vec![Span::styled(
                 format!("  AGENTS ({})", session.agents.len()),
@@ -454,7 +447,6 @@ impl SessionModal {
                     .add_modifier(Modifier::BOLD),
             )]));
             lines.push(Line::from(""));
-
             for agent in &session.agents {
                 let name_color = if agent.is_main {
                     Color::Cyan
@@ -468,7 +460,7 @@ impl SessionModal {
                 } else {
                     String::new()
                 };
-                let prefix_len = 6; // "    ● "
+                let prefix_len = 6;
                 let max_content =
                     (area.width.saturating_sub(2) as usize).saturating_sub(prefix_len);
                 let agent_name = &agent.name;
@@ -497,7 +489,6 @@ impl SessionModal {
                         Span::styled(suffix_part, Style::default().fg(Color::Magenta)),
                     ]));
                 }
-
                 let agent_active_dur = format_active_duration(agent.active_duration_ms);
                 lines.push(Line::from(vec![
                     Span::styled("      Duration   ", Style::default().fg(Color::DarkGray)),
@@ -506,8 +497,6 @@ impl SessionModal {
                         Style::default().fg(Color::Rgb(100, 200, 255)),
                     ),
                 ]));
-
-                // Messages count
                 lines.push(Line::from(vec![
                     Span::styled("      Messages   ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
@@ -515,8 +504,6 @@ impl SessionModal {
                         Style::default().fg(Color::White),
                     ),
                 ]));
-
-                // Token details - single column, aligned
                 let token_rows = [
                     ("Input", format_number(agent.tokens.input), Color::Blue),
                     ("Output", format_number(agent.tokens.output), Color::Green),
@@ -536,26 +523,20 @@ impl SessionModal {
                         Color::Yellow,
                     ),
                 ];
-
                 for (label, value, color) in &token_rows {
                     lines.push(Line::from(vec![
                         Span::styled(format!("      {:<11}", label), Style::default().fg(*color)),
                         Span::styled(format!("{:>10}", value), Style::default().fg(Color::White)),
                     ]));
                 }
-
                 lines.push(Line::from(""));
             }
         }
-
-        // Separator before MODEL
         lines.push(Line::from(vec![Span::styled(
             "─".repeat((area.width - 2) as usize),
             Style::default().fg(Color::Rgb(50, 50, 70)),
         )]));
         lines.push(Line::from(""));
-
-        // MODEL section (per-model token breakdown)
         let details = self.session_details.as_ref();
         if let Some(d) = details {
             for (idx, model) in d.model_stats.iter().enumerate() {
@@ -565,24 +546,22 @@ impl SessionModal {
                     "MODEL:".to_string()
                 };
                 let header_prefix = format!("  {} ", prefix);
-                let header_prefix_len = header_prefix.chars().count();
-                let model_max =
-                    (area.width.saturating_sub(2) as usize).saturating_sub(header_prefix_len);
-                let mut model_header_spans = Vec::with_capacity(2);
-                model_header_spans.push(Span::styled(
-                    header_prefix,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                model_header_spans.push(Span::styled(
-                    safe_truncate_plain(&model.name, model_max),
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                lines.push(Line::from(model_header_spans));
-
+                let model_max = (area.width.saturating_sub(2) as usize)
+                    .saturating_sub(header_prefix.chars().count());
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        header_prefix,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        safe_truncate_plain(&model.name, model_max),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
                 let left_labels = [
                     ("Input", format_number(model.tokens.input), Color::Blue),
                     ("Output", format_number(model.tokens.output), Color::Green),
@@ -602,7 +581,6 @@ impl SessionModal {
                         Color::Yellow,
                     ),
                 ];
-
                 let responses = model.messages.saturating_sub(model.prompts);
                 let model_cost = model.cost;
                 let model_est = model_cost
@@ -629,15 +607,11 @@ impl SessionModal {
                         },
                     ),
                 ];
-
                 let inner_width = area.width.saturating_sub(2) as usize;
-                // 6 (indent) + 11 (label) + 10 (value) + 7 (sep) + 11 (label) + 10 (value) = 55
                 let show_right_column = inner_width >= 55;
-
                 for i in 0..5 {
                     let mut spans = Vec::with_capacity(7);
                     spans.push(Span::raw("      "));
-
                     if i < left_labels.len() {
                         let (label, value, color) = &left_labels[i];
                         spans.push(Span::styled(
@@ -651,7 +625,6 @@ impl SessionModal {
                     } else if show_right_column {
                         spans.push(Span::raw(" ".repeat(21)));
                     }
-
                     if show_right_column {
                         spans.push(Span::styled(
                             "   │   ",
@@ -669,41 +642,31 @@ impl SessionModal {
                             ));
                         }
                     }
-
                     lines.push(Line::from(spans));
                 }
-
                 lines.push(Line::from(""));
             }
         }
-
-        // Separator before TOTAL USAGE
         lines.push(Line::from(vec![Span::styled(
             "─".repeat((area.width - 2) as usize),
             Style::default().fg(Color::Rgb(50, 50, 70)),
         )]));
         lines.push(Line::from(""));
-
-        // Total usage
         lines.push(Line::from(vec![Span::styled(
             "  TOTAL USAGE",
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )]));
-
-        let total_tokens = session.tokens.total();
         lines.push(Line::from(vec![
             Span::styled("      Tokens     ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{:>10}", format_number(total_tokens)),
+                format!("{:>10}", format_number(session.tokens.total())),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
-
-        let total_responses = session.messages.saturating_sub(session.prompts);
         lines.push(Line::from(vec![
             Span::styled("      Prompts    ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -716,7 +679,7 @@ impl SessionModal {
         lines.push(Line::from(vec![
             Span::styled("      Responses  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{:>10}", total_responses),
+                format!("{:>10}", session.messages.saturating_sub(session.prompts)),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
@@ -731,7 +694,6 @@ impl SessionModal {
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
-
         let total_cost = session.cost;
         let total_non_cache =
             (session.tokens.input + session.tokens.output + session.tokens.reasoning).max(1) as f64;
@@ -760,15 +722,11 @@ impl SessionModal {
             ),
         ]));
         lines.push(Line::from(""));
-
-        // Separator before file changes
         lines.push(Line::from(vec![Span::styled(
             "─".repeat((area.width - 2) as usize),
             Style::default().fg(Color::Rgb(50, 50, 70)),
         )]));
         lines.push(Line::from(""));
-
-        // File changes section
         if !session.file_diffs.is_empty() {
             lines.push(Line::from(vec![Span::styled(
                 "  FILE CHANGES",
@@ -776,20 +734,11 @@ impl SessionModal {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )]));
-
             let max_val_len = 6usize;
-            let diff_block_width = (max_val_len + 1) * 2 + 3; // 17 (7+3+7)
-            let fixed_prefix = 14; // 4 + 10
-            let status_sep = 1;
-            let path_sep = 2;
-            let right_margin = 5; // Add space at the end of the panel
-
-            let inner_width = area.width.saturating_sub(2) as usize;
-            let needed_width =
-                fixed_prefix + status_sep + path_sep + diff_block_width + right_margin;
-            let path_display_width = inner_width.saturating_sub(needed_width);
-            let show_diffs = inner_width >= needed_width;
-
+            let needed_width = 4 + 10 + 1 + 2 + (max_val_len + 1) * 2 + 3 + 5;
+            let path_display_width =
+                (area.width.saturating_sub(2) as usize).saturating_sub(needed_width);
+            let show_diffs = (area.width.saturating_sub(2) as usize) >= needed_width;
             for f in &session.file_diffs {
                 let status_text = match f.status.as_ref() {
                     "added" => "   added",
@@ -797,87 +746,87 @@ impl SessionModal {
                     "deleted" => " deleted",
                     _ => " unknown",
                 };
-
-                let mut file_spans = Vec::with_capacity(10);
-                file_spans.push(Span::raw("    "));
-                file_spans.push(Span::styled(
-                    format!("[{}]", status_text),
-                    Style::default().fg(Color::DarkGray),
-                ));
-
+                let mut file_spans = vec![
+                    Span::raw("    "),
+                    Span::styled(
+                        format!("[{}]", status_text),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ];
                 if show_diffs {
-                    file_spans.push(Span::raw(" ")); // status_sep
-
-                    let path_count = f.path.chars().count();
-                    let short_path = if path_count > path_display_width {
-                        let visible_chars = path_display_width.saturating_sub(3);
-                        let truncated: String = f.path.chars().take(visible_chars).collect();
-                        format!("{}...", truncated)
+                    file_spans.push(Span::raw(" "));
+                    let short_path = if f.path.chars().count() > path_display_width {
+                        format!(
+                            "{}…",
+                            f.path
+                                .chars()
+                                .take(path_display_width.saturating_sub(1))
+                                .collect::<String>()
+                        )
                     } else {
                         format!("{:<width$}", f.path, width = path_display_width)
                     };
-
-                    file_spans.push(Span::styled(short_path, Style::default().fg(Color::White)));
-                    file_spans.push(Span::raw("  ")); // path_sep
-
-                    let add_str = format_number(f.additions);
-                    let add_sign_str = format!("+{}", add_str);
-                    file_spans.push(Span::styled(
-                        format!("{:>width$}", add_sign_str, width = max_val_len + 1),
-                        Style::default().fg(Color::Green),
-                    ));
-                    file_spans.push(Span::styled(
-                        " │ ",
-                        Style::default().fg(Color::Rgb(40, 40, 50)),
-                    ));
-                    let del_str = format_number(f.deletions);
-                    let del_sign_str = format!("-{}", del_str);
-                    file_spans.push(Span::styled(
-                        format!("{:>width$}", del_sign_str, width = max_val_len + 1),
-                        Style::default().fg(Color::Red),
-                    ));
+                    file_spans.extend(vec![
+                        Span::styled(short_path, Style::default().fg(Color::White)),
+                        Span::raw("  "),
+                        Span::styled(
+                            format!(
+                                "{:>width$}",
+                                format!("+{}", format_number(f.additions)),
+                                width = max_val_len + 1
+                            ),
+                            Style::default().fg(Color::Green),
+                        ),
+                        Span::styled(" │ ", Style::default().fg(Color::Rgb(40, 40, 50))),
+                        Span::styled(
+                            format!(
+                                "{:>width$}",
+                                format!("-{}", format_number(f.deletions)),
+                                width = max_val_len + 1
+                            ),
+                            Style::default().fg(Color::Red),
+                        ),
+                    ]);
                 }
                 lines.push(Line::from(file_spans));
             }
-
-            // Add separator line and total (without "total" label)
             if show_diffs {
-                let mut sep_spans = Vec::new();
-                let diff_start = fixed_prefix + status_sep + path_display_width + path_sep;
-                sep_spans.push(Span::raw(" ".repeat(diff_start)));
-
-                let dash_part = "─".repeat(max_val_len + 1); // 8
-                sep_spans.push(Span::styled(
-                    format!("{}─┼─{}", dash_part, dash_part),
-                    Style::default().fg(Color::Rgb(40, 40, 50)),
-                ));
-                lines.push(Line::from(sep_spans));
-
-                let mut total_spans = Vec::with_capacity(4);
-                total_spans.push(Span::raw(" ".repeat(diff_start)));
-
-                let add_str = format_number(session.diffs.additions);
-                let add_sign_str = format!("+{}", add_str);
-                total_spans.push(Span::styled(
-                    format!("{:>width$}", add_sign_str, width = max_val_len + 1),
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                total_spans.push(Span::styled(
-                    " │ ",
-                    Style::default().fg(Color::Rgb(40, 40, 50)),
-                ));
-                let del_str = format_number(session.diffs.deletions);
-                let del_sign_str = format!("-{}", del_str);
-                total_spans.push(Span::styled(
-                    format!("{:>width$}", del_sign_str, width = max_val_len + 1),
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ));
-                lines.push(Line::from(total_spans));
+                let diff_start = 4 + 10 + 1 + path_display_width + 2;
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(diff_start)),
+                    Span::styled(
+                        format!(
+                            "{}─┼─{}",
+                            "─".repeat(max_val_len + 1),
+                            "─".repeat(max_val_len + 1)
+                        ),
+                        Style::default().fg(Color::Rgb(40, 40, 50)),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(diff_start)),
+                    Span::styled(
+                        format!(
+                            "{:>width$}",
+                            format!("+{}", format_number(session.diffs.additions)),
+                            width = max_val_len + 1
+                        ),
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" │ ", Style::default().fg(Color::Rgb(40, 40, 50))),
+                    Span::styled(
+                        format!(
+                            "{:>width$}",
+                            format!("-{}", format_number(session.diffs.deletions)),
+                            width = max_val_len + 1
+                        ),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
             }
         } else {
-            // No file changes
             lines.push(Line::from(vec![Span::styled(
                 "  FILE CHANGES ",
                 Style::default()
@@ -890,20 +839,15 @@ impl SessionModal {
                 Style::default().fg(Color::DarkGray),
             )]));
         }
-
-        // Compute max scroll from actual content vs inner height (borders = 2)
         let inner_height = area.height.saturating_sub(2) as usize;
         let info_max_scroll = (lines.len().saturating_sub(inner_height)) as u16;
         self.cached_rects.info_max_scroll = info_max_scroll;
-        let scroll = self.info_scroll.min(info_max_scroll);
-        self.info_scroll = scroll;
+        self.info_scroll = self.info_scroll.min(info_max_scroll);
         let visible: Vec<Line> = lines
             .into_iter()
-            .skip(scroll as usize)
+            .skip(self.info_scroll as usize)
             .take(inner_height)
             .collect();
-
-        // Build title: show session ID and continuation info
         let title_text = if session.is_continuation {
             if let Some(first_date) = &session.first_created_date {
                 format!("  {}  [Continue from {}]  ", session.id, first_date)
@@ -913,13 +857,11 @@ impl SessionModal {
         } else {
             format!("  {}  ", session.id)
         };
-
         let title_color = if border_style.fg == Some(Color::Cyan) {
             Color::Cyan
         } else {
             Color::DarkGray
         };
-
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
@@ -931,9 +873,8 @@ impl SessionModal {
                         .fg(title_color)
                         .add_modifier(Modifier::BOLD),
                 ))
-                .alignment(ratatui::layout::Alignment::Center),
+                .alignment(Alignment::Center),
             );
-
         frame.render_widget(
             Paragraph::new(visible)
                 .block(block)
@@ -942,199 +883,265 @@ impl SessionModal {
         );
     }
 
-    /// Render modal chat panel
+    /// Render modal chat panel — redesigned with role-colored boxes,
+    /// collapsed/expanded blocks, grouped tools, and edit diffs.
     fn render_modal_chat(&mut self, frame: &mut Frame, area: Rect, border_style: Style) {
-        // Pre-allocate with estimated capacity to avoid reallocations
-        let mut lines = Vec::with_capacity(self.chat_messages.len() * 15);
-        let inner_width = area.width.saturating_sub(2) as usize;
+        let mut lines: Vec<Line> = Vec::with_capacity(self.chat_messages.len() * 10);
+        let inner_w = area.width.saturating_sub(2) as usize;
+        let box_w = inner_w.saturating_sub(2);
 
-        let mut current_subagent: Option<&str> = None;
+        // ── Phase 1: group messages into blocks ──
+        enum ChatBlock {
+            Single(usize),
+            SubagentGroup(Vec<(Box<str>, Vec<usize>)>),
+        }
+        let msgs = &*self.chat_messages;
+        let mut blocks: Vec<ChatBlock> = Vec::new();
+        let mut i = 0;
+        while i < msgs.len() {
+            if msgs[i].is_subagent {
+                let start = i;
+                while i < msgs.len() && msgs[i].is_subagent {
+                    i += 1;
+                }
+                let mut agent_order: Vec<Box<str>> = Vec::new();
+                let mut agent_msgs: FxHashMap<Box<str>, Vec<usize>> = FxHashMap::default();
+                for idx in start..i {
+                    let name: Box<str> = msgs[idx]
+                        .agent_label
+                        .clone()
+                        .unwrap_or_else(|| "subagent".into());
+                    if !agent_msgs.contains_key(&name) {
+                        agent_order.push(name.clone());
+                    }
+                    agent_msgs.entry(name).or_default().push(idx);
+                }
+                let groups: Vec<(Box<str>, Vec<usize>)> = agent_order
+                    .into_iter()
+                    .map(|n| (n.clone(), agent_msgs.remove(&n).unwrap_or_default()))
+                    .collect();
+                blocks.push(ChatBlock::SubagentGroup(groups));
+            } else {
+                blocks.push(ChatBlock::Single(i));
+                i += 1;
+            }
+        }
 
-        for msg in self.chat_messages.iter() {
-            // Check for sub-agent transitions
-            let msg_agent = msg.agent_label.as_deref();
-
-            if msg.is_subagent && current_subagent != msg_agent {
-                // Close previous sub-agent if any
-                if current_subagent.is_some() {
-                    let end_label = format!(" ══ end {} ", current_subagent.unwrap());
-                    let end_dashes = "═".repeat(inner_width.saturating_sub(end_label.len()));
+        // ── Phase 2: render blocks ──
+        self.chat_click_targets.clear();
+        for block in &blocks {
+            match block {
+                ChatBlock::Single(idx) => {
+                    let msg = &msgs[*idx];
+                    let is_expanded = self.expanded_messages.contains(idx);
+                    self.chat_click_targets
+                        .push((lines.len() as u16, ChatClickTarget::Message(*idx)));
+                    if &*msg.role == "user" {
+                        render_user_box(&mut lines, msg, box_w, is_expanded);
+                    } else if &*msg.role == "assistant" {
+                        render_agent_box(
+                            &mut lines,
+                            msg,
+                            box_w,
+                            is_expanded,
+                            *idx,
+                            &mut self.chat_click_targets,
+                            &self.expanded_tools,
+                        );
+                    } else {
+                        render_system_line(&mut lines, msg, box_w, is_expanded);
+                    }
+                    lines.push(Line::from(""));
+                }
+                ChatBlock::SubagentGroup(agents) => {
+                    let outer_color = Color::Rgb(100, 75, 0);
+                    let header = format!(" 🔀 SUBAGENTS ({}) ", agents.len());
+                    let dash_len = box_w.saturating_sub(header.chars().count() + 2);
                     lines.push(Line::from(vec![
+                        Span::raw(" "),
+                        Span::styled("┌", Style::default().fg(outer_color)),
                         Span::styled(
-                            end_label,
+                            header,
                             Style::default()
-                                .fg(Color::Rgb(255, 165, 0))
+                                .fg(Color::Rgb(200, 150, 50))
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(end_dashes, Style::default().fg(Color::Rgb(80, 60, 0))),
+                        Span::styled("╌".repeat(dash_len), Style::default().fg(outer_color)),
+                    ]));
+                    for (ag_idx, (agent_name, msg_indices)) in agents.iter().enumerate() {
+                        let ag_color = subagent_color(ag_idx);
+                        let ag_dim = dim_color(ag_color);
+                        let is_expanded = self.expanded_agents.contains(agent_name);
+                        let toggle_label = if is_expanded {
+                            "▼ collapse"
+                        } else {
+                            "▶ expand"
+                        };
+                        let (total_tools, tool_stats) = aggregate_tools_in_group(msgs, msg_indices);
+                        let card_w = box_w.saturating_sub(4);
+                        self.chat_click_targets.push((
+                            lines.len() as u16,
+                            ChatClickTarget::Agent(agent_name.clone()),
+                        ));
+                        let model_str = msg_indices
+                            .first()
+                            .and_then(|&mi| msgs[mi].model.as_deref())
+                            .unwrap_or("");
+                        let card_label = if model_str.is_empty() {
+                            format!(" 🤖 {} ", agent_name)
+                        } else {
+                            format!(" 🤖 {} ({}) ", agent_name, model_str)
+                        };
+                        let card_dash = card_w.saturating_sub(
+                            card_label.chars().count() + 2 + toggle_label.len() + 1,
+                        );
+                        lines.push(Line::from(vec![
+                            Span::raw("   "),
+                            Span::styled("┌", Style::default().fg(ag_dim)),
+                            Span::styled(
+                                card_label,
+                                Style::default().fg(ag_color).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled("╌".repeat(card_dash), Style::default().fg(ag_dim)),
+                            Span::styled(
+                                format!(" {}", toggle_label),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]));
+                        if is_expanded {
+                            for &mi in msg_indices {
+                                let m = &msgs[mi];
+                                let prefix_p = if &*m.role == "user" {
+                                    ("👤", Color::Cyan)
+                                } else {
+                                    ("🤖", ag_color)
+                                };
+                                for part in &m.parts {
+                                    match part {
+                                        MessageContent::Text(t) => {
+                                            for line in wrap_text_plain(t, card_w.saturating_sub(6))
+                                            {
+                                                lines.push(Line::from(vec![
+                                                    Span::styled(
+                                                        "   ┊ ",
+                                                        Style::default().fg(ag_dim),
+                                                    ),
+                                                    Span::styled(
+                                                        format!("{} ", prefix_p.0),
+                                                        Style::default().fg(prefix_p.1),
+                                                    ),
+                                                    Span::styled(
+                                                        line,
+                                                        Style::default()
+                                                            .fg(Color::Rgb(200, 200, 200)),
+                                                    ),
+                                                ]));
+                                            }
+                                        }
+                                        MessageContent::Thinking(_) => {
+                                            lines.push(Line::from(vec![
+                                                Span::styled("   ┊ ", Style::default().fg(ag_dim)),
+                                                Span::styled(
+                                                    "  💭 thinking...",
+                                                    Style::default().fg(Color::Rgb(70, 70, 80)),
+                                                ),
+                                            ]));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            if total_tools > 0 {
+                                lines.push(Line::from(vec![Span::styled(
+                                    "   ┊ ",
+                                    Style::default().fg(ag_dim),
+                                )]));
+                                let target_id =
+                                    format!("tools:agent:{}", agent_name).into_boxed_str();
+                                let tools_expanded = self.expanded_tools.contains(&target_id);
+                                render_tool_stats_box(
+                                    &mut lines,
+                                    "   ┊  ",
+                                    ag_dim,
+                                    card_w,
+                                    total_tools,
+                                    &tool_stats,
+                                    tools_expanded,
+                                    &mut self.chat_click_targets,
+                                    target_id,
+                                );
+                            }
+                        } else {
+                            let mut first_p = None;
+                            for &mi in msg_indices {
+                                if &*msgs[mi].role == "user" {
+                                    if let Some(MessageContent::Text(t)) = msgs[mi].parts.first() {
+                                        first_p = Some(t);
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(p) = first_p {
+                                lines.push(Line::from(vec![
+                                    Span::styled("   ┊ ", Style::default().fg(ag_dim)),
+                                    Span::styled(
+                                        format!(
+                                            " \"{}\"",
+                                            safe_truncate(p, card_w.saturating_sub(4))
+                                        ),
+                                        Style::default().fg(Color::Rgb(140, 140, 140)),
+                                    ),
+                                ]));
+                            }
+                            if total_tools > 0 {
+                                let target_id =
+                                    format!("tools:agent:{}", agent_name).into_boxed_str();
+                                let tools_expanded = self.expanded_tools.contains(&target_id);
+                                render_tool_stats_box(
+                                    &mut lines,
+                                    "   ┊  ",
+                                    ag_dim,
+                                    card_w,
+                                    total_tools,
+                                    &tool_stats,
+                                    tools_expanded,
+                                    &mut self.chat_click_targets,
+                                    target_id,
+                                );
+                            }
+                        }
+                        lines.push(Line::from(vec![
+                            Span::raw("   "),
+                            Span::styled(
+                                format!("└{}", "╌".repeat(card_w.saturating_sub(1))),
+                                Style::default().fg(ag_dim),
+                            ),
+                        ]));
+                    }
+                    lines.push(Line::from(vec![
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("└{}", "╌".repeat(box_w.saturating_sub(1))),
+                            Style::default().fg(outer_color),
+                        ),
                     ]));
                     lines.push(Line::from(""));
                 }
-                // Open new sub-agent
-                let agent_name = msg_agent.unwrap_or("subagent");
-                let start_label = format!(" ══ {} ", agent_name);
-                let start_dashes = "═".repeat(inner_width.saturating_sub(start_label.len()));
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        start_label,
-                        Style::default()
-                            .fg(Color::Rgb(255, 165, 0))
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(start_dashes, Style::default().fg(Color::Rgb(80, 60, 0))),
-                ]));
-                lines.push(Line::from(""));
-                current_subagent = msg_agent;
-            } else if !msg.is_subagent && current_subagent.is_some() {
-                // Leaving sub-agent context
-                let end_label = format!(" ══ end {} ", current_subagent.unwrap());
-                let end_dashes = "═".repeat(inner_width.saturating_sub(end_label.len()));
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        end_label,
-                        Style::default()
-                            .fg(Color::Rgb(255, 165, 0))
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(end_dashes, Style::default().fg(Color::Rgb(80, 60, 0))),
-                ]));
-                lines.push(Line::from(""));
-                current_subagent = None;
             }
-
-            // Role header (the AGENT/SUBAGENT logic)
-            let (role_icon, role_label, role_color) = if &*msg.role == "assistant" {
-                if msg.is_subagent {
-                    ("🤖", "SUBAGENT".to_string(), Color::Rgb(255, 165, 0))
-                } else {
-                    ("🤖", "AGENT".to_string(), Color::Green)
-                }
-            } else {
-                let (icon, label, color) = get_role_info(&msg.role);
-                (icon, label, color)
-            };
-
-            let display_role = if &*msg.role == "assistant" {
-                if let Some(model) = &msg.model {
-                    format!("{} ({})", role_label, model)
-                } else {
-                    role_label
-                }
-            } else {
-                role_label
-            };
-
-            let header_label = format!(" {} {} ", role_icon, display_role);
-            let dash_len = inner_width.saturating_sub(header_label.len());
-            let dash_line = "─".repeat(dash_len);
-
-            let header_spans = vec![
-                Span::styled(
-                    header_label,
-                    Style::default().fg(role_color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(dash_line, Style::default().fg(Color::Rgb(50, 50, 60))),
-            ];
-            lines.push(Line::from(header_spans));
-
-            // Message content
-            for part in &msg.parts {
-                match part {
-                    MessageContent::Text(text) => {
-                        let (max_line_chars, max_lines) = match &*msg.role {
-                            "user" => (150, 5),
-                            "assistant" => (250, 10),
-                            _ => (200, 6),
-                        };
-                        let line_count = text.lines().count();
-                        for (line_idx, l) in text.lines().enumerate() {
-                            if line_idx >= max_lines {
-                                let mut more_spans = Vec::with_capacity(2);
-                                more_spans.push(Span::raw("  "));
-                                more_spans.push(Span::styled(
-                                    format!("... ({} more)", line_count - max_lines),
-                                    Style::default().fg(Color::Rgb(100, 100, 100)),
-                                ));
-                                lines.push(Line::from(more_spans));
-                                break;
-                            }
-                            let text_spans =
-                                vec![Span::raw("  "), Span::raw(safe_truncate(l, max_line_chars))];
-                            lines.push(Line::from(text_spans));
-                        }
-                    }
-                    MessageContent::ToolCall(tool_info) => {
-                        let display = match (&tool_info.file_path, &tool_info.title) {
-                            (Some(fp), _) => {
-                                let parts: Vec<&str> = fp.rsplit('/').take(2).collect();
-                                let short_path = if parts.len() >= 2 {
-                                    format!("{}/{}", parts[1], parts[0])
-                                } else {
-                                    parts[0].to_string()
-                                };
-                                format!("{} → {}", tool_info.name, short_path)
-                            }
-                            (None, Some(title)) => {
-                                format!("{}: {}", tool_info.name, safe_truncate_plain(title, 40))
-                            }
-                            (None, None) => tool_info.name.to_string(),
-                        };
-                        let tool_spans = vec![
-                            Span::raw("    "),
-                            Span::styled("▸ ", Style::default().fg(Color::Cyan)),
-                            Span::styled(
-                                display,
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::ITALIC),
-                            ),
-                        ];
-                        lines.push(Line::from(tool_spans));
-                    }
-                    MessageContent::Thinking(_) => {
-                        let think_spans = vec![
-                            Span::raw("  "),
-                            Span::styled(
-                                "> Thinking...",
-                                Style::default().fg(Color::Rgb(80, 80, 80)),
-                            ),
-                        ];
-                        lines.push(Line::from(think_spans));
-                    }
-                }
-            }
-
-            lines.push(Line::from(""));
         }
-
-        // Close final sub-agent banner if still open
-        if current_subagent.is_some() {
-            let end_label = format!(" ══ end {} ", current_subagent.unwrap());
-            let end_dashes = "═".repeat(inner_width.saturating_sub(end_label.len()));
-            lines.push(Line::from(vec![
-                Span::styled(
-                    end_label,
-                    Style::default()
-                        .fg(Color::Rgb(255, 165, 0))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(end_dashes, Style::default().fg(Color::Rgb(80, 60, 0))),
-            ]));
-            lines.push(Line::from(""));
-        }
-
-        let inner_height = area.height.saturating_sub(2) as usize;
-        self.chat_max_scroll = (lines.len().saturating_sub(inner_height)) as u16;
+        let inner_h = area.height.saturating_sub(2) as usize;
+        self.chat_max_scroll = (lines.len().saturating_sub(inner_h)) as u16;
         self.chat_scroll = self.chat_scroll.min(self.chat_max_scroll);
-        let scroll = self.chat_scroll as usize;
-        let visible: Vec<Line> = lines.into_iter().skip(scroll).take(inner_height).collect();
-
+        let visible: Vec<Line> = lines
+            .into_iter()
+            .skip(self.chat_scroll as usize)
+            .take(inner_h)
+            .collect();
         let title_color = if border_style.fg == Some(Color::Cyan) {
             Color::Cyan
         } else {
             Color::DarkGray
         };
-
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
@@ -1146,9 +1153,8 @@ impl SessionModal {
                         .fg(title_color)
                         .add_modifier(Modifier::BOLD),
                 ))
-                .alignment(ratatui::layout::Alignment::Center),
+                .alignment(Alignment::Center),
             );
-
         frame.render_widget(
             Paragraph::new(visible)
                 .block(block)
@@ -1164,7 +1170,6 @@ impl SessionModal {
             .add_modifier(Modifier::BOLD);
         let t = Style::default().fg(Color::DarkGray);
         let sep = Span::styled(" │ ", Style::default().fg(Color::Rgb(50, 50, 70)));
-
         let instructions = vec![Line::from(vec![
             Span::styled("←→/Click", k),
             Span::styled(" column", t),
@@ -1178,37 +1183,923 @@ impl SessionModal {
             Span::styled("Esc/q/Right-click", k),
             Span::styled(" close", t),
         ])];
-
         let status_bar = Paragraph::new(instructions)
             .style(Style::default().bg(Color::Rgb(15, 15, 25)))
             .alignment(Alignment::Center);
-
         frame.render_widget(status_bar, area);
     }
 }
 
-/// Helper: Truncate string with ellipsis if too long
-/// Returns a static string slice - optimized to avoid allocations
-#[inline]
-fn safe_truncate(s: &str, max_len: usize) -> &str {
-    if s.chars().count() <= max_len {
-        return s;
+// ── Chat panel helpers ──
+
+/// One invocation of a tool, with its file path, input text, and diff stats.
+struct ToolInvocation {
+    file_path: Option<String>,
+    input: Option<String>,
+}
+
+struct ToolStatsEntry {
+    count: usize,
+    invocations: Vec<ToolInvocation>,
+}
+
+fn aggregate_tools_in_group(
+    msgs: &[ChatMessage],
+    indices: &[usize],
+) -> (usize, FxHashMap<String, ToolStatsEntry>) {
+    let mut stats: FxHashMap<String, ToolStatsEntry> = FxHashMap::default();
+    let mut total = 0;
+    for &mi in indices {
+        for part in &msgs[mi].parts {
+            if let MessageContent::ToolCall(tc) = part {
+                total += 1;
+                let entry = stats
+                    .entry(normalize_tool_name(&tc.name))
+                    .or_insert_with(|| ToolStatsEntry {
+                        count: 0,
+                        invocations: Vec::new(),
+                    });
+                entry.count += 1;
+                entry.invocations.push(ToolInvocation {
+                    file_path: tc.file_path.as_deref().map(|s| s.to_string()),
+                    input: tc.input.as_deref().map(|s| s.to_string()),
+                });
+            }
+        }
     }
-    let target = max_len.saturating_sub(3);
+    (total, stats)
+}
+
+fn render_tool_stats_box<'a>(
+    lines: &mut Vec<Line<'a>>,
+    prefix: &'a str,
+    dim_color: Color,
+    card_w: usize,
+    total_tools: usize,
+    tool_stats: &FxHashMap<String, ToolStatsEntry>,
+    is_expanded: bool,
+    click_targets: &mut Vec<(u16, ChatClickTarget)>,
+    target_id: Box<str>,
+) {
+    let inner_w = card_w.saturating_sub(6);
+    let frame_color = Color::Rgb(50, 50, 60);
+    let toggle_label = if is_expanded {
+        "▼ collapse"
+    } else {
+        "▶ expand"
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled(prefix, Style::default().fg(dim_color)),
+        Span::styled(
+            format!("┌{}┐", "─".repeat(inner_w)),
+            Style::default().fg(frame_color),
+        ),
+    ]));
+
+    // Record click target for the tool box header
+    click_targets.push((lines.len() as u16, ChatClickTarget::ToolBox(target_id)));
+
+    let header = format!("tools used ({})", total_tools);
+    let dash_len = inner_w.saturating_sub(header.chars().count() + toggle_label.len() + 3);
+    lines.push(Line::from(vec![
+        Span::styled(prefix, Style::default().fg(dim_color)),
+        Span::styled("│ ", Style::default().fg(frame_color)),
+        Span::styled(
+            header,
+            Style::default()
+                .fg(Color::Rgb(170, 170, 185))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ".repeat(dash_len), Style::default().fg(frame_color)),
+        Span::styled(
+            format!(" {}", toggle_label),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(" │", Style::default().fg(frame_color)),
+    ]));
+
+    lines.push(Line::from(vec![
+        Span::styled(prefix, Style::default().fg(dim_color)),
+        Span::styled("├", Style::default().fg(frame_color)),
+        Span::styled("─".repeat(inner_w), Style::default().fg(frame_color)),
+        Span::styled("┤", Style::default().fg(frame_color)),
+    ]));
+
+    let mut tools: Vec<(&String, &ToolStatsEntry)> = tool_stats.iter().collect();
+    tools.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(&b.0)));
+
+    for (name, entry) in tools {
+        // Summary line intentionally keeps only tool name + count.
+        // File/path details are shown in expanded rows below.
+        let row = format!("{} {}: x{}", tool_icon(name), name, entry.count);
+        push_tool_line(
+            lines,
+            prefix,
+            dim_color,
+            frame_color,
+            inner_w,
+            &row,
+            Color::Rgb(140, 140, 155),
+        );
+
+        if is_expanded {
+            let detail_w = inner_w.saturating_sub(6);
+            // Group by file for file-centric tools, even with a single invocation,
+            // to keep output layout consistent and avoid odd indentation shifts.
+            let is_file_tool = matches!(name.as_str(), "read" | "edit" | "write" | "apply_patch");
+            if is_file_tool {
+                // Group by file path
+                let mut file_groups: Vec<(String, Vec<&ToolInvocation>)> = Vec::new();
+                let mut file_order: Vec<String> = Vec::new();
+                let mut file_map: FxHashMap<String, Vec<&ToolInvocation>> = FxHashMap::default();
+                for inv in &entry.invocations {
+                    let key = inv.file_path.as_deref().unwrap_or("(unknown)").to_string();
+                    if !file_map.contains_key(&key) {
+                        file_order.push(key.clone());
+                    }
+                    file_map.entry(key).or_default().push(inv);
+                }
+                for key in file_order {
+                    file_groups.push((key.clone(), file_map.remove(&key).unwrap_or_default()));
+                }
+                for (fp, invs) in &file_groups {
+                    let short_fp = short_file_path(Some(fp));
+                    // Consistent layout: always file header then per-call details.
+                    let header = format!("  {} (x{})", short_fp, invs.len());
+                    push_tool_line(
+                        lines,
+                        prefix,
+                        dim_color,
+                        frame_color,
+                        inner_w,
+                        &header,
+                        Color::Rgb(140, 140, 150),
+                    );
+
+                    // Keep file-only tools clean: show file counts only.
+                    // Detailed per-invocation lines are useful for read, but
+                    // often repetitive/noisy for edit/write/apply_patch.
+                    let show_per_call_details = matches!(name.as_str(), "read");
+                    if !show_per_call_details {
+                        continue;
+                    }
+
+                    let mut seen_subdetails: FxHashSet<String> = FxHashSet::default();
+                    let mut rendered_subdetail = false;
+                    for inv in invs {
+                        let detail =
+                            tool_invocation_secondary_detail(name, inv, detail_w.saturating_sub(6))
+                                .or_else(|| {
+                                    tool_invocation_primary_detail(
+                                        name,
+                                        inv,
+                                        detail_w.saturating_sub(6),
+                                    )
+                                });
+
+                        if let Some(sub_detail) = detail {
+                            let normalized = sub_detail.trim().to_string();
+                            let is_redundant_path = normalized == short_fp;
+                            let is_redundant_write =
+                                matches!(name.as_str(), "edit" | "write" | "apply_patch")
+                                    && matches!(normalized.as_str(), "write" | "edit");
+                            if is_redundant_path || is_redundant_write {
+                                continue;
+                            }
+                            if !seen_subdetails.insert(normalized.clone()) {
+                                continue;
+                            }
+                            let sub_line = format!("    - {}", sub_detail);
+                            push_tool_line(
+                                lines,
+                                prefix,
+                                dim_color,
+                                frame_color,
+                                inner_w,
+                                &sub_line,
+                                Color::Rgb(120, 120, 130),
+                            );
+                            rendered_subdetail = true;
+                        }
+                    }
+
+                    if !rendered_subdetail {
+                        let fallback = if *fp == "(unknown)" {
+                            "    - no file metadata"
+                        } else {
+                            "    - no per-call detail"
+                        };
+                        push_tool_line(
+                            lines,
+                            prefix,
+                            dim_color,
+                            frame_color,
+                            inner_w,
+                            fallback,
+                            Color::Rgb(105, 105, 115),
+                        );
+                    }
+                }
+            } else {
+                // Non-file tools or single invocation: show each invocation on one line
+                for inv in &entry.invocations {
+                    let detail =
+                        tool_invocation_primary_detail(name, inv, detail_w.saturating_sub(4))
+                            .unwrap_or_else(|| format!("{} call", name));
+                    let line_text = format!("  - {}", detail);
+                    push_tool_line(
+                        lines,
+                        prefix,
+                        dim_color,
+                        frame_color,
+                        inner_w,
+                        &line_text,
+                        Color::Rgb(140, 140, 150),
+                    );
+                }
+            }
+        }
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled(prefix, Style::default().fg(dim_color)),
+        Span::styled(
+            format!("└{}┘", "─".repeat(inner_w)),
+            Style::default().fg(frame_color),
+        ),
+    ]));
+}
+
+fn tool_invocation_primary_detail(
+    tool_name: &str,
+    inv: &ToolInvocation,
+    max_w: usize,
+) -> Option<String> {
+    if let Some(inp) = inv.input.as_deref() {
+        if !inp.trim().is_empty() {
+            let detail = format_tool_detail(tool_name, inp, max_w);
+            if !detail.trim().is_empty() {
+                return Some(detail);
+            }
+        }
+    }
+    inv.file_path
+        .as_deref()
+        .map(|fp| fit_display_width(&short_file_path(Some(fp)), max_w))
+}
+
+fn tool_invocation_secondary_detail(
+    tool_name: &str,
+    inv: &ToolInvocation,
+    max_w: usize,
+) -> Option<String> {
+    if let Some(inp) = inv.input.as_deref() {
+        if !inp.trim().is_empty() {
+            let short = format_tool_invocation_short(tool_name, inp, max_w);
+            if !short.trim().is_empty() {
+                return Some(short);
+            }
+            let detail = format_tool_detail(tool_name, inp, max_w);
+            if !detail.trim().is_empty() {
+                return Some(detail);
+            }
+        }
+    }
+    inv.file_path
+        .as_deref()
+        .map(|fp| safe_truncate_plain(&short_file_path(Some(fp)), max_w).into_owned())
+}
+
+fn render_user_box<'a>(
+    lines: &mut Vec<Line<'a>>,
+    msg: &ChatMessage,
+    box_w: usize,
+    is_expanded: bool,
+) {
+    let border_color = Color::Cyan;
+    let toggle_label = if is_expanded {
+        "▼ collapse"
+    } else {
+        "▶ expand"
+    };
+    let label = " [U] USER ";
+    let dash_len = box_w.saturating_sub(label.chars().count() + 2 + toggle_label.len() + 1);
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled("┌", Style::default().fg(border_color)),
+        Span::styled(
+            label,
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("─".repeat(dash_len), Style::default().fg(border_color)),
+        Span::styled(
+            format!(" {}", toggle_label),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    let content_w = box_w.saturating_sub(4);
+    let mut has_content = false;
+    for part in &msg.parts {
+        if let MessageContent::Text(t) = part {
+            if is_expanded {
+                for line in wrap_text_plain(t, content_w) {
+                    lines.push(Line::from(vec![
+                        Span::styled(" │", Style::default().fg(border_color)),
+                        Span::raw("  "),
+                        Span::styled(line, Style::default().fg(Color::White)),
+                    ]));
+                }
+            } else {
+                let summary = first_n_sentences(t, 4);
+                if !summary.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(" │", Style::default().fg(border_color)),
+                        Span::raw("  "),
+                        Span::styled(
+                            safe_truncate(&summary, content_w).to_string(),
+                            Style::default().fg(Color::White),
+                        ),
+                    ]));
+                }
+            }
+            has_content = true;
+        }
+    }
+    if !has_content {
+        lines.push(Line::from(vec![
+            Span::styled(" │", Style::default().fg(border_color)),
+            Span::styled("  (empty)", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            format!("└{}", "─".repeat(box_w.saturating_sub(1))),
+            Style::default().fg(border_color),
+        ),
+    ]));
+}
+
+fn render_agent_box<'a>(
+    lines: &mut Vec<Line<'a>>,
+    msg: &ChatMessage,
+    box_w: usize,
+    is_expanded: bool,
+    msg_idx: usize,
+    click_targets: &mut Vec<(u16, ChatClickTarget)>,
+    expanded_tools: &FxHashSet<Box<str>>,
+) {
+    let border_color = Color::Green;
+    let toggle_label = if is_expanded {
+        "▼ collapse"
+    } else {
+        "▶ expand"
+    };
+    let model_str = msg.model.as_deref().unwrap_or("");
+    let label = if model_str.is_empty() {
+        " 🤖 AGENT ".to_string()
+    } else {
+        format!(" 🤖 AGENT ({}) ", model_str)
+    };
+    let dash_len = box_w.saturating_sub(label.chars().count() + 2 + toggle_label.len() + 1);
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled("╔", Style::default().fg(border_color)),
+        Span::styled(
+            label,
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("═".repeat(dash_len), Style::default().fg(border_color)),
+        Span::styled(
+            format!(" {}", toggle_label),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    let content_w = box_w.saturating_sub(4);
+    let mut has_thinking = false;
+    for part in &msg.parts {
+        if let MessageContent::Thinking(_) = part {
+            has_thinking = true;
+            break;
+        }
+    }
+    if has_thinking {
+        lines.push(Line::from(vec![
+            Span::styled(" ║", Style::default().fg(border_color)),
+            Span::styled(
+                "  💭 thinking...",
+                Style::default().fg(Color::Rgb(70, 70, 80)),
+            ),
+        ]));
+    }
+    let mut has_text = false;
+    for part in &msg.parts {
+        if let MessageContent::Text(t) = part {
+            if is_expanded {
+                for line in wrap_text_plain(t, content_w) {
+                    lines.push(Line::from(vec![
+                        Span::styled(" ║", Style::default().fg(border_color)),
+                        Span::raw("  "),
+                        Span::styled(line, Style::default().fg(Color::Rgb(200, 200, 200))),
+                    ]));
+                }
+            } else {
+                let summary = first_n_sentences(t, 4);
+                if !summary.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(" ║", Style::default().fg(border_color)),
+                        Span::raw("  "),
+                        Span::styled(
+                            safe_truncate(&summary, content_w).to_string(),
+                            Style::default().fg(Color::Rgb(200, 200, 200)),
+                        ),
+                    ]));
+                }
+            }
+            has_text = true;
+        }
+    }
+    let (total_tools, tool_stats) = aggregate_tools_in_group(std::slice::from_ref(msg), &[0]);
+    if total_tools > 0 {
+        let target_id = format!("tools:msg:{}", msg_idx).into_boxed_str();
+        let tools_expanded = expanded_tools.contains(&target_id);
+        render_tool_stats_box(
+            lines,
+            " ║  ",
+            border_color,
+            content_w,
+            total_tools,
+            &tool_stats,
+            tools_expanded,
+            click_targets,
+            target_id,
+        );
+    }
+    if !has_text && !has_thinking && total_tools == 0 {
+        lines.push(Line::from(vec![
+            Span::styled(" ║", Style::default().fg(border_color)),
+            Span::styled("  (empty)", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            format!("╚{}", "═".repeat(box_w.saturating_sub(1))),
+            Style::default().fg(border_color),
+        ),
+    ]));
+}
+
+fn render_system_line<'a>(
+    lines: &mut Vec<Line<'a>>,
+    msg: &ChatMessage,
+    box_w: usize,
+    is_expanded: bool,
+) {
+    let (icon, label, color) = get_role_info(&msg.role);
+    let header = format!(" {} {} ", icon, label);
+    let toggle_label = if is_expanded {
+        "▼ collapse"
+    } else {
+        "▶ expand"
+    };
+    let dash_len = box_w.saturating_sub(header.chars().count() + 2 + toggle_label.len() + 1);
+    lines.push(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(header, Style::default().fg(color)),
+        Span::styled(
+            "─".repeat(dash_len),
+            Style::default().fg(Color::Rgb(40, 40, 50)),
+        ),
+        Span::styled(
+            format!(" {}", toggle_label),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    for part in &msg.parts {
+        if let MessageContent::Text(t) = part {
+            if is_expanded {
+                for line in wrap_text_plain(t, box_w.saturating_sub(4)) {
+                    lines.push(Line::from(vec![
+                        Span::raw("   "),
+                        Span::styled(line, Style::default().fg(Color::Rgb(120, 120, 120))),
+                    ]));
+                }
+            } else {
+                let summary = first_n_sentences(t, 1);
+                if !summary.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::raw("   "),
+                        Span::styled(
+                            safe_truncate(&summary, box_w.saturating_sub(4)).to_string(),
+                            Style::default().fg(Color::Rgb(120, 120, 120)),
+                        ),
+                    ]));
+                }
+            }
+        }
+    }
+}
+
+fn wrap_text_plain(s: &str, max_w: usize) -> Vec<String> {
+    if max_w == 0 {
+        return vec![s.to_string()];
+    }
+    let mut result = Vec::new();
+    // Handle embedded newlines: split first, then wrap each line
+    for raw_line in s.split('\n') {
+        if raw_line.is_empty() {
+            result.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_w = 0usize;
+        for word in raw_line.split_whitespace() {
+            let word_w = UnicodeWidthStr::width(word);
+            if current_w + word_w + usize::from(!current.is_empty()) > max_w {
+                if !current.is_empty() {
+                    result.push(current);
+                    current = String::new();
+                    current_w = 0;
+                }
+                if word_w > max_w {
+                    // Break long word on char boundary using display width
+                    let mut chunk = String::new();
+                    let mut chunk_w = 0usize;
+                    for ch in word.chars() {
+                        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                        if chunk_w + cw > max_w && !chunk.is_empty() {
+                            result.push(chunk);
+                            chunk = String::new();
+                            chunk_w = 0;
+                        }
+                        chunk.push(ch);
+                        chunk_w += cw;
+                    }
+                    current = chunk;
+                    current_w = chunk_w;
+                    continue;
+                }
+            }
+            if !current.is_empty() {
+                current.push(' ');
+                current_w += 1;
+            }
+            current.push_str(word);
+            current_w += word_w;
+        }
+        if !current.is_empty() {
+            result.push(current);
+        }
+    }
+    if result.is_empty() {
+        result.push(String::new());
+    }
+    result
+}
+
+const SUBAGENT_COLORS: &[Color] = &[
+    Color::Rgb(255, 165, 0),
+    Color::Rgb(180, 120, 255),
+    Color::Rgb(0, 200, 180),
+    Color::Rgb(255, 120, 160),
+    Color::Rgb(120, 200, 255),
+    Color::Rgb(200, 200, 100),
+];
+
+#[inline]
+fn subagent_color(index: usize) -> Color {
+    SUBAGENT_COLORS[index % SUBAGENT_COLORS.len()]
+}
+#[inline]
+fn dim_color(c: Color) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => Color::Rgb(r / 3, g / 3, b / 3),
+        _ => Color::DarkGray,
+    }
+}
+
+fn tool_icon(name: &str) -> &'static str {
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "read" => "📖",
+        "grep" | "find" | "finder" => "🔍",
+        "glob" | "list" | "ls" | "list_directory" => "📁",
+        "edit" | "edit_file" | "write" | "create" | "create_file" => "🔧",
+        "apply_patch" | "patch" | "apply" | "apply_diff" => "🔧",
+        "bash" | "shell" | "exec" | "terminal" => "💻",
+        "task" | "todowrite" | "todoread" => "📝",
+        "skill" => "🧩",
+        "webfetch" | "web_search" | "browse" | "fetch" => "🌐",
+        "extract" => "📤",
+        "discard" => "🗑️",
+        "question" => "❓",
+        "invalid" => "⚠️",
+        _ => "📚",
+    }
+}
+
+fn normalize_tool_name(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let base = lower.strip_prefix("opencode_").unwrap_or(&lower);
+    match base {
+        "find" | "finder" => "grep".to_string(),
+        "list_directory" | "list" | "ls" => "glob".to_string(),
+        "edit_file" => "edit".to_string(),
+        "create_file" | "create" => "write".to_string(),
+        "patch" | "apply" | "apply_diff" => "apply_patch".to_string(),
+        "shell" | "exec" | "terminal" => "bash".to_string(),
+        s if s.starts_with("exa_") => "exa".to_string(),
+        s if s.starts_with("ref_") => "ref".to_string(),
+        s if s.starts_with("context7_") => "context7".to_string(),
+        s if s.starts_with("memory_") => "memory".to_string(),
+        _ => base.to_string(),
+    }
+}
+
+/// Push a single padded line inside the tool stats box.
+fn push_tool_line<'a>(
+    lines: &mut Vec<Line<'a>>,
+    prefix: &'a str,
+    dim_color: Color,
+    frame_color: Color,
+    inner_w: usize,
+    text: &str,
+    text_color: Color,
+) {
+    let fitted = fit_display_width(text, inner_w.saturating_sub(1));
+    lines.push(Line::from(vec![
+        Span::styled(prefix, Style::default().fg(dim_color)),
+        Span::styled("│ ", Style::default().fg(frame_color)),
+        Span::styled(fitted, Style::default().fg(text_color)),
+        Span::styled("│", Style::default().fg(frame_color)),
+    ]));
+}
+
+/// For file-centric tools with multiple invocations on the same file,
+/// extract just the distinguishing part (e.g. line range for Read).
+fn format_tool_invocation_short(tool_name: &str, input: &str, max_w: usize) -> String {
+    if !input.contains('{') {
+        return if input.chars().count() > max_w {
+            safe_truncate_plain(input, max_w).into_owned()
+        } else {
+            input.to_string()
+        };
+    }
+    let lower = tool_name.to_ascii_lowercase();
+    let detail = match lower.as_str() {
+        "read" => {
+            let range = extract_json_field(input, "read_range").or_else(|| {
+                let off = extract_json_field(input, "offset");
+                let lim = extract_json_field(input, "limit");
+                match (off, lim) {
+                    (Some(o), Some(l)) => Some(format!("offset {}, limit {}", o, l)),
+                    (Some(o), None) => Some(format!("offset {}", o)),
+                    (None, Some(l)) => Some(format!("limit {}", l)),
+                    _ => None,
+                }
+            });
+            match range {
+                Some(r) => r,
+                None => "full file".to_string(),
+            }
+        }
+        "edit" | "edit_file" | "write" | "create" | "create_file" => {
+            // Show a snippet of old_str or description if available
+            let old = extract_json_field(input, "old_str");
+            match old {
+                Some(o) => {
+                    let first = o.lines().next().unwrap_or(&o);
+                    let trimmed = first.trim();
+                    if trimmed.is_empty() {
+                        "edit".to_string()
+                    } else {
+                        format!("\"{}\"", trimmed)
+                    }
+                }
+                None => "write".to_string(),
+            }
+        }
+        _ => compact_oneline(input),
+    };
+    if detail.chars().count() > max_w {
+        safe_truncate_plain(&detail, max_w).into_owned()
+    } else {
+        detail
+    }
+}
+
+/// Produce a compact one-line summary of a tool invocation for the expanded tool list.
+/// e.g. Read → "src/main.rs [1,50]", Grep → `pattern` in path, Bash → first command line.
+fn format_tool_detail(tool_name: &str, input: &str, max_w: usize) -> String {
+    if !input.contains('{') {
+        return if input.chars().count() > max_w {
+            safe_truncate_plain(input, max_w).into_owned()
+        } else {
+            input.to_string()
+        };
+    }
+    let lower = tool_name.to_ascii_lowercase();
+    let detail = match lower.as_str() {
+        "read" => {
+            // Try to extract path and optional read_range from JSON-ish input
+            let path = extract_json_field(input, "path")
+                .or_else(|| extract_json_field(input, "file_path"))
+                .or_else(|| extract_json_field(input, "filePath"));
+            let range = extract_json_field(input, "read_range").or_else(|| {
+                let off = extract_json_field(input, "offset");
+                let lim = extract_json_field(input, "limit");
+                match (off, lim) {
+                    (Some(o), Some(l)) => Some(format!("offset {}, limit {}", o, l)),
+                    (Some(o), None) => Some(format!("offset {}", o)),
+                    (None, Some(l)) => Some(format!("limit {}", l)),
+                    _ => None,
+                }
+            });
+            match (path, range) {
+                (Some(p), Some(r)) => format!("{} ({})", short_path_display(&p), r),
+                (Some(p), None) => short_path_display(&p),
+                _ => compact_oneline(input),
+            }
+        }
+        "grep" | "find" | "finder" => {
+            let pattern =
+                extract_json_field(input, "pattern").or_else(|| extract_json_field(input, "query"));
+            let path = extract_json_field(input, "path");
+            match (pattern, path) {
+                (Some(pat), Some(p)) => format!("`{}` in {}", pat, short_path_display(&p)),
+                (Some(pat), None) => format!("`{}`", pat),
+                _ => compact_oneline(input),
+            }
+        }
+        "bash" | "shell" | "exec" | "terminal" => {
+            let cmd =
+                extract_json_field(input, "cmd").or_else(|| extract_json_field(input, "command"));
+            match cmd {
+                Some(c) => {
+                    // Show first line of command
+                    let first = c.lines().next().unwrap_or(&c);
+                    first.to_string()
+                }
+                None => compact_oneline(input),
+            }
+        }
+        "edit" | "edit_file" | "write" | "create" | "create_file" => {
+            let path = extract_json_field(input, "path")
+                .or_else(|| extract_json_field(input, "file_path"))
+                .or_else(|| extract_json_field(input, "filePath"));
+            match path {
+                Some(p) => short_path_display(&p),
+                None => compact_oneline(input),
+            }
+        }
+        "glob" | "list" | "ls" | "list_directory" => {
+            let pat = extract_json_field(input, "filePattern")
+                .or_else(|| extract_json_field(input, "pattern"));
+            match pat {
+                Some(p) => p,
+                None => compact_oneline(input),
+            }
+        }
+        _ => compact_oneline(input),
+    };
+    if detail.chars().count() > max_w {
+        safe_truncate_plain(&detail, max_w).into_owned()
+    } else {
+        detail
+    }
+}
+
+/// Extract a simple JSON field value (handles `"key": "value"` and `"key": [...]`)
+fn extract_json_field(input: &str, field: &str) -> Option<String> {
+    let key = format!("\"{}\"", field);
+    let key_pos = input.find(&key)?;
+    let after_key = &input[key_pos + key.len()..];
+    // skip `: ` or `:`
+    let after_colon = after_key.trim_start().strip_prefix(':')?;
+    let trimmed = after_colon.trim_start();
+    if trimmed.starts_with('"') {
+        // String value — find closing quote (handle escaped quotes)
+        let content = &trimmed[1..];
+        let mut end = 0;
+        let mut escaped = false;
+        for ch in content.chars() {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                break;
+            }
+            end += ch.len_utf8();
+        }
+        Some(content[..end].to_string())
+    } else if trimmed.starts_with('[') {
+        // Array value — find closing bracket
+        let end = trimmed.find(']').unwrap_or(trimmed.len());
+        let inner = trimmed[1..end].trim();
+        Some(inner.to_string())
+    } else {
+        // Number or other
+        let end = trimmed
+            .find(|c: char| c == ',' || c == '}' || c == '\n')
+            .unwrap_or(trimmed.len());
+        Some(trimmed[..end].trim().to_string())
+    }
+}
+
+/// Show last 2 path components
+fn short_path_display(path: &str) -> String {
+    let parts: Vec<&str> = path.rsplit('/').take(3).collect();
+    if parts.len() >= 3 {
+        format!("…/{}/{}", parts[1], parts[0])
+    } else {
+        path.to_string()
+    }
+}
+
+/// Collapse multi-line input into a single line
+fn compact_oneline(s: &str) -> String {
+    let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed
+}
+
+fn short_file_path(fp: Option<&str>) -> String {
+    match fp {
+        Some(p) => {
+            let parts: Vec<&str> = p.rsplit('/').take(2).collect();
+            if parts.len() >= 2 {
+                format!("{}/{}", parts[1], parts[0])
+            } else {
+                parts[0].to_string()
+            }
+        }
+        None => "file".to_string(),
+    }
+}
+
+fn first_n_sentences(text: &str, n: usize) -> String {
+    let collapsed: String = text.split_whitespace().collect::<Vec<&str>>().join(" ");
+    if collapsed.is_empty() {
+        return String::new();
+    }
+    let mut end_idx = 0;
+    let mut count = 0;
+    let chars: Vec<(usize, char)> = collapsed.char_indices().collect();
+    for i in 0..chars.len() {
+        let (pos, c) = chars[i];
+        if c == '.' || c == '!' || c == '?' {
+            count += 1;
+            end_idx = pos + c.len_utf8();
+            if count == n {
+                break;
+            }
+        }
+    }
+    if count > 0 {
+        let result = collapsed[..end_idx].trim().to_string();
+        if end_idx < collapsed.len() {
+            return format!("{}…", result);
+        }
+        return result;
+    }
+    if collapsed.chars().count() > 150 {
+        let target = 147;
+        let byte_pos = collapsed
+            .char_indices()
+            .nth(target)
+            .map(|(i, _)| i)
+            .unwrap_or(collapsed.len());
+        return format!("{}…", &collapsed[..byte_pos]);
+    }
+    collapsed
+}
+
+#[inline]
+fn safe_truncate(s: &str, max_len: usize) -> Cow<'_, str> {
+    if s.chars().count() <= max_len {
+        return Cow::Borrowed(s);
+    }
+    let target = max_len.saturating_sub(1);
     let byte_end = s
         .char_indices()
         .nth(target)
         .map(|(i, _)| i)
         .unwrap_or(s.len());
-    s[..byte_end]
+    let cut = s[..byte_end]
         .rfind(' ')
-        .map(|pos| &s[..pos + 1])
-        .unwrap_or(&s[..byte_end])
+        .map(|pos| &s[..pos])
+        .unwrap_or(&s[..byte_end]);
+    Cow::Owned(format!("{}…", cut))
 }
 
 fn safe_truncate_plain(s: &str, max_len: usize) -> Cow<'_, str> {
     let mut char_count = 0;
-    // Fast check for short strings
     for _ in s.chars() {
         char_count += 1;
         if char_count > max_len {
@@ -1218,8 +2109,6 @@ fn safe_truncate_plain(s: &str, max_len: usize) -> Cow<'_, str> {
     if char_count <= max_len {
         return Cow::Borrowed(s);
     }
-
-    // Truncate and add ellipsis - total length will be max_len
     let target = max_len.saturating_sub(1);
     let mut current_count = 0;
     for (idx, _) in s.char_indices() {
@@ -1233,6 +2122,38 @@ fn safe_truncate_plain(s: &str, max_len: usize) -> Cow<'_, str> {
     Cow::Borrowed(s)
 }
 
+fn fit_display_width(s: &str, target_width: usize) -> String {
+    if target_width == 0 {
+        return String::new();
+    }
+    let current_w = UnicodeWidthStr::width(s);
+    if current_w <= target_width {
+        let mut out = String::with_capacity(s.len() + (target_width - current_w));
+        out.push_str(s);
+        out.push_str(&" ".repeat(target_width - current_w));
+        return out;
+    }
+    let ellipsis = '…';
+    let ellipsis_w = UnicodeWidthChar::width(ellipsis).unwrap_or(1);
+    let keep_w = target_width.saturating_sub(ellipsis_w);
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > keep_w {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push(ellipsis);
+    used += ellipsis_w;
+    if used < target_width {
+        out.push_str(&" ".repeat(target_width - used));
+    }
+    out
+}
+
 fn wrap_text_with_indent(
     text: &str,
     first_line_width: usize,
@@ -1242,19 +2163,16 @@ fn wrap_text_with_indent(
     if words.is_empty() {
         return vec![String::new()];
     }
-
     let mut result = Vec::new();
     let mut current_line = String::new();
     let mut current_width = 0;
     let mut is_first_line = true;
-
     for word in &words {
         let max_width = if is_first_line {
             first_line_width
         } else {
             continuation_width
         };
-
         if current_line.is_empty() {
             if word.len() <= max_width {
                 current_line.push_str(word);
@@ -1320,15 +2238,12 @@ fn wrap_text_with_indent(
             }
         }
     }
-
     if !current_line.is_empty() {
         result.push(current_line);
     }
-
     result
 }
 
-/// Helper: Get role display information (icon, label, color)
 fn get_role_info(role: &str) -> (&'static str, String, Color) {
     match role {
         "user" => ("👤", "USER".to_string(), Color::Cyan),
@@ -1343,7 +2258,6 @@ pub fn detect_git_branch(root: &str) -> Option<String> {
     if root_path.as_os_str().is_empty() {
         return None;
     }
-
     let git_path = root_path.join(".git");
     let head_path = if git_path.is_dir() {
         git_path.join("HEAD")
@@ -1365,7 +2279,6 @@ pub fn detect_git_branch(root: &str) -> Option<String> {
     } else {
         return None;
     };
-
     let Ok(head) = fs::read_to_string(head_path) else {
         return None;
     };

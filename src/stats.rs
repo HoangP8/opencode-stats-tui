@@ -13,7 +13,6 @@ use std::sync::{Arc, OnceLock};
 // Fast path constants for performance
 pub const MAX_MESSAGES_TO_LOAD: usize = 100;
 const MAX_CHARS_PER_TEXT_PART: usize = 500;
-const MAX_TOOL_TITLE_CHARS: usize = 100;
 
 static HOME_DIR: OnceLock<String> = OnceLock::new();
 static OPENCODE_ROOT_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -369,8 +368,10 @@ pub struct ToolUsage {
 #[derive(Clone)]
 pub struct ToolCallInfo {
     pub name: Box<str>,
-    pub title: Option<Box<str>>,
     pub file_path: Option<Box<str>>,
+    pub input: Option<Box<str>>,
+    pub additions: Option<u64>,
+    pub deletions: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -651,12 +652,28 @@ struct SessionData {
 pub(crate) struct ToolStateInput {
     #[serde(rename = "filePath")]
     pub(crate) file_path: Option<String>,
+    #[serde(alias = "old_str", alias = "oldStr")]
+    pub(crate) old_str: Option<String>,
+    #[serde(alias = "new_str", alias = "newStr")]
+    pub(crate) new_str: Option<String>,
+    #[serde(alias = "content")]
+    pub(crate) content: Option<String>,
+    #[serde(alias = "patchText")]
+    pub(crate) patch_text: Option<String>,
+    pub(crate) command: Option<String>,
+    pub(crate) pattern: Option<String>,
+    pub(crate) query: Option<String>,
+    pub(crate) path: Option<String>,
+    pub(crate) url: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) limit: Option<serde_json::Value>,
+    pub(crate) offset: Option<serde_json::Value>,
+    pub(crate) todos: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Default)]
 pub(crate) struct ToolState {
     pub(crate) input: Option<ToolStateInput>,
-    pub(crate) title: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1832,16 +1849,12 @@ fn load_session_chat_internal(
         f.par_iter()
             .filter_map(|p| {
                 let msg: Message = load_message_from_path(p)?;
-
-                // Filter by day if specified
                 if let Some(target_day) = day_filter {
                     let msg_day = get_day(msg.time.as_ref().and_then(|t| t.created.map(|v| *v)));
                     if msg_day != target_day {
                         return None;
                     }
                 }
-
-                // Filter by timestamp if specified
                 if let Some(since) = since_ts {
                     let created = msg
                         .time
@@ -1852,7 +1865,6 @@ fn load_session_chat_internal(
                         return None;
                     }
                 }
-
                 Some(msg)
             })
             .collect()
@@ -1863,22 +1875,17 @@ fn load_session_chat_internal(
             .par_iter()
             .filter_map(|p| {
                 let msg: Message = load_message_from_path(p)?;
-
                 if let Some(session_id) = session_id {
                     if msg.session_id.as_ref().map(|s| s.as_ref()) != Some(session_id) {
                         return None;
                     }
                 }
-
-                // Filter by day if specified
                 if let Some(target_day) = day_filter {
                     let msg_day = get_day(msg.time.as_ref().and_then(|t| t.created.map(|v| *v)));
                     if msg_day != target_day {
                         return None;
                     }
                 }
-
-                // Filter by timestamp if specified
                 if let Some(since) = since_ts {
                     let created = msg
                         .time
@@ -1889,7 +1896,6 @@ fn load_session_chat_internal(
                         return None;
                     }
                 }
-
                 Some(msg)
             })
             .collect()
@@ -1907,7 +1913,6 @@ fn load_session_chat_internal(
         session_msgs = session_msgs.split_off(start);
     }
 
-    // Now load parts in parallel for only the selected messages
     let session_msgs_with_parts: Vec<(Message, Vec<MessageContent>)> = session_msgs
         .into_par_iter()
         .map(|msg| {
@@ -1919,27 +1924,29 @@ fn load_session_chat_internal(
                         if part.thought.is_some() {
                             parts_vec.push(MessageContent::Thinking(()));
                         }
+                        let mut current_text = None;
                         if let Some(t) = part.text {
+                            current_text = Some(t.clone());
                             parts_vec.push(MessageContent::Text(truncate_string(
                                 &t,
                                 MAX_CHARS_PER_TEXT_PART,
                             )));
                         }
                         if let Some(tool) = part.tool {
-                            let fp = part
-                                .state
-                                .as_ref()
-                                .and_then(|s| s.input.as_ref().and_then(|i| i.file_path.as_ref()))
-                                .map(|s| s.clone().into());
-                            let title = part
-                                .state
-                                .as_ref()
-                                .and_then(|s| s.title.as_ref())
-                                .map(|t| truncate_string(t, MAX_TOOL_TITLE_CHARS));
+                            let state_input = part.state.as_ref().and_then(|s| s.input.as_ref());
+                            let fp: Option<Box<str>> = state_input.and_then(|i| {
+                                infer_tool_file_path(&tool, i).map(|s| s.into_boxed_str())
+                            });
+                            let tool_detail = state_input
+                                .map(|i| build_tool_detail(&tool, i))
+                                .or(current_text.map(|s| s.clone()))
+                                .map(|s| s.into());
                             parts_vec.push(MessageContent::ToolCall(ToolCallInfo {
                                 name: tool.into(),
-                                title,
                                 file_path: fp,
+                                input: tool_detail,
+                                additions: None,
+                                deletions: None,
                             }));
                         }
                     }
@@ -1951,7 +1958,9 @@ fn load_session_chat_internal(
 
     let mut max_ts = since_ts.unwrap_or(0);
     let mut merged: Vec<ChatMessage> = Vec::with_capacity(session_msgs_with_parts.len());
-    for (msg, parts_vec) in session_msgs_with_parts {
+    let mut last_cumulative_diffs: Vec<FileDiff> = Vec::new();
+
+    for (msg, mut parts_vec) in session_msgs_with_parts {
         let created = msg
             .time
             .as_ref()
@@ -1959,6 +1968,75 @@ fn load_session_chat_internal(
             .unwrap_or(0);
         if created > max_ts {
             max_ts = created;
+        }
+
+        let current_cumulative: Vec<FileDiff> = msg
+            .summary
+            .as_ref()
+            .and_then(|s| s.diffs.as_ref())
+            .map(|diffs| {
+                let mut v: Vec<FileDiff> = diffs
+                    .iter()
+                    .map(|d| FileDiff {
+                        path: d
+                            .file
+                            .as_ref()
+                            .map(|s| s.0.clone())
+                            .unwrap_or_default()
+                            .into_boxed_str(),
+                        additions: d.additions.map(|v| *v).unwrap_or(0),
+                        deletions: d.deletions.map(|v| *v).unwrap_or(0),
+                        status: d
+                            .status
+                            .as_ref()
+                            .map(|s| s.0.clone())
+                            .unwrap_or_else(|| "modified".into())
+                            .into_boxed_str(),
+                    })
+                    .collect();
+                sort_file_diffs(&mut v);
+                v
+            })
+            .unwrap_or_else(|| last_cumulative_diffs.clone());
+
+        let incremental = compute_incremental_diffs(&current_cumulative, &last_cumulative_diffs);
+        last_cumulative_diffs = current_cumulative;
+
+        for part in &mut parts_vec {
+            if let MessageContent::ToolCall(ref mut tc) = part {
+                if let Some(ref fp_str) = tc.file_path {
+                    let fp_name = fp_str.rsplit('/').next().unwrap_or(fp_str);
+                    let fp_suffix: Vec<&str> = fp_str.rsplit('/').take(2).collect();
+                    for d in &incremental {
+                        let d_path_str = &d.path;
+                        let d_suffix: Vec<&str> = d_path_str.rsplit('/').take(2).collect();
+                        if fp_suffix == d_suffix {
+                            tc.additions = Some(d.additions);
+                            tc.deletions = Some(d.deletions);
+                            break;
+                        }
+                        let d_name = d_path_str.rsplit('/').next().unwrap_or(d_path_str);
+                        if d_name == fp_name {
+                            tc.additions = Some(d.additions);
+                            tc.deletions = Some(d.deletions);
+                        }
+                    }
+                } else {
+                    // Fallback for patch-like tools that often do not carry file_path
+                    let tool_name = tc.name.to_ascii_lowercase();
+                    if matches!(
+                        tool_name.as_str(),
+                        "apply_patch" | "patch" | "apply" | "apply_diff"
+                    ) {
+                        let adds: u64 = incremental.iter().map(|d| d.additions).sum();
+                        let dels: u64 = incremental.iter().map(|d| d.deletions).sum();
+                        if adds > 0 || dels > 0 {
+                            tc.additions = Some(adds);
+                            tc.deletions = Some(dels);
+                        }
+                    }
+                }
+            }
         }
 
         let role: Box<str> = msg
@@ -2164,18 +2242,15 @@ pub fn load_combined_session_chat(
         .get(parent_session_id)
         .map(|f| f.iter().cloned().collect())
         .unwrap_or_default();
-
     let child_agent_map: FxHashMap<&str, &str> = children
         .iter()
         .map(|(id, name)| (id.as_ref(), name.as_ref()))
         .collect();
-
     for (child_id, _) in children {
         if let Some(files) = session_message_files.get(child_id.as_ref()) {
             all_files.extend(files.iter().cloned());
         }
     }
-
     if all_files.is_empty() {
         return (Vec::new(), 0);
     }
@@ -2187,14 +2262,12 @@ pub fn load_combined_session_chat(
         .par_iter()
         .filter_map(|p| {
             let msg: Message = load_message_from_path(p)?;
-
             if let Some(target_day) = day_filter {
                 let msg_day = get_day(msg.time.as_ref().and_then(|t| t.created.map(|v| *v)));
                 if msg_day != target_day {
                     return None;
                 }
             }
-
             let msg_session = msg.session_id.as_ref().map(|s| s.0.as_str()).unwrap_or("");
             let (is_sub, agent_lbl) = if let Some(agent_name) = child_agent_map.get(msg_session) {
                 (true, Some((*agent_name).to_string().into_boxed_str()))
@@ -2210,33 +2283,34 @@ pub fn load_combined_session_chat(
                         if part.thought.is_some() {
                             parts_vec.push(MessageContent::Thinking(()));
                         }
+                        let mut current_text = None;
                         if let Some(t) = part.text {
+                            current_text = Some(t.clone());
                             parts_vec.push(MessageContent::Text(truncate_string(
                                 &t,
                                 MAX_CHARS_PER_TEXT_PART,
                             )));
                         }
                         if let Some(tool) = part.tool {
-                            let fp = part
-                                .state
-                                .as_ref()
-                                .and_then(|s| s.input.as_ref().and_then(|i| i.file_path.as_ref()))
-                                .map(|s| s.clone().into());
-                            let title = part
-                                .state
-                                .as_ref()
-                                .and_then(|s| s.title.as_ref())
-                                .map(|t| truncate_string(t, MAX_TOOL_TITLE_CHARS));
+                            let state_input = part.state.as_ref().and_then(|s| s.input.as_ref());
+                            let fp: Option<Box<str>> = state_input.and_then(|i| {
+                                infer_tool_file_path(&tool, i).map(|s| s.into_boxed_str())
+                            });
+                            let tool_detail = state_input
+                                .map(|i| build_tool_detail(&tool, i))
+                                .or(current_text.map(|s| s.clone()))
+                                .map(|s| s.into());
                             parts_vec.push(MessageContent::ToolCall(ToolCallInfo {
                                 name: tool.into(),
-                                title,
                                 file_path: fp,
+                                input: tool_detail,
+                                additions: None,
+                                deletions: None,
                             }));
                         }
                     }
                 }
             }
-
             Some((msg, parts_vec, is_sub, agent_lbl))
         })
         .collect();
@@ -2247,7 +2321,6 @@ pub fn load_combined_session_chat(
             .and_then(|t| t.created.map(|v| *v))
             .unwrap_or(0)
     });
-
     if all_messages.len() > MAX_MESSAGES_TO_LOAD {
         let start = all_messages.len() - MAX_MESSAGES_TO_LOAD;
         all_messages.drain(..start);
@@ -2255,8 +2328,9 @@ pub fn load_combined_session_chat(
 
     let mut max_ts: i64 = 0;
     let mut merged: Vec<ChatMessage> = Vec::with_capacity(all_messages.len());
+    let mut last_cumulative_diffs: Vec<FileDiff> = Vec::new();
 
-    for (msg, parts_vec, is_sub, agent_lbl) in all_messages {
+    for (msg, mut parts_vec, is_sub, agent_lbl) in all_messages {
         let created = msg
             .time
             .as_ref()
@@ -2266,20 +2340,87 @@ pub fn load_combined_session_chat(
             max_ts = created;
         }
 
+        let current_cumulative: Vec<FileDiff> = msg
+            .summary
+            .as_ref()
+            .and_then(|s| s.diffs.as_ref())
+            .map(|diffs| {
+                let mut v: Vec<FileDiff> = diffs
+                    .iter()
+                    .map(|d| FileDiff {
+                        path: d
+                            .file
+                            .as_ref()
+                            .map(|s| s.0.clone())
+                            .unwrap_or_default()
+                            .into_boxed_str(),
+                        additions: d.additions.map(|v| *v).unwrap_or(0),
+                        deletions: d.deletions.map(|v| *v).unwrap_or(0),
+                        status: d
+                            .status
+                            .as_ref()
+                            .map(|s| s.0.clone())
+                            .unwrap_or_else(|| "modified".into())
+                            .into_boxed_str(),
+                    })
+                    .collect();
+                sort_file_diffs(&mut v);
+                v
+            })
+            .unwrap_or_else(|| last_cumulative_diffs.clone());
+
+        let incremental = compute_incremental_diffs(&current_cumulative, &last_cumulative_diffs);
+        last_cumulative_diffs = current_cumulative;
+
+        for part in &mut parts_vec {
+            if let MessageContent::ToolCall(ref mut tc) = part {
+                if let Some(ref fp_str) = tc.file_path {
+                    let fp_name = fp_str.rsplit('/').next().unwrap_or(fp_str);
+                    let fp_suffix: Vec<&str> = fp_str.rsplit('/').take(2).collect();
+                    for d in &incremental {
+                        let d_path_str = &d.path;
+                        let d_suffix: Vec<&str> = d_path_str.rsplit('/').take(2).collect();
+                        if fp_suffix == d_suffix {
+                            tc.additions = Some(d.additions);
+                            tc.deletions = Some(d.deletions);
+                            break;
+                        }
+                        let d_name = d_path_str.rsplit('/').next().unwrap_or(d_path_str);
+                        if d_name == fp_name {
+                            tc.additions = Some(d.additions);
+                            tc.deletions = Some(d.deletions);
+                        }
+                    }
+                } else {
+                    // Fallback for patch-like tools that often do not carry file_path
+                    let tool_name = tc.name.to_ascii_lowercase();
+                    if matches!(
+                        tool_name.as_str(),
+                        "apply_patch" | "patch" | "apply" | "apply_diff"
+                    ) {
+                        let adds: u64 = incremental.iter().map(|d| d.additions).sum();
+                        let dels: u64 = incremental.iter().map(|d| d.deletions).sum();
+                        if adds > 0 || dels > 0 {
+                            tc.additions = Some(adds);
+                            tc.deletions = Some(dels);
+                        }
+                    }
+                }
+            }
+        }
+
         let role: Box<str> = msg
             .role
             .as_ref()
             .map(|s| s.as_ref())
             .unwrap_or("unknown")
             .into();
-
         if let Some(last) = merged.last_mut() {
             if *last.role == *role && last.is_subagent == is_sub && last.agent_label == agent_lbl {
                 last.parts.extend(parts_vec);
                 continue;
             }
         }
-
         let full_model = match (
             msg.provider_id.as_ref().map(|s| s.0.clone()).or_else(|| {
                 msg.model
@@ -2296,7 +2437,6 @@ pub fn load_combined_session_chat(
             (None, Some(m)) => Some(m.into()),
             _ => None,
         };
-
         merged.push(ChatMessage {
             role,
             model: full_model,
@@ -2305,11 +2445,275 @@ pub fn load_combined_session_chat(
             agent_label: agent_lbl,
         });
     }
-
     (merged, max_ts)
 }
 
-#[inline]
+/// Build a compact one-line detail string from tool state input fields.
+/// This replaces the old approach of using the part `text` (which is always empty for tools).
+fn build_tool_detail(tool_name: &str, input: &ToolStateInput) -> String {
+    let lower = tool_name.to_ascii_lowercase();
+    match lower.as_str() {
+        "read" => {
+            let fp = input
+                .file_path
+                .as_deref()
+                .or(input.path.as_deref())
+                .unwrap_or("");
+            let range_str = match (&input.offset, &input.limit) {
+                (Some(off), Some(lim)) => {
+                    format!(" (offset {}, limit {})", json_num(off), json_num(lim))
+                }
+                (Some(off), None) => format!(" (offset {})", json_num(off)),
+                (None, Some(lim)) => format!(" (limit {})", json_num(lim)),
+                _ => String::new(),
+            };
+            format!("{}{}", short_path(fp), range_str)
+        }
+        "bash" | "shell" | "exec" | "terminal" => {
+            let cmd = input
+                .command
+                .as_deref()
+                .or(input.description.as_deref())
+                .unwrap_or("");
+            let first = cmd.lines().next().unwrap_or(cmd);
+            first.to_string()
+        }
+        "grep" | "find" | "finder" => {
+            let pat = input
+                .pattern
+                .as_deref()
+                .or(input.query.as_deref())
+                .unwrap_or("");
+            let path = input.path.as_deref().or(input.file_path.as_deref());
+            match path {
+                Some(p) => format!("`{}` in {}", pat, short_path(p)),
+                None => format!("`{}`", pat),
+            }
+        }
+        "edit" | "edit_file" => {
+            let fp = input.file_path.as_deref().unwrap_or("");
+            let old_hint = input.old_str.as_deref().and_then(first_nonempty_line);
+            let new_hint = input.new_str.as_deref().and_then(first_nonempty_line);
+            match (old_hint, new_hint) {
+                (Some(o), Some(n)) => format!(
+                    "{} ↺ \"{}\" → \"{}\"",
+                    short_path(fp),
+                    truncate_inline(o, 24),
+                    truncate_inline(n, 24)
+                ),
+                (Some(h), None) => format!("{} ↺ \"{}\"", short_path(fp), truncate_inline(h, 36)),
+                (None, Some(h)) => format!("{} → \"{}\"", short_path(fp), truncate_inline(h, 36)),
+                (None, None) => short_path(fp),
+            }
+        }
+        "write" | "create" | "create_file" => {
+            let fp = input.file_path.as_deref().unwrap_or("");
+            if let Some(content) = input.content.as_deref().filter(|s| !s.is_empty()) {
+                let lines = content.lines().count().max(1);
+                format!("{} ({} lines)", short_path(fp), lines)
+            } else {
+                short_path(fp)
+            }
+        }
+        "apply_patch" | "patch" | "apply" | "apply_diff" => {
+            if let Some(patch) = input.patch_text.as_deref().filter(|s| !s.is_empty()) {
+                let files = extract_patch_files(patch);
+                if files.is_empty() {
+                    "patch".to_string()
+                } else {
+                    let shown: Vec<String> = files.iter().take(2).map(|f| short_path(f)).collect();
+                    let more = files.len().saturating_sub(shown.len());
+                    if more > 0 {
+                        format!("patch {} (+{} more)", shown.join(", "), more)
+                    } else {
+                        format!("patch {}", shown.join(", "))
+                    }
+                }
+            } else {
+                "patch".to_string()
+            }
+        }
+        "todowrite" => summarize_todos(input.todos.as_ref()),
+        "task" => {
+            let desc = input.description.as_deref().unwrap_or("");
+            if desc.is_empty() {
+                "task".to_string()
+            } else {
+                desc.to_string()
+            }
+        }
+        _ => {
+            // Fallback: show whatever fields we have
+            let mut parts = Vec::new();
+            if let Some(fp) = &input.file_path {
+                parts.push(short_path(fp));
+            }
+            if let Some(p) = &input.pattern {
+                parts.push(format!("`{}`", p));
+            }
+            if let Some(c) = &input.command {
+                parts.push(c.lines().next().unwrap_or("").to_string());
+            }
+            if let Some(u) = &input.url {
+                parts.push(truncate_inline(u, 50));
+            }
+            if parts.is_empty() {
+                String::new()
+            } else {
+                parts.join(" ")
+            }
+        }
+    }
+}
+
+fn json_num(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Array(arr) => {
+            let nums: Vec<String> = arr.iter().map(|x| json_num(x)).collect();
+            nums.join(", ")
+        }
+        _ => v.to_string(),
+    }
+}
+
+fn short_path(p: &str) -> String {
+    let parts: Vec<&str> = p.rsplit('/').take(2).collect();
+    if parts.len() >= 2 {
+        format!("{}/{}", parts[1], parts[0])
+    } else {
+        p.to_string()
+    }
+}
+
+fn truncate_inline(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for ch in s.chars().take(max_chars.saturating_sub(1)) {
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+fn first_nonempty_line(s: &str) -> Option<&str> {
+    s.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+fn summarize_todos(todos: Option<&serde_json::Value>) -> String {
+    let Some(serde_json::Value::Array(items)) = todos else {
+        return "todo update".to_string();
+    };
+    if items.is_empty() {
+        return "todo update (0 items)".to_string();
+    }
+
+    let mut pending = 0usize;
+    let mut in_progress = 0usize;
+    let mut completed = 0usize;
+    let mut cancelled = 0usize;
+    let mut examples: Vec<String> = Vec::new();
+
+    for item in items {
+        let status = item
+            .as_object()
+            .and_then(|o| o.get("status"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        match status {
+            "pending" => pending += 1,
+            "in_progress" => in_progress += 1,
+            "completed" => completed += 1,
+            "cancelled" => cancelled += 1,
+            _ => {}
+        }
+
+        if examples.len() < 2 {
+            if let Some(content) = item
+                .as_object()
+                .and_then(|o| o.get("content"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let prefix = match status {
+                    "in_progress" => "▶",
+                    "completed" => "✓",
+                    "cancelled" => "✕",
+                    _ => "•",
+                };
+                examples.push(format!("{} {}", prefix, truncate_inline(content, 32)));
+            }
+        }
+    }
+
+    let mut parts = Vec::new();
+    if in_progress > 0 {
+        parts.push(format!("{} in-progress", in_progress));
+    }
+    if pending > 0 {
+        parts.push(format!("{} pending", pending));
+    }
+    if completed > 0 {
+        parts.push(format!("{} completed", completed));
+    }
+    if cancelled > 0 {
+        parts.push(format!("{} cancelled", cancelled));
+    }
+
+    if !examples.is_empty() {
+        let extra = items.len().saturating_sub(examples.len());
+        let tail = if extra > 0 {
+            format!("; +{} more", extra)
+        } else {
+            String::new()
+        };
+        format!("{} todos: {}{}", items.len(), examples.join("; "), tail)
+    } else if parts.is_empty() {
+        format!("todo update ({} items)", items.len())
+    } else {
+        format!("{} todos ({})", items.len(), parts.join(", "))
+    }
+}
+
+fn infer_tool_file_path(tool_name: &str, input: &ToolStateInput) -> Option<String> {
+    if let Some(fp) = input.file_path.as_ref().or(input.path.as_ref()) {
+        if !fp.trim().is_empty() {
+            return Some(fp.clone());
+        }
+    }
+
+    let lower = tool_name.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "apply_patch" | "patch" | "apply" | "apply_diff"
+    ) {
+        if let Some(patch) = input.patch_text.as_deref() {
+            return extract_patch_files(patch).into_iter().next();
+        }
+    }
+    None
+}
+
+fn extract_patch_files(patch: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for line in patch.lines() {
+        let trimmed = line.trim_start();
+        for marker in ["*** Update File:", "*** Add File:", "*** Delete File:"] {
+            if let Some(rest) = trimmed.strip_prefix(marker) {
+                let p = rest.trim();
+                if !p.is_empty() {
+                    files.push(p.to_string());
+                }
+                break;
+            }
+        }
+    }
+    files
+}
+
 fn truncate_string(s: &str, max: usize) -> Box<str> {
     if s.len() <= max {
         return s.into();
