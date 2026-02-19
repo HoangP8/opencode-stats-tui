@@ -3161,19 +3161,21 @@ impl App {
                 }
             }
 
-            // Device / Server line
+            // Host line (Local or Server)
             {
                 let device = crate::device::get_device_info();
-                let (label, color) = if device.kind == "server" {
-                    ("Server       ", Color::Rgb(255, 165, 0))
+                let type_color = if device.kind == "server" {
+                    Color::Rgb(255, 165, 0)
                 } else {
-                    ("Device       ", Color::Rgb(100, 200, 255))
+                    Color::Rgb(100, 200, 255)
                 };
                 left_lines.push(Line::from(vec![
-                    Span::styled(label, label_style),
+                    Span::styled("Host:        ", label_style),
+                    Span::styled(device.display_label(), Style::default().fg(type_color)),
+                    Span::raw(" | "),
                     Span::styled(
                         truncate_with_ellipsis(&device.display_name(), left_val_width),
-                        Style::default().fg(color),
+                        Style::default().fg(type_color),
                     ),
                 ]));
             }

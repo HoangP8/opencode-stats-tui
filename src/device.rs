@@ -40,11 +40,24 @@ pub struct DeviceInfo {
 }
 
 impl DeviceInfo {
-    /// Formatted display: "mail (docker_user)" for servers, plain name for devices
+    /// Formatted display: "mail (docker_user)" for servers, "hostname (OS)" for local
     pub fn display_name(&self) -> String {
         match (&self.kind, &self.user) {
             (k, Some(u)) if k == "server" => format!("{} ({})", self.name, u),
-            _ => self.name.clone(),
+            _ => {
+                // Local device: show hostname + OS
+                let os = get_os_name();
+                format!("{} ({})", self.name, os)
+            }
+        }
+    }
+
+    /// Label for display: "Local" or "Server"
+    pub fn display_label(&self) -> &'static str {
+        if self.kind == "server" {
+            "Server"
+        } else {
+            "Local"
         }
     }
 }
@@ -279,6 +292,26 @@ fn get_local_device_name() -> String {
 
     // Linux / fallback: gethostname
     get_hostname()
+}
+
+/// Get a human-friendly OS name for display.
+fn get_os_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "Windows"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "macOS"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "Linux"
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        "Unknown"
+    }
 }
 
 /// POSIX gethostname via libc (already in Cargo.toml).
