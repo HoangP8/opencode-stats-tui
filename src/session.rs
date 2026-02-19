@@ -62,6 +62,14 @@ pub enum ModalColumn {
 }
 
 impl SessionModal {
+    #[inline]
+    fn reset_expansion_state(&mut self) {
+        self.expanded_agents.clear();
+        self.expanded_messages.clear();
+        self.expanded_tools.clear();
+        self.chat_click_targets.clear();
+    }
+
     pub fn new() -> Self {
         Self {
             open: false,
@@ -98,10 +106,7 @@ impl SessionModal {
         self.chat_max_scroll = 0; // Will be calculated during render
         self.open = true;
         self.selected_column = ModalColumn::Info;
-        self.expanded_agents.clear();
-        self.expanded_messages.clear();
-        self.expanded_tools.clear();
-        self.chat_click_targets.clear();
+        self.reset_expansion_state();
     }
 
     /// Close modal and reset state
@@ -115,10 +120,7 @@ impl SessionModal {
         self.chat_max_scroll = 0;
         self.selected_column = ModalColumn::Info;
         self.cached_rects = ModalRects::default();
-        self.expanded_agents.clear();
-        self.expanded_messages.clear();
-        self.expanded_tools.clear();
-        self.chat_click_targets.clear();
+        self.reset_expansion_state();
     }
 
     /// Handle keyboard events when modal is open
@@ -911,10 +913,12 @@ impl SessionModal {
                         .agent_label
                         .clone()
                         .unwrap_or_else(|| "subagent".into());
-                    if !agent_msgs.contains_key(&name) {
+                    if let Some(indices) = agent_msgs.get_mut(&name) {
+                        indices.push(idx);
+                    } else {
                         agent_order.push(name.clone());
+                        agent_msgs.insert(name, vec![idx]);
                     }
-                    agent_msgs.entry(name).or_default().push(idx);
                 }
                 let groups: Vec<(Box<str>, Vec<usize>)> = agent_order
                     .into_iter()
@@ -938,7 +942,7 @@ impl SessionModal {
                         .push((lines.len() as u16, ChatClickTarget::Message(*idx)));
                     if &*msg.role == "user" {
                         render_user_box(&mut lines, msg, box_w, is_expanded);
-                    } else if &*msg.role == "assistant" {
+                    } else {
                         render_agent_box(
                             &mut lines,
                             msg,
@@ -948,14 +952,12 @@ impl SessionModal {
                             &mut self.chat_click_targets,
                             &self.expanded_tools,
                         );
-                    } else {
-                        render_system_line(&mut lines, msg, box_w, is_expanded);
                     }
                     lines.push(Line::from(""));
                 }
                 ChatBlock::SubagentGroup(agents) => {
                     let outer_color = Color::Rgb(100, 75, 0);
-                    let header = format!(" 🔀 SUBAGENTS ({}) ", agents.len());
+                    let header = format!(" SUBAGENTS ({}) ", agents.len());
                     let dash_len = box_w.saturating_sub(header.chars().count() + 2);
                     lines.push(Line::from(vec![
                         Span::raw(" "),
@@ -988,9 +990,9 @@ impl SessionModal {
                             .and_then(|&mi| msgs[mi].model.as_deref())
                             .unwrap_or("");
                         let card_label = if model_str.is_empty() {
-                            format!(" 🤖 {} ", agent_name)
+                            format!(" {} ", agent_name)
                         } else {
-                            format!(" 🤖 {} ({}) ", agent_name, model_str)
+                            format!(" {} ({}) ", agent_name, model_str)
                         };
                         let card_dash = card_w.saturating_sub(
                             card_label.chars().count() + 2 + toggle_label.len() + 1,
@@ -1012,22 +1014,32 @@ impl SessionModal {
                             for &mi in msg_indices {
                                 let m = &msgs[mi];
                                 let prefix_p = if &*m.role == "user" {
-                                    ("👤", Color::Cyan)
+                                    ("USR", Color::Cyan)
                                 } else {
-                                    ("🤖", ag_color)
+                                    ("AGT", ag_color)
                                 };
                                 for part in &m.parts {
                                     match part {
                                         MessageContent::Text(t) => {
-                                            for line in wrap_text_plain(t, card_w.saturating_sub(6))
+                                            let max_lines = if &*m.role == "user" { 3 } else { 5 };
+                                            for (line_idx, line) in
+                                                wrap_text_plain(t, card_w.saturating_sub(10))
+                                                    .into_iter()
+                                                    .take(max_lines)
+                                                    .enumerate()
                                             {
+                                                let tag = if line_idx == 0 {
+                                                    format!("{} ", prefix_p.0)
+                                                } else {
+                                                    "    ".to_string()
+                                                };
                                                 lines.push(Line::from(vec![
                                                     Span::styled(
                                                         "   ┊ ",
                                                         Style::default().fg(ag_dim),
                                                     ),
                                                     Span::styled(
-                                                        format!("{} ", prefix_p.0),
+                                                        tag,
                                                         Style::default().fg(prefix_p.1),
                                                     ),
                                                     Span::styled(
@@ -1037,15 +1049,6 @@ impl SessionModal {
                                                     ),
                                                 ]));
                                             }
-                                        }
-                                        MessageContent::Thinking(_) => {
-                                            lines.push(Line::from(vec![
-                                                Span::styled("   ┊ ", Style::default().fg(ag_dim)),
-                                                Span::styled(
-                                                    "  💭 thinking...",
-                                                    Style::default().fg(Color::Rgb(70, 70, 80)),
-                                                ),
-                                            ]));
                                         }
                                         _ => {}
                                     }
@@ -1074,25 +1077,44 @@ impl SessionModal {
                         } else {
                             let mut first_p = None;
                             for &mi in msg_indices {
-                                if &*msgs[mi].role == "user" {
-                                    if let Some(MessageContent::Text(t)) = msgs[mi].parts.first() {
-                                        first_p = Some(t);
-                                        break;
+                                for part in &msgs[mi].parts {
+                                    if let MessageContent::Text(t) = part {
+                                        if !t.trim().is_empty() {
+                                            first_p = Some(t);
+                                            break;
+                                        }
                                     }
+                                }
+                                if first_p.is_some() {
+                                    break;
                                 }
                             }
                             if let Some(p) = first_p {
-                                lines.push(Line::from(vec![
-                                    Span::styled("   ┊ ", Style::default().fg(ag_dim)),
-                                    Span::styled(
-                                        format!(
-                                            " \"{}\"",
-                                            safe_truncate(p, card_w.saturating_sub(4))
+                                let preview = first_n_sentences(p, 6);
+                                for line in wrap_text_plain(&preview, card_w.saturating_sub(8))
+                                    .into_iter()
+                                    .take(2)
+                                {
+                                    lines.push(Line::from(vec![
+                                        Span::styled("   ┊  ", Style::default().fg(ag_dim)),
+                                        Span::styled(
+                                            line,
+                                            Style::default().fg(Color::Rgb(140, 140, 140)),
                                         ),
-                                        Style::default().fg(Color::Rgb(140, 140, 140)),
-                                    ),
-                                ]));
+                                    ]));
+                                }
                             }
+                            lines.push(Line::from(vec![
+                                Span::styled("   ┊  ", Style::default().fg(ag_dim)),
+                                Span::styled(
+                                    format!(
+                                        "messages: {}  tools: {}",
+                                        msg_indices.len(),
+                                        total_tools
+                                    ),
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                            ]));
                             if total_tools > 0 {
                                 let target_id =
                                     format!("tools:agent:{}", agent_name).into_boxed_str();
@@ -1243,7 +1265,8 @@ fn render_tool_stats_box<'a>(
 ) {
     let inner_w = card_w.saturating_sub(6);
     let frame_color = Color::Rgb(50, 50, 60);
-    let tool_text_color = Color::Rgb(180, 180, 200);
+    let tool_header_color = Color::Rgb(165, 165, 178);
+    let tool_text_color = Color::Rgb(145, 145, 160);
     let toggle_label = if is_expanded {
         "▼ collapse"
     } else {
@@ -1260,7 +1283,7 @@ fn render_tool_stats_box<'a>(
 
     click_targets.push((lines.len() as u16, ChatClickTarget::ToolBox(target_id)));
 
-    let header = format!("tools used ({})", total_tools);
+    let header = format!("⚙︎ tools used ({})", total_tools);
     let dash_len = inner_w.saturating_sub(header.chars().count() + toggle_label.len() + 3);
     lines.push(Line::from(vec![
         Span::styled(prefix, Style::default().fg(dim_color)),
@@ -1268,7 +1291,7 @@ fn render_tool_stats_box<'a>(
         Span::styled(
             header,
             Style::default()
-                .fg(tool_text_color)
+                .fg(tool_header_color)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" ".repeat(dash_len), Style::default().fg(frame_color)),
@@ -1291,8 +1314,7 @@ fn render_tool_stats_box<'a>(
 
     let tools_len = tools.len();
     for (idx, (name, entry)) in tools.iter().enumerate() {
-        // Tool line: emoji + name (xN) format
-        let tool_line = format!("{} {} (x{})", tool_icon(name), name, entry.count);
+        let tool_line = format!("  {} (x{})", name, entry.count);
         push_tool_line(
             lines,
             prefix,
@@ -1313,10 +1335,12 @@ fn render_tool_stats_box<'a>(
                 let mut file_map: FxHashMap<String, Vec<&ToolInvocation>> = FxHashMap::default();
                 for inv in &entry.invocations {
                     let key = inv.file_path.as_deref().unwrap_or("(unknown)").to_string();
-                    if !file_map.contains_key(&key) {
+                    if let Some(list) = file_map.get_mut(&key) {
+                        list.push(inv);
+                    } else {
                         file_order.push(key.clone());
+                        file_map.insert(key, vec![inv]);
                     }
-                    file_map.entry(key).or_default().push(inv);
                 }
                 for key in file_order {
                     let val = file_map.remove(&key).unwrap_or_default();
@@ -1326,16 +1350,12 @@ fn render_tool_stats_box<'a>(
                 for (g_idx, (fp, invs)) in file_groups.iter().enumerate() {
                     let is_last_group = g_idx == group_count - 1;
                     let tree_char = if is_last_group { "└" } else { "├" };
-                    let file_line = if is_read {
-                        format!("  {} {}", tree_char, short_file_path(Some(fp)))
-                    } else {
-                        format!(
-                            "  {} {} (x{})",
-                            tree_char,
-                            short_file_path(Some(fp)),
-                            invs.len()
-                        )
-                    };
+                    let file_line = format!(
+                        "    {} {} (x{})",
+                        tree_char,
+                        short_file_path(Some(fp)),
+                        invs.len()
+                    );
                     push_tool_line(
                         lines,
                         prefix,
@@ -1346,35 +1366,25 @@ fn render_tool_stats_box<'a>(
                         tool_text_color,
                     );
                     if is_read {
-                        // For read, show each invocation as a bullet point (dedup'd)
+                        // For read, show each invocation as a subtree (dedup'd)
                         let mut seen_details: FxHashSet<String> = FxHashSet::default();
-                        let mut rendered_any = false;
                         let detail_max = inner_w.saturating_sub(1).saturating_sub(6);
+                        let mut invs_deduped: Vec<&ToolInvocation> = Vec::new();
                         for inv in invs {
                             let detail = tool_invocation_secondary_detail(name, inv, detail_max)
                                 .or_else(|| tool_invocation_primary_detail(name, inv, detail_max));
                             if let Some(d) = detail {
-                                if !seen_details.insert(d.clone()) {
-                                    continue;
+                                if seen_details.insert(d) {
+                                    invs_deduped.push(inv);
                                 }
-                                let bullet_line = format!("    • {}", d);
-                                push_tool_line(
-                                    lines,
-                                    prefix,
-                                    dim_color,
-                                    frame_color,
-                                    inner_w,
-                                    &bullet_line,
-                                    tool_text_color,
-                                );
-                                rendered_any = true;
                             }
                         }
-                        if !rendered_any {
+                        let total_rendered = invs_deduped.len();
+                        if total_rendered == 0 {
                             let fallback = if fp == "(unknown)" {
-                                "    • no file metadata"
+                                "      └ no file metadata"
                             } else {
-                                "    • no per-call detail"
+                                "      └ no per-call detail"
                             };
                             push_tool_line(
                                 lines,
@@ -1385,6 +1395,27 @@ fn render_tool_stats_box<'a>(
                                 fallback,
                                 tool_text_color,
                             );
+                        } else {
+                            for (idx, inv) in invs_deduped.iter().enumerate() {
+                                let is_last = idx == total_rendered - 1;
+                                let tree_char = if is_last { "└" } else { "├" };
+                                let detail =
+                                    tool_invocation_secondary_detail(name, inv, detail_max)
+                                        .or_else(|| {
+                                            tool_invocation_primary_detail(name, inv, detail_max)
+                                        })
+                                        .unwrap_or_else(|| "unknown".to_string());
+                                let bullet_line = format!("      {} {}", tree_char, detail);
+                                push_tool_line(
+                                    lines,
+                                    prefix,
+                                    dim_color,
+                                    frame_color,
+                                    inner_w,
+                                    &bullet_line,
+                                    tool_text_color,
+                                );
+                            }
                         }
                     }
                 }
@@ -1397,7 +1428,7 @@ fn render_tool_stats_box<'a>(
                     let tree_char = if is_last_inv { "└" } else { "├" };
                     let description = tool_invocation_primary_detail(name, inv, desc_max)
                         .unwrap_or_else(|| format!("{} call", name));
-                    let line_text = format!("  {} {}", tree_char, description);
+                    let line_text = format!("    {} {}", tree_char, description);
                     push_tool_line(
                         lines,
                         prefix,
@@ -1466,6 +1497,22 @@ fn tool_invocation_secondary_detail(
             }
         }
     }
+    // For read tool without explicit params, show (full file)
+    if tool_name == "read" {
+        if let Some(fp) = inv.file_path.as_deref() {
+            // Check if input contains offset/limit parameters
+            let has_range_params = inv
+                .input
+                .as_deref()
+                .map_or(false, |inp| inp.contains("offset") || inp.contains("limit"));
+            if !has_range_params {
+                return Some(format!(
+                    "{} (full file)",
+                    safe_truncate_plain(&short_file_path(Some(fp)), max_w)
+                ));
+            }
+        }
+    }
     inv.file_path
         .as_deref()
         .map(|fp| safe_truncate_plain(&short_file_path(Some(fp)), max_w).into_owned())
@@ -1483,7 +1530,7 @@ fn render_user_box<'a>(
     } else {
         "▶ expand"
     };
-    let label = " 👤 USER ";
+    let label = " USER ";
     let dash_len = box_w.saturating_sub(label.chars().count() + 2 + toggle_label.len() + 1);
     lines.push(Line::from(vec![
         Span::raw(" "),
@@ -1560,9 +1607,9 @@ fn render_agent_box<'a>(
     };
     let model_str = msg.model.as_deref().unwrap_or("");
     let label = if model_str.is_empty() {
-        " 🤖 AGENT ".to_string()
+        " AGENT ".to_string()
     } else {
-        format!(" 🤖 AGENT ({}) ", model_str)
+        format!(" AGENT ({}) ", model_str)
     };
     let dash_len = box_w.saturating_sub(label.chars().count() + 2 + toggle_label.len() + 1);
     lines.push(Line::from(vec![
@@ -1581,22 +1628,6 @@ fn render_agent_box<'a>(
         ),
     ]));
     let content_w = box_w.saturating_sub(4);
-    let mut has_thinking = false;
-    for part in &msg.parts {
-        if let MessageContent::Thinking(_) = part {
-            has_thinking = true;
-            break;
-        }
-    }
-    if has_thinking {
-        lines.push(Line::from(vec![
-            Span::styled(" ║", Style::default().fg(border_color)),
-            Span::styled(
-                "  💭 thinking...",
-                Style::default().fg(Color::Rgb(70, 70, 80)),
-            ),
-        ]));
-    }
     let mut has_text = false;
     for part in &msg.parts {
         if let MessageContent::Text(t) = part {
@@ -1640,7 +1671,7 @@ fn render_agent_box<'a>(
             target_id,
         );
     }
-    if !has_text && !has_thinking && total_tools == 0 {
+    if !has_text && total_tools == 0 {
         lines.push(Line::from(vec![
             Span::styled(" ║", Style::default().fg(border_color)),
             Span::styled("  (empty)", Style::default().fg(Color::DarkGray)),
@@ -1653,57 +1684,6 @@ fn render_agent_box<'a>(
             Style::default().fg(border_color),
         ),
     ]));
-}
-
-fn render_system_line<'a>(
-    lines: &mut Vec<Line<'a>>,
-    msg: &ChatMessage,
-    box_w: usize,
-    is_expanded: bool,
-) {
-    let (icon, label, color) = get_role_info(&msg.role);
-    let header = format!(" {} {} ", icon, label);
-    let toggle_label = if is_expanded {
-        "▼ collapse"
-    } else {
-        "▶ expand"
-    };
-    let dash_len = box_w.saturating_sub(header.chars().count() + 2 + toggle_label.len() + 1);
-    lines.push(Line::from(vec![
-        Span::raw(" "),
-        Span::styled(header, Style::default().fg(color)),
-        Span::styled(
-            "─".repeat(dash_len),
-            Style::default().fg(Color::Rgb(40, 40, 50)),
-        ),
-        Span::styled(
-            format!(" {}", toggle_label),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]));
-    for part in &msg.parts {
-        if let MessageContent::Text(t) = part {
-            if is_expanded {
-                for line in wrap_text_plain(t, box_w.saturating_sub(4)) {
-                    lines.push(Line::from(vec![
-                        Span::raw("   "),
-                        Span::styled(line, Style::default().fg(Color::Rgb(120, 120, 120))),
-                    ]));
-                }
-            } else {
-                let summary = first_n_sentences(t, 1);
-                if !summary.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::raw("   "),
-                        Span::styled(
-                            safe_truncate(&summary, box_w.saturating_sub(4)).to_string(),
-                            Style::default().fg(Color::Rgb(120, 120, 120)),
-                        ),
-                    ]));
-                }
-            }
-        }
-    }
 }
 
 fn wrap_text_plain(s: &str, max_w: usize) -> Vec<String> {
@@ -1784,26 +1764,6 @@ fn dim_color(c: Color) -> Color {
     }
 }
 
-fn tool_icon(name: &str) -> &'static str {
-    let lower = name.to_ascii_lowercase();
-    match lower.as_str() {
-        "read" => "📖",
-        "grep" | "find" | "finder" => "🔍",
-        "glob" | "list" | "ls" | "list_directory" => "📁",
-        "edit" | "edit_file" | "write" | "create" | "create_file" => "🔧",
-        "apply_patch" | "patch" | "apply" | "apply_diff" => "🔧",
-        "bash" | "shell" | "exec" | "terminal" => "💻",
-        "task" | "todowrite" | "todoread" => "📝",
-        "skill" => "🧩",
-        "webfetch" | "web_search" | "browse" | "fetch" => "🌐",
-        "extract" => "📤",
-        "discard" => "🗑️",
-        "question" => "❓",
-        "invalid" => "⚠️",
-        _ => "📚",
-    }
-}
-
 fn normalize_tool_name(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
     let base = lower.strip_prefix("opencode_").unwrap_or(&lower);
@@ -1875,23 +1835,15 @@ fn format_tool_invocation_short(tool_name: &str, input: &str, max_w: usize) -> S
                 let off = extract_json_field(input, "offset");
                 let lim = extract_json_field(input, "limit");
                 match (off, lim) {
-                    (Some(o), Some(l)) => {
-                        let start: usize = o.parse().unwrap_or(1);
-                        let count: usize = l.parse().unwrap_or(0);
-                        if count > 0 {
-                            Some(format!("lines {}-{}", start, start + count - 1))
-                        } else {
-                            Some(format!("line {}", start))
-                        }
-                    }
-                    (Some(o), None) => Some(format!("from line {}", o)),
-                    (None, Some(l)) => Some(format!("limit {} lines", l)),
-                    _ => None,
+                    (Some(o), Some(l)) => Some(format!("offset {}, limit {}", o, l)),
+                    (Some(o), None) => Some(format!("offset {}", o)),
+                    (None, Some(l)) => Some(format!("limit {}", l)),
+                    (None, None) => None,
                 }
             });
             match range {
                 Some(r) => r,
-                None => "full file".to_string(),
+                None => "(full file)".to_string(),
             }
         }
         "edit" | "edit_file" | "write" | "create" | "create_file" => {
@@ -1943,12 +1895,12 @@ fn format_tool_detail(tool_name: &str, input: &str, max_w: usize) -> String {
                     (Some(o), Some(l)) => Some(format!("offset {}, limit {}", o, l)),
                     (Some(o), None) => Some(format!("offset {}", o)),
                     (None, Some(l)) => Some(format!("limit {}", l)),
-                    _ => None,
+                    (None, None) => None,
                 }
             });
             match (path, range) {
                 (Some(p), Some(r)) => format!("{} ({})", short_path_display(&p), r),
-                (Some(p), None) => short_path_display(&p),
+                (Some(p), None) => format!("{} (full file)", short_path_display(&p)),
                 _ => compact_oneline(input),
             }
         }
@@ -2267,15 +2219,6 @@ fn wrap_text_with_indent(
         result.push(current_line);
     }
     result
-}
-
-fn get_role_info(role: &str) -> (&'static str, String, Color) {
-    match role {
-        "user" => ("👤", "USER".to_string(), Color::Cyan),
-        "assistant" => ("🤖", "ASSISTANT".to_string(), Color::Green),
-        "system" => ("⚙", "SYSTEM".to_string(), Color::Yellow),
-        _ => ("?", role.to_uppercase(), Color::White),
-    }
 }
 
 pub fn detect_git_branch(root: &str) -> Option<String> {

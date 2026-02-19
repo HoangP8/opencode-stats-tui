@@ -2465,7 +2465,7 @@ fn build_tool_detail(tool_name: &str, input: &ToolStateInput) -> String {
                 }
                 (Some(off), None) => format!(" (offset {})", json_num(off)),
                 (None, Some(lim)) => format!(" (limit {})", json_num(lim)),
-                _ => String::new(),
+                _ => " (full file)".to_string(),
             };
             format!("{}{}", short_path(fp), range_str)
         }
