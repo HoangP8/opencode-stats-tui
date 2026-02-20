@@ -1348,7 +1348,7 @@ pub fn collect_stats() -> Stats {
         let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
 
         // Compute tokens for agent tracking
-        let tokens_from_msg = if let Some(t) = &msg.tokens {
+        let mut tokens_from_msg = if let Some(t) = &msg.tokens {
             Tokens {
                 input: t.input.map(|v| *v).unwrap_or(0),
                 output: t.output.map(|v| *v).unwrap_or(0),
@@ -1368,6 +1368,27 @@ pub fn collect_stats() -> Stats {
             Tokens::default()
         };
 
+        // If reasoning tokens are 0, estimate from reasoning parts text content
+        // (some providers store reasoning content in parts, not in tokens.reasoning field)
+        if tokens_from_msg.reasoning == 0 && is_assistant {
+            if let Some(msg_id) = msg.id.as_ref() {
+                let parts = load_parts_for_message(&msg_id.0, part_root);
+                let reasoning_parts: Vec<_> = parts
+                    .iter()
+                    .filter(|p| p.part_type.as_deref() == Some("reasoning"))
+                    .collect();
+                if !reasoning_parts.is_empty() {
+                    let reasoning_chars: usize = reasoning_parts
+                        .iter()
+                        .filter_map(|p| p.text.as_ref().map(|t| t.chars().count()))
+                        .sum();
+                    if reasoning_chars > 0 {
+                        tokens_from_msg.reasoning = (reasoning_chars / 4) as u64;
+                    }
+                }
+            }
+        }
+
         // Track first day session was seen for continuation detection (use effective)
         if !effective_session_id.is_empty()
             && !session_first_days.contains_key(effective_session_id.as_ref())
@@ -1386,7 +1407,12 @@ pub fn collect_stats() -> Stats {
             totals.prompts += 1;
         }
         totals.cost += cost;
-        add_tokens(&mut totals.tokens, &msg.tokens);
+        // Use tokens_from_msg which includes estimated reasoning tokens
+        totals.tokens.input += tokens_from_msg.input;
+        totals.tokens.output += tokens_from_msg.output;
+        totals.tokens.reasoning += tokens_from_msg.reasoning;
+        totals.tokens.cache_read += tokens_from_msg.cache_read;
+        totals.tokens.cache_write += tokens_from_msg.cache_write;
 
         if is_assistant {
             let model_entry = model_stats.entry(model_id.clone()).or_insert_with(|| {
@@ -1413,7 +1439,12 @@ pub fn collect_stats() -> Stats {
                 model_entry.sessions.insert(effective_session_id.clone());
             }
             model_entry.cost += cost;
-            add_tokens(&mut model_entry.tokens, &msg.tokens);
+            // Use tokens_from_msg which includes estimated reasoning tokens
+            model_entry.tokens.input += tokens_from_msg.input;
+            model_entry.tokens.output += tokens_from_msg.output;
+            model_entry.tokens.reasoning += tokens_from_msg.reasoning;
+            model_entry.tokens.cache_read += tokens_from_msg.cache_read;
+            model_entry.tokens.cache_write += tokens_from_msg.cache_write;
             if let Some(agent) = msg
                 .agent
                 .as_ref()
@@ -1439,7 +1470,12 @@ pub fn collect_stats() -> Stats {
             day_stat.prompts += 1;
         }
         day_stat.cost += cost;
-        add_tokens(&mut day_stat.tokens, &msg.tokens);
+        // Use tokens_from_msg which includes estimated reasoning tokens
+        day_stat.tokens.input += tokens_from_msg.input;
+        day_stat.tokens.output += tokens_from_msg.output;
+        day_stat.tokens.reasoning += tokens_from_msg.reasoning;
+        day_stat.tokens.cache_read += tokens_from_msg.cache_read;
+        day_stat.tokens.cache_write += tokens_from_msg.cache_write;
 
         // Get or create the session for THIS specific day using effective_session_id
         let session_stat_arc =
@@ -1481,7 +1517,12 @@ pub fn collect_stats() -> Stats {
         if is_assistant {
             session_stat.models.insert(model_id.clone());
         }
-        add_tokens(&mut session_stat.tokens, &msg.tokens);
+        // Use tokens_from_msg which includes estimated reasoning tokens
+        session_stat.tokens.input += tokens_from_msg.input;
+        session_stat.tokens.output += tokens_from_msg.output;
+        session_stat.tokens.reasoning += tokens_from_msg.reasoning;
+        session_stat.tokens.cache_read += tokens_from_msg.cache_read;
+        session_stat.tokens.cache_write += tokens_from_msg.cache_write;
         if let Some(t) = ts_val {
             if t < session_stat.first_activity {
                 session_stat.first_activity = t;
@@ -1921,6 +1962,10 @@ fn load_session_chat_internal(
                 let id_str = &id.0;
                 if !id_str.is_empty() {
                     for part in load_parts_for_message(id_str, part_root) {
+                        // Skip reasoning/thinking parts - we only want actual content
+                        if part.part_type.as_deref() == Some("reasoning") {
+                            continue;
+                        }
                         if part.thought.is_some() {
                             parts_vec.push(MessageContent::Thinking(()));
                         }
@@ -2002,42 +2047,7 @@ fn load_session_chat_internal(
         let incremental = compute_incremental_diffs(&current_cumulative, &last_cumulative_diffs);
         last_cumulative_diffs = current_cumulative;
 
-        for part in &mut parts_vec {
-            if let MessageContent::ToolCall(ref mut tc) = part {
-                if let Some(ref fp_str) = tc.file_path {
-                    let fp_name = fp_str.rsplit('/').next().unwrap_or(fp_str);
-                    let fp_suffix: Vec<&str> = fp_str.rsplit('/').take(2).collect();
-                    for d in &incremental {
-                        let d_path_str = &d.path;
-                        let d_suffix: Vec<&str> = d_path_str.rsplit('/').take(2).collect();
-                        if fp_suffix == d_suffix {
-                            tc.additions = Some(d.additions);
-                            tc.deletions = Some(d.deletions);
-                            break;
-                        }
-                        let d_name = d_path_str.rsplit('/').next().unwrap_or(d_path_str);
-                        if d_name == fp_name {
-                            tc.additions = Some(d.additions);
-                            tc.deletions = Some(d.deletions);
-                        }
-                    }
-                } else {
-                    // Fallback for patch-like tools that often do not carry file_path
-                    let tool_name = tc.name.to_ascii_lowercase();
-                    if matches!(
-                        tool_name.as_str(),
-                        "apply_patch" | "patch" | "apply" | "apply_diff"
-                    ) {
-                        let adds: u64 = incremental.iter().map(|d| d.additions).sum();
-                        let dels: u64 = incremental.iter().map(|d| d.deletions).sum();
-                        if adds > 0 || dels > 0 {
-                            tc.additions = Some(adds);
-                            tc.deletions = Some(dels);
-                        }
-                    }
-                }
-            }
-        }
+        match_tool_calls_with_diffs(&mut parts_vec, &incremental);
 
         let role: Box<str> = msg
             .role
@@ -2164,13 +2174,30 @@ pub fn load_session_details(
         a
     }
 
-    fn parse_msg(msg: &Message) -> (Box<str>, bool, Tokens, f64) {
+    fn parse_msg(msg: &Message, _msg_path: Option<&Path>) -> (Box<str>, bool, Tokens, f64) {
         let role = msg.role.as_ref().map(|s| s.0.as_str()).unwrap_or("");
         let is_user = role == "user";
         let model_id = get_model_id(msg);
         let mut tokens = Tokens::default();
         add_tokens(&mut tokens, &msg.tokens);
         let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
+
+        // Estimate reasoning tokens from parts if tokens.reasoning is 0
+        // (some providers store reasoning content in parts, not in tokens.reasoning field)
+        if tokens.reasoning == 0 && !is_user {
+            if let Some(msg_id) = msg.id.as_ref() {
+                let parts = load_parts_for_message(&msg_id.0, Path::new(""));
+                let reasoning_chars: usize = parts
+                    .iter()
+                    .filter(|p| p.part_type.as_deref() == Some("reasoning"))
+                    .filter_map(|p| p.text.as_ref().map(|t| t.chars().count()))
+                    .sum();
+                if reasoning_chars > 0 {
+                    tokens.reasoning = (reasoning_chars / 4) as u64;
+                }
+            }
+        }
+
         (model_id, is_user, tokens, cost)
     }
 
@@ -2186,7 +2213,7 @@ pub fn load_session_details(
                     }
                 }
 
-                let (model, is_user, tokens, cost) = parse_msg(&msg);
+                let (model, is_user, tokens, cost) = parse_msg(&msg, Some(p));
                 Some(MsgStats {
                     model,
                     is_user,
@@ -2214,7 +2241,7 @@ pub fn load_session_details(
                     }
                 }
 
-                let (model, is_user, tokens, cost) = parse_msg(&msg);
+                let (model, is_user, tokens, cost) = parse_msg(&msg, Some(p));
                 Some(MsgStats {
                     model,
                     is_user,
@@ -2372,42 +2399,7 @@ pub fn load_combined_session_chat(
         let incremental = compute_incremental_diffs(&current_cumulative, &last_cumulative_diffs);
         last_cumulative_diffs = current_cumulative;
 
-        for part in &mut parts_vec {
-            if let MessageContent::ToolCall(ref mut tc) = part {
-                if let Some(ref fp_str) = tc.file_path {
-                    let fp_name = fp_str.rsplit('/').next().unwrap_or(fp_str);
-                    let fp_suffix: Vec<&str> = fp_str.rsplit('/').take(2).collect();
-                    for d in &incremental {
-                        let d_path_str = &d.path;
-                        let d_suffix: Vec<&str> = d_path_str.rsplit('/').take(2).collect();
-                        if fp_suffix == d_suffix {
-                            tc.additions = Some(d.additions);
-                            tc.deletions = Some(d.deletions);
-                            break;
-                        }
-                        let d_name = d_path_str.rsplit('/').next().unwrap_or(d_path_str);
-                        if d_name == fp_name {
-                            tc.additions = Some(d.additions);
-                            tc.deletions = Some(d.deletions);
-                        }
-                    }
-                } else {
-                    // Fallback for patch-like tools that often do not carry file_path
-                    let tool_name = tc.name.to_ascii_lowercase();
-                    if matches!(
-                        tool_name.as_str(),
-                        "apply_patch" | "patch" | "apply" | "apply_diff"
-                    ) {
-                        let adds: u64 = incremental.iter().map(|d| d.additions).sum();
-                        let dels: u64 = incremental.iter().map(|d| d.deletions).sum();
-                        if adds > 0 || dels > 0 {
-                            tc.additions = Some(adds);
-                            tc.deletions = Some(dels);
-                        }
-                    }
-                }
-            }
-        }
+        match_tool_calls_with_diffs(&mut parts_vec, &incremental);
 
         let role: Box<str> = msg
             .role
@@ -2577,6 +2569,7 @@ fn json_num(v: &serde_json::Value) -> String {
     }
 }
 
+/// Short path - show last 2 components
 fn short_path(p: &str) -> String {
     let parts: Vec<&str> = p.rsplit('/').take(2).collect();
     if parts.len() >= 2 {
@@ -2586,16 +2579,19 @@ fn short_path(p: &str) -> String {
     }
 }
 
+/// Truncate a string to max chars with ellipsis
 fn truncate_inline(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
         return s.to_string();
     }
-    let mut out = String::new();
-    for ch in s.chars().take(max_chars.saturating_sub(1)) {
-        out.push(ch);
-    }
-    out.push('…');
-    out
+    let target = max_chars.saturating_sub(1);
+    let byte_pos = s
+        .char_indices()
+        .nth(target)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    format!("{}…", &s[..byte_pos])
 }
 
 fn first_nonempty_line(s: &str) -> Option<&str> {
@@ -2715,21 +2711,68 @@ fn extract_patch_files(patch: &str) -> Vec<String> {
 }
 
 fn truncate_string(s: &str, max: usize) -> Box<str> {
-    if s.len() <= max {
+    let char_count = s.chars().count();
+    if char_count <= max {
         return s.into();
     }
+    let target = max.saturating_sub(3); // Reserve space for "..."
+    let byte_pos = s
+        .char_indices()
+        .nth(target)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len());
+    format!("{}...", &s[..byte_pos]).into_boxed_str()
+}
 
-    let mut char_count = 0;
-    for (idx, _) in s.char_indices() {
-        if char_count == max {
-            let mut result = String::with_capacity(idx + 3);
-            result.push_str(&s[..idx]);
-            result.push_str("...");
-            return result.into_boxed_str();
+/// Match tool calls with incremental file diffs - assigns additions/deletions to tool calls
+fn match_tool_calls_with_diffs(parts: &mut [MessageContent], incremental: &[FileDiff]) {
+    for part in parts.iter_mut() {
+        if let MessageContent::ToolCall(ref mut tc) = part {
+            if let Some(ref fp_str) = tc.file_path {
+                let fp_name = fp_str.rsplit('/').next().unwrap_or(fp_str);
+                // Get last 2 path components without Vec allocation
+                let mut fp_parts: [&str; 2] = ["", ""];
+                let mut fp_idx = 0;
+                for seg in fp_str.rsplit('/').take(2) {
+                    fp_parts[1 - fp_idx] = seg;
+                    fp_idx += 1;
+                }
+                for d in incremental {
+                    let d_path_str = &d.path;
+                    let mut d_parts: [&str; 2] = ["", ""];
+                    let mut d_idx = 0;
+                    for seg in d_path_str.rsplit('/').take(2) {
+                        d_parts[1 - d_idx] = seg;
+                        d_idx += 1;
+                    }
+                    if fp_parts == d_parts {
+                        tc.additions = Some(d.additions);
+                        tc.deletions = Some(d.deletions);
+                        break;
+                    }
+                    let d_name = d_path_str.rsplit('/').next().unwrap_or(d_path_str);
+                    if d_name == fp_name {
+                        tc.additions = Some(d.additions);
+                        tc.deletions = Some(d.deletions);
+                    }
+                }
+            } else {
+                // Fallback for patch-like tools that often do not carry file_path
+                let tool_name = tc.name.to_ascii_lowercase();
+                if matches!(
+                    tool_name.as_str(),
+                    "apply_patch" | "patch" | "apply" | "apply_diff"
+                ) {
+                    let adds: u64 = incremental.iter().map(|d| d.additions).sum();
+                    let dels: u64 = incremental.iter().map(|d| d.deletions).sum();
+                    if adds > 0 || dels > 0 {
+                        tc.additions = Some(adds);
+                        tc.deletions = Some(dels);
+                    }
+                }
+            }
         }
-        char_count += 1;
     }
-    s.into()
 }
 
 fn deserialize_lenient_summary<'de, D>(deserializer: D) -> Result<Option<Summary>, D::Error>

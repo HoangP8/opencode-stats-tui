@@ -937,6 +937,8 @@ impl SessionModal {
 
         // ── Phase 2: render blocks ──
         self.chat_click_targets.clear();
+        let mut user_count = 0usize;
+        let mut agent_count = 0usize;
         for block in &blocks {
             match block {
                 ChatBlock::Single(idx) => {
@@ -945,13 +947,16 @@ impl SessionModal {
                     self.chat_click_targets
                         .push((lines.len() as u16, ChatClickTarget::Message(*idx)));
                     if &*msg.role == "user" {
-                        render_user_box(&mut lines, msg, box_w, is_expanded);
+                        user_count += 1;
+                        render_user_box(&mut lines, msg, box_w, is_expanded, user_count);
                     } else {
+                        agent_count += 1;
                         render_agent_box(
                             &mut lines,
                             msg,
                             box_w,
                             is_expanded,
+                            agent_count,
                             *idx,
                             &mut self.chat_click_targets,
                             &self.expanded_tools,
@@ -1015,47 +1020,81 @@ impl SessionModal {
                             ),
                         ]));
                         if is_expanded {
+                            // Merge all AGT text and all USR text separately
+                            let mut all_agt_text = String::new();
+                            let mut all_usr_text = String::new();
                             for &mi in msg_indices {
                                 let m = &msgs[mi];
-                                let prefix_p = if &*m.role == "user" {
-                                    ("USR", Color::Cyan)
-                                } else {
-                                    ("AGT", ag_color)
-                                };
+                                let is_user = &*m.role == "user";
                                 for part in &m.parts {
-                                    match part {
-                                        MessageContent::Text(t) => {
-                                            let max_lines = if &*m.role == "user" { 3 } else { 5 };
-                                            for (line_idx, line) in
-                                                wrap_text_plain(t, card_w.saturating_sub(10))
-                                                    .into_iter()
-                                                    .take(max_lines)
-                                                    .enumerate()
-                                            {
-                                                let tag = if line_idx == 0 {
-                                                    format!("{} ", prefix_p.0)
-                                                } else {
-                                                    "    ".to_string()
-                                                };
-                                                lines.push(Line::from(vec![
-                                                    Span::styled(
-                                                        "   ┊ ",
-                                                        Style::default().fg(ag_dim),
-                                                    ),
-                                                    Span::styled(
-                                                        tag,
-                                                        Style::default().fg(prefix_p.1),
-                                                    ),
-                                                    Span::styled(
-                                                        line,
-                                                        Style::default()
-                                                            .fg(Color::Rgb(200, 200, 200)),
-                                                    ),
-                                                ]));
+                                    if let MessageContent::Text(t) = part {
+                                        let text = if is_user {
+                                            filter_user_text(t)
+                                        } else {
+                                            t.to_string()
+                                        };
+                                        if !text.trim().is_empty() {
+                                            if is_user {
+                                                if !all_usr_text.is_empty() {
+                                                    all_usr_text.push_str("\n");
+                                                }
+                                                all_usr_text.push_str(&text);
+                                            } else {
+                                                if !all_agt_text.is_empty() {
+                                                    all_agt_text.push_str("\n");
+                                                }
+                                                all_agt_text.push_str(&text);
                                             }
                                         }
-                                        _ => {}
                                     }
+                                }
+                            }
+                            // Show USR if present (compact, max 2 lines)
+                            if !all_usr_text.is_empty() {
+                                let usr_lines: Vec<String> =
+                                    wrap_text_plain(&all_usr_text, card_w.saturating_sub(8));
+                                let usr_display: Vec<&str> =
+                                    usr_lines.iter().take(5).map(|s| s.as_str()).collect();
+                                let usr_truncated = usr_lines.len() > 5;
+                                for (i, line) in usr_display.iter().enumerate() {
+                                    let tag = if i == 0 { "USR " } else { "    " };
+                                    let suffix = if i == usr_display.len() - 1 && usr_truncated {
+                                        "…"
+                                    } else {
+                                        ""
+                                    };
+                                    lines.push(Line::from(vec![
+                                        Span::styled("   ┊ ", Style::default().fg(ag_dim)),
+                                        Span::styled(tag, Style::default().fg(Color::Cyan)),
+                                        Span::styled(
+                                            format!("{}{}", line, suffix),
+                                            Style::default().fg(Color::Rgb(200, 200, 200)),
+                                        ),
+                                    ]));
+                                }
+                            }
+                            // Show AGT (compact, max 4 lines)
+                            if !all_agt_text.is_empty() {
+                                let agt_lines: Vec<String> =
+                                    wrap_text_plain(&all_agt_text, card_w.saturating_sub(8));
+                                let agt_display: Vec<&str> =
+                                    agt_lines.iter().take(10).map(|s| s.as_str()).collect();
+                                let agt_truncated = agt_lines.len() > 10;
+                                for (i, line) in agt_display.iter().enumerate() {
+                                    let tag = if i == 0 { "AGT " } else { "    " };
+                                    let suffix = if i == agt_display.len() - 1 && agt_truncated {
+                                        "…"
+                                    } else {
+                                        ""
+                                    };
+                                    lines.push(Line::from(vec![
+                                        Span::styled("   ┊ ", Style::default().fg(ag_dim)),
+                                        Span::styled(tag, Style::default().fg(ag_color)),
+                                        Span::styled(
+                                            format!("{}{}", line, suffix),
+                                            Style::default().fg(Color::Rgb(200, 200, 200)),
+                                        ),
+                                    ]));
                                 }
                             }
                             if total_tools > 0 {
@@ -1083,8 +1122,9 @@ impl SessionModal {
                             for &mi in msg_indices {
                                 for part in &msgs[mi].parts {
                                     if let MessageContent::Text(t) = part {
-                                        if !t.trim().is_empty() {
-                                            first_p = Some(t);
+                                        let filtered = filter_user_text(t);
+                                        if !filtered.trim().is_empty() {
+                                            first_p = Some(filtered);
                                             break;
                                         }
                                     }
@@ -1094,10 +1134,10 @@ impl SessionModal {
                                 }
                             }
                             if let Some(p) = first_p {
-                                let preview = first_n_sentences(p, 6);
+                                let preview = first_n_sentences(&p, 6);
                                 for line in wrap_text_plain(&preview, card_w.saturating_sub(8))
                                     .into_iter()
-                                    .take(2)
+                                    .take(4)
                                 {
                                     lines.push(Line::from(vec![
                                         Span::styled("   ┊  ", Style::default().fg(ag_dim)),
@@ -1111,11 +1151,7 @@ impl SessionModal {
                             lines.push(Line::from(vec![
                                 Span::styled("   ┊  ", Style::default().fg(ag_dim)),
                                 Span::styled(
-                                    format!(
-                                        "messages: {}  tools: {}",
-                                        msg_indices.len(),
-                                        total_tools
-                                    ),
+                                    format!("tools: {}", total_tools),
                                     Style::default().fg(Color::DarkGray),
                                 ),
                             ]));
@@ -1522,11 +1558,96 @@ fn tool_invocation_secondary_detail(
         .map(|fp| safe_truncate_plain(&short_file_path(Some(fp)), max_w).into_owned())
 }
 
+/// Truncate text to max chars with "..." suffix
+fn truncate_text(text: &str, max_chars: usize) -> Cow<'_, str> {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        Cow::Borrowed(trimmed)
+    } else {
+        let target = max_chars.saturating_sub(1);
+        let byte_pos = trimmed
+            .char_indices()
+            .nth(target)
+            .map(|(i, _)| i)
+            .unwrap_or(trimmed.len());
+        Cow::Owned(format!("{}…", &trimmed[..byte_pos]))
+    }
+}
+
+/// Clean text and add line breaks after **section** headers for readability
+fn clean_text_with_breaks(text: &str) -> String {
+    // Replace **Title** with **Title**\n for better line breaks
+    let mut result = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            // Find closing **
+            let mut j = i + 2;
+            while j + 1 < chars.len() && !(chars[j] == '*' && chars[j + 1] == '*') {
+                j += 1;
+            }
+            if j + 1 < chars.len() {
+                // Add the **title** and a newline after
+                for k in i..=j + 1 {
+                    result.push(chars[k]);
+                }
+                // Check if next char is not already newline
+                if j + 2 < chars.len() && !chars[j + 2].is_whitespace() {
+                    result.push('\n');
+                }
+                i = j + 2;
+                continue;
+            }
+        }
+        result.push(chars[i]);
+        i += 1;
+    }
+    result
+}
+
+/// Filter out tool call annotations from user text to show only raw input
+/// Removes lines like "Called the Read tool with..." and similar patterns
+fn filter_user_text(text: &str) -> String {
+    let mut result = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // Skip tool call annotation lines
+        if trimmed.starts_with("Called the ")
+            || trimmed.starts_with("Used the ")
+            || trimmed.starts_with("Ran the ")
+            || trimmed.starts_with("Invoked the ")
+            // Skip JSON-like parameter blocks
+            || trimmed.starts_with("{\"")
+            || trimmed.starts_with("{ \"")
+            // Skip lines that are just tool output markers
+            || trimmed.starts_with("Tool:")
+            || trimmed.starts_with("Result:")
+            // Skip path annotations like "<path>/foo/bar</path>"
+            || (trimmed.starts_with("<path>") && trimmed.ends_with("</path>"))
+            // Skip type annotations like "<type>file</type>"
+            || (trimmed.starts_with("<type>") && trimmed.ends_with("</type>"))
+            // Skip content markers
+            || trimmed.starts_with("<content>")
+            || trimmed == "```"
+            || trimmed.starts_with("```json")
+        {
+            continue;
+        }
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(line);
+    }
+    result.trim().to_string()
+}
+
 fn render_user_box<'a>(
     lines: &mut Vec<Line<'a>>,
     msg: &ChatMessage,
     box_w: usize,
     is_expanded: bool,
+    user_num: usize,
 ) {
     let border_color = Color::Cyan;
     let toggle_label = if is_expanded {
@@ -1534,7 +1655,7 @@ fn render_user_box<'a>(
     } else {
         "▶ expand"
     };
-    let label = " USER ";
+    let label = format!(" USER #{} ", user_num);
     let dash_len = box_w.saturating_sub(label.chars().count() + 2 + toggle_label.len() + 1);
     lines.push(Line::from(vec![
         Span::raw(" "),
@@ -1552,38 +1673,36 @@ fn render_user_box<'a>(
         ),
     ]));
     let content_w = box_w.saturating_sub(4);
-    let mut has_content = false;
-    for part in &msg.parts {
-        if let MessageContent::Text(t) = part {
-            if is_expanded {
-                for line in wrap_text_plain(t, content_w) {
-                    lines.push(Line::from(vec![
-                        Span::styled(" │", Style::default().fg(border_color)),
-                        Span::raw("  "),
-                        Span::styled(line, Style::default().fg(Color::White)),
-                    ]));
-                }
+    // Extract only text parts, concatenate with newlines, filter tool call annotations, then clean for readability
+    let all_text: String = msg
+        .parts
+        .iter()
+        .filter_map(|p| {
+            if let MessageContent::Text(t) = p {
+                Some(filter_user_text(t).trim().to_string())
             } else {
-                let summary = first_n_sentences(t, 4);
-                if !summary.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled(" │", Style::default().fg(border_color)),
-                        Span::raw("  "),
-                        Span::styled(
-                            safe_truncate(&summary, content_w).to_string(),
-                            Style::default().fg(Color::White),
-                        ),
-                    ]));
-                }
+                None
             }
-            has_content = true;
-        }
-    }
-    if !has_content {
+        })
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cleaned = clean_text_with_breaks(&all_text);
+    if cleaned.is_empty() {
         lines.push(Line::from(vec![
             Span::styled(" │", Style::default().fg(border_color)),
             Span::styled("  (empty)", Style::default().fg(Color::DarkGray)),
         ]));
+    } else {
+        let max_chars = if is_expanded { 600 } else { 300 };
+        let truncated = truncate_text(&cleaned, max_chars);
+        for line in wrap_text_plain(&truncated, content_w) {
+            lines.push(Line::from(vec![
+                Span::styled(" │", Style::default().fg(border_color)),
+                Span::raw("  "),
+                Span::styled(line, Style::default().fg(Color::White)),
+            ]));
+        }
     }
     lines.push(Line::from(vec![
         Span::raw(" "),
@@ -1599,6 +1718,7 @@ fn render_agent_box<'a>(
     msg: &ChatMessage,
     box_w: usize,
     is_expanded: bool,
+    agent_num: usize,
     msg_idx: usize,
     click_targets: &mut Vec<(u16, ChatClickTarget)>,
     expanded_tools: &FxHashSet<Box<str>>,
@@ -1611,9 +1731,9 @@ fn render_agent_box<'a>(
     };
     let model_str = msg.model.as_deref().unwrap_or("");
     let label = if model_str.is_empty() {
-        " AGENT ".to_string()
+        format!(" AGENT #{} ", agent_num)
     } else {
-        format!(" AGENT ({}) ", model_str)
+        format!(" AGENT #{} ({}) ", agent_num, model_str)
     };
     let dash_len = box_w.saturating_sub(label.chars().count() + 2 + toggle_label.len() + 1);
     lines.push(Line::from(vec![
@@ -1632,33 +1752,34 @@ fn render_agent_box<'a>(
         ),
     ]));
     let content_w = box_w.saturating_sub(4);
-    let mut has_text = false;
-    for part in &msg.parts {
-        if let MessageContent::Text(t) = part {
-            if is_expanded {
-                for line in wrap_text_plain(t, content_w) {
-                    lines.push(Line::from(vec![
-                        Span::styled(" ║", Style::default().fg(border_color)),
-                        Span::raw("  "),
-                        Span::styled(line, Style::default().fg(Color::Rgb(200, 200, 200))),
-                    ]));
-                }
+    // Extract only text parts, concatenate with newlines, then clean for readability
+    let all_text: String = msg
+        .parts
+        .iter()
+        .filter_map(|p| {
+            if let MessageContent::Text(t) = p {
+                Some(t.trim())
             } else {
-                let summary = first_n_sentences(t, 4);
-                if !summary.is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled(" ║", Style::default().fg(border_color)),
-                        Span::raw("  "),
-                        Span::styled(
-                            safe_truncate(&summary, content_w).to_string(),
-                            Style::default().fg(Color::Rgb(200, 200, 200)),
-                        ),
-                    ]));
-                }
+                None
             }
-            has_text = true;
+        })
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cleaned = clean_text_with_breaks(&all_text);
+    let has_text = !cleaned.is_empty();
+    if has_text {
+        let max_chars = if is_expanded { 600 } else { 300 };
+        let truncated = truncate_text(&cleaned, max_chars);
+        for line in wrap_text_plain(&truncated, content_w) {
+            lines.push(Line::from(vec![
+                Span::styled(" ║", Style::default().fg(border_color)),
+                Span::raw("  "),
+                Span::styled(line, Style::default().fg(Color::Rgb(200, 200, 200))),
+            ]));
         }
     }
+    // Tool stats
     let (total_tools, tool_stats) = aggregate_tools_in_group(std::slice::from_ref(msg), &[0]);
     if total_tools > 0 {
         let target_id = format!("tools:msg:{}", msg_idx).into_boxed_str();
@@ -1994,34 +2115,34 @@ fn extract_json_field(input: &str, field: &str) -> Option<String> {
     }
 }
 
-/// Show last 2 path components
-fn short_path_display(path: &str) -> String {
-    let parts: Vec<&str> = path.rsplit('/').take(3).collect();
-    if parts.len() >= 3 {
-        format!("…/{}/{}", parts[1], parts[0])
+/// Show path shortened to last N components
+/// If components >= depth+1, shows prefix + last components
+fn short_path(path: &str, depth: usize, prefix: &str) -> String {
+    let parts: Vec<&str> = path.rsplit('/').take(depth + 1).collect();
+    if parts.len() > depth {
+        let reversed: Vec<&str> = parts.into_iter().rev().collect();
+        format!("{}{}", prefix, reversed.join("/"))
     } else {
         path.to_string()
     }
 }
 
-/// Collapse multi-line input into a single line
-fn compact_oneline(s: &str) -> String {
-    let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    collapsed
+/// Show last 2-3 path components with ellipsis prefix
+fn short_path_display(path: &str) -> String {
+    short_path(path, 2, "…/")
 }
 
+/// Show last 2 components for file paths (handles Option)
 fn short_file_path(fp: Option<&str>) -> String {
     match fp {
-        Some(p) => {
-            let parts: Vec<&str> = p.rsplit('/').take(2).collect();
-            if parts.len() >= 2 {
-                format!("{}/{}", parts[1], parts[0])
-            } else {
-                parts[0].to_string()
-            }
-        }
+        Some(p) => short_path(p, 1, ""),
         None => "file".to_string(),
     }
+}
+
+/// Collapse multi-line input into a single line
+fn compact_oneline(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn first_n_sentences(text: &str, n: usize) -> String {
@@ -2049,8 +2170,8 @@ fn first_n_sentences(text: &str, n: usize) -> String {
         }
         return result;
     }
-    if collapsed.chars().count() > 150 {
-        let target = 147;
+    if collapsed.chars().count() > 500 {
+        let target = 497;
         let byte_pos = collapsed
             .char_indices()
             .nth(target)
@@ -2061,46 +2182,19 @@ fn first_n_sentences(text: &str, n: usize) -> String {
     collapsed
 }
 
-#[inline]
-fn safe_truncate(s: &str, max_len: usize) -> Cow<'_, str> {
-    if s.chars().count() <= max_len {
-        return Cow::Borrowed(s);
-    }
-    let target = max_len.saturating_sub(1);
-    let byte_end = s
-        .char_indices()
-        .nth(target)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len());
-    let cut = s[..byte_end]
-        .rfind(' ')
-        .map(|pos| &s[..pos])
-        .unwrap_or(&s[..byte_end]);
-    Cow::Owned(format!("{}…", cut))
-}
-
 fn safe_truncate_plain(s: &str, max_len: usize) -> Cow<'_, str> {
-    let mut char_count = 0;
-    for _ in s.chars() {
-        char_count += 1;
-        if char_count > max_len {
-            break;
-        }
-    }
+    let char_count = s.chars().count();
     if char_count <= max_len {
-        return Cow::Borrowed(s);
+        Cow::Borrowed(s)
+    } else {
+        let target = max_len.saturating_sub(1);
+        let byte_pos = s
+            .char_indices()
+            .nth(target)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        Cow::Owned(format!("{}…", &s[..byte_pos]))
     }
-    let target = max_len.saturating_sub(1);
-    let mut current_count = 0;
-    for (idx, _) in s.char_indices() {
-        if current_count == target {
-            let mut result = s[..idx].to_string();
-            result.push('…');
-            return Cow::Owned(result);
-        }
-        current_count += 1;
-    }
-    Cow::Borrowed(s)
 }
 
 fn fit_display_width(s: &str, target_width: usize) -> String {
