@@ -1,3 +1,4 @@
+use crate::cost::estimate_cost;
 use crate::stats::{
     format_active_duration, format_number, load_session_details, ChatMessage, MessageContent,
     SessionDetails, SessionStat,
@@ -404,7 +405,7 @@ impl SessionModal {
                     Color::Rgb(100, 200, 255)
                 };
                 lines.push(Line::from(vec![
-                    Span::raw("    Host:  "),
+                    Span::raw("    Host:     "),
                     Span::styled(device.display_label(), Style::default().fg(type_color)),
                     Span::raw(" | "),
                     Span::styled(
@@ -587,11 +588,9 @@ impl SessionModal {
                 ];
                 let responses = model.messages.saturating_sub(model.prompts);
                 let model_cost = model.cost;
-                let model_est = model_cost
-                    + (model.tokens.cache_read as f64 * model_cost
-                        / (model.tokens.input + model.tokens.output + model.tokens.reasoning).max(1)
-                            as f64);
-                let model_savings = model_est - model_cost;
+                // Use OpenRouter pricing for estimated cost (what you would pay at standard rates)
+                let model_est = estimate_cost(&model.name, &model.tokens).unwrap_or(model_cost);
+                let model_savings = model_est - model_cost; // Positive when you saved money
                 let right_labels = [
                     ("Prompts", model.prompts.to_string(), Color::Cyan),
                     ("Responses", responses.to_string(), Color::Green),
@@ -699,11 +698,14 @@ impl SessionModal {
             ),
         ]));
         let total_cost = session.cost;
-        let total_non_cache =
-            (session.tokens.input + session.tokens.output + session.tokens.reasoning).max(1) as f64;
-        let est_cost =
-            total_cost + (session.tokens.cache_read as f64 * total_cost / total_non_cache);
-        let savings = est_cost - total_cost;
+        // Use OpenRouter pricing for estimated cost (what you would pay at standard rates)
+        let est_cost = session
+            .models
+            .iter()
+            .next()
+            .and_then(|m| estimate_cost(m, &session.tokens))
+            .unwrap_or(total_cost);
+        let savings = est_cost - total_cost; // Positive when you saved money
         let (savings_text, savings_color) = if savings < 0.0 {
             (format!("-${:.2}", savings.abs()), Color::Red)
         } else {
