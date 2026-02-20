@@ -279,6 +279,17 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     s.into()
 }
 
+/// Helper: Smart truncate for host names.
+/// If the full name fits, show it. If not, show just the short name (before space/parenthesis) without ellipsis.
+fn truncate_host_name(full_name: &str, short_name: &str, max_chars: usize) -> String {
+    if full_name.chars().count() <= max_chars {
+        full_name.to_string()
+    } else {
+        // Not enough space - show clean short name, no ellipsis as requested
+        safe_truncate_plain(short_name, max_chars).into_owned()
+    }
+}
+
 /// Calculate the actual number of rendered lines for a chat message
 fn calculate_message_rendered_lines(msg: &ChatMessage) -> u16 {
     let mut lines = 1u16; // Header line
@@ -2489,7 +2500,7 @@ impl App {
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(7), // Info (5 lines content + borders)
+                Constraint::Length(7), // Info (6 lines content + borders)
                 Constraint::Min(0),    // Bottom section
             ])
             .split(area);
@@ -2574,10 +2585,8 @@ impl App {
                 truncate_with_ellipsis(text, avail.max(1))
             };
 
-            let non_cache =
-                (model.tokens.input + model.tokens.output + model.tokens.reasoning).max(1) as f64;
-            let est_cost = model.cost + (model.tokens.cache_read as f64 * model.cost / non_cache);
-            let savings = est_cost - model.cost;
+            let est_cost = crate::cost::estimate_cost(&model.name, &model.tokens);
+            let savings = est_cost.map(|e| e - model.cost);
 
             let left_lines = vec![
                 Line::from(vec![
@@ -2608,14 +2617,31 @@ impl App {
                     ),
                 ]),
                 Line::from(vec![
+                    Span::styled("Est. Cost ", label_color),
+                    Span::styled(
+                        match est_cost {
+                            Some(c) => format!("${:.2}", c),
+                            None => "$0.00".to_string(),
+                        },
+                        Style::default()
+                            .fg(match est_cost {
+                                Some(c) if c > 0.0 => Color::Rgb(255, 165, 0),
+                                _ => Color::DarkGray,
+                            })
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
                     Span::styled("Savings   ", label_color),
                     Span::styled(
-                        format!("${:.2}", savings),
+                        match savings {
+                            Some(s) => format!("${:.2}", s),
+                            None => "$0.00".to_string(),
+                        },
                         Style::default()
-                            .fg(if savings > 0.0 {
-                                Color::Green
-                            } else {
-                                Color::DarkGray
+                            .fg(match savings {
+                                Some(s) if s > 0.0 => Color::Green,
+                                _ => Color::DarkGray,
                             })
                             .add_modifier(Modifier::BOLD),
                     ),
@@ -3169,12 +3195,20 @@ impl App {
                 } else {
                     Color::Rgb(100, 200, 255)
                 };
+                let label = device.display_label();
+                // 13 for "Host:        ", label length, 3 for " | ", and 1 for margin
+                let host_avail = (cols[0].width as usize).saturating_sub(13 + label.len() + 3 + 1);
+
                 left_lines.push(Line::from(vec![
                     Span::styled("Host:        ", label_style),
-                    Span::styled(device.display_label(), Style::default().fg(type_color)),
+                    Span::styled(label, Style::default().fg(type_color)),
                     Span::raw(" | "),
                     Span::styled(
-                        truncate_with_ellipsis(&device.display_name(), left_val_width),
+                        truncate_host_name(
+                            &device.display_name(),
+                            &device.short_name(),
+                            host_avail,
+                        ),
                         Style::default().fg(type_color),
                     ),
                 ]));

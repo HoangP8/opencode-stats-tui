@@ -1,4 +1,5 @@
 use std::io;
+mod cost;
 mod device;
 mod live_watcher;
 mod session;
@@ -144,6 +145,11 @@ fn main() -> io::Result<()> {
     // Uses OnceLock internally — resolves in parallel while TUI initializes.
     std::thread::spawn(|| {
         device::get_device_info();
+    });
+
+    // Fetch OpenRouter pricing in background (non-blocking).
+    std::thread::spawn(|| {
+        cost::init_pricing();
     });
 
     // OPTIMIZATION: Skip startup drain entirely for modern terminals
