@@ -52,6 +52,13 @@ impl DeviceInfo {
         }
     }
 
+    /// Short display name without parentheses - ideal for narrow terminal widths.
+    /// For servers: just the alias (e.g., "mail")
+    /// For local: just the hostname (e.g., "DESKTOP-HP")
+    pub fn short_name(&self) -> String {
+        self.name.clone()
+    }
+
     /// Label for display: "Local" or "Server"
     pub fn display_label(&self) -> &'static str {
         if self.kind == "server" {
