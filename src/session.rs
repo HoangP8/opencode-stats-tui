@@ -1120,12 +1120,12 @@ impl SessionModal {
                                         if !text.trim().is_empty() {
                                             if is_user {
                                                 if !all_usr_text.is_empty() {
-                                                    all_usr_text.push_str("\n");
+                                                    all_usr_text.push('\n');
                                                 }
                                                 all_usr_text.push_str(&text);
                                             } else {
                                                 if !all_agt_text.is_empty() {
-                                                    all_agt_text.push_str("\n");
+                                                    all_agt_text.push('\n');
                                                 }
                                                 all_agt_text.push_str(&text);
                                             }
@@ -1133,49 +1133,34 @@ impl SessionModal {
                                     }
                                 }
                             }
-                            // Show USR if present (compact, max 2 lines)
+                            let wrap_w = card_w.saturating_sub(8);
+                            // Show USR — all lines
                             if !all_usr_text.is_empty() {
-                                let usr_lines: Vec<String> =
-                                    wrap_text_plain(&all_usr_text, card_w.saturating_sub(8));
-                                let usr_display: Vec<&str> =
-                                    usr_lines.iter().take(5).map(|s| s.as_str()).collect();
-                                let usr_truncated = usr_lines.len() > 5;
-                                for (i, line) in usr_display.iter().enumerate() {
+                                for (i, line) in
+                                    wrap_text_plain(&all_usr_text, wrap_w).iter().enumerate()
+                                {
                                     let tag = if i == 0 { "USR " } else { "    " };
-                                    let suffix = if i == usr_display.len() - 1 && usr_truncated {
-                                        "…"
-                                    } else {
-                                        ""
-                                    };
                                     lines.push(Line::from(vec![
                                         Span::styled("   ┊ ", Style::default().fg(ag_dim)),
                                         Span::styled(tag, Style::default().fg(Color::Cyan)),
                                         Span::styled(
-                                            format!("{}{}", line, suffix),
+                                            line.clone(),
                                             Style::default().fg(Color::Rgb(200, 200, 200)),
                                         ),
                                     ]));
                                 }
                             }
-                            // Show AGT (compact, max 4 lines)
+                            // Show AGT — all lines
                             if !all_agt_text.is_empty() {
-                                let agt_lines: Vec<String> =
-                                    wrap_text_plain(&all_agt_text, card_w.saturating_sub(8));
-                                let agt_display: Vec<&str> =
-                                    agt_lines.iter().take(10).map(|s| s.as_str()).collect();
-                                let agt_truncated = agt_lines.len() > 10;
-                                for (i, line) in agt_display.iter().enumerate() {
+                                for (i, line) in
+                                    wrap_text_plain(&all_agt_text, wrap_w).iter().enumerate()
+                                {
                                     let tag = if i == 0 { "AGT " } else { "    " };
-                                    let suffix = if i == agt_display.len() - 1 && agt_truncated {
-                                        "…"
-                                    } else {
-                                        ""
-                                    };
                                     lines.push(Line::from(vec![
                                         Span::styled("   ┊ ", Style::default().fg(ag_dim)),
                                         Span::styled(tag, Style::default().fg(ag_color)),
                                         Span::styled(
-                                            format!("{}{}", line, suffix),
+                                            line.clone(),
                                             Style::default().fg(Color::Rgb(200, 200, 200)),
                                         ),
                                     ]));
@@ -1202,26 +1187,40 @@ impl SessionModal {
                                 );
                             }
                         } else {
-                            let mut first_p = None;
-                            for &mi in msg_indices {
+                            // Collapsed: 300-char preview with early exit
+                            const COLLAPSE_LIMIT: usize = 300;
+                            let mut preview = String::new();
+                            'collect: for &mi in msg_indices {
                                 for part in &msgs[mi].parts {
                                     if let MessageContent::Text(t) = part {
                                         let filtered = filter_user_text(t);
                                         if !filtered.trim().is_empty() {
-                                            first_p = Some(filtered);
-                                            break;
+                                            if !preview.is_empty() {
+                                                preview.push(' ');
+                                            }
+                                            preview.push_str(filtered.trim());
+                                            if preview.len() >= COLLAPSE_LIMIT {
+                                                break 'collect;
+                                            }
                                         }
                                     }
                                 }
-                                if first_p.is_some() {
-                                    break;
-                                }
                             }
-                            if let Some(p) = first_p {
-                                let preview = first_n_sentences(&p, 6);
-                                for line in wrap_text_plain(&preview, card_w.saturating_sub(8))
-                                    .into_iter()
-                                    .take(4)
+                            if !preview.is_empty() {
+                                // Truncate cleanly at char boundary
+                                let truncated = preview.len() > COLLAPSE_LIMIT;
+                                if truncated {
+                                    let byte_pos = preview
+                                        .char_indices()
+                                        .take_while(|(i, _)| *i < COLLAPSE_LIMIT)
+                                        .last()
+                                        .map(|(i, c)| i + c.len_utf8())
+                                        .unwrap_or(preview.len());
+                                    preview.truncate(byte_pos);
+                                    preview.push('…');
+                                }
+                                for line in
+                                    wrap_text_plain(&preview, card_w.saturating_sub(8))
                                 {
                                     lines.push(Line::from(vec![
                                         Span::styled("   ┊  ", Style::default().fg(ag_dim)),
@@ -1778,14 +1777,23 @@ fn render_user_box<'a>(
             Span::styled("  (empty)", Style::default().fg(Color::DarkGray)),
         ]));
     } else {
-        let max_chars = if is_expanded { 600 } else { 300 };
-        let truncated = truncate_text(&cleaned, max_chars);
-        for line in wrap_text_plain(&truncated, content_w) {
-            lines.push(Line::from(vec![
-                Span::styled(" │", Style::default().fg(border_color)),
-                Span::raw("  "),
-                Span::styled(line, Style::default().fg(Color::White)),
-            ]));
+        if is_expanded {
+            for line in wrap_text_plain(&cleaned, content_w) {
+                lines.push(Line::from(vec![
+                    Span::styled(" │", Style::default().fg(border_color)),
+                    Span::raw("  "),
+                    Span::styled(line, Style::default().fg(Color::White)),
+                ]));
+            }
+        } else {
+            let truncated = truncate_text(&cleaned, 300);
+            for line in wrap_text_plain(&truncated, content_w) {
+                lines.push(Line::from(vec![
+                    Span::styled(" │", Style::default().fg(border_color)),
+                    Span::raw("  "),
+                    Span::styled(line, Style::default().fg(Color::White)),
+                ]));
+            }
         }
     }
     lines.push(Line::from(vec![
@@ -1853,14 +1861,23 @@ fn render_agent_box<'a>(
     let cleaned = clean_text_with_breaks(&all_text);
     let has_text = !cleaned.is_empty();
     if has_text {
-        let max_chars = if is_expanded { 600 } else { 300 };
-        let truncated = truncate_text(&cleaned, max_chars);
-        for line in wrap_text_plain(&truncated, content_w) {
-            lines.push(Line::from(vec![
-                Span::styled(" ║", Style::default().fg(border_color)),
-                Span::raw("  "),
-                Span::styled(line, Style::default().fg(Color::Rgb(200, 200, 200))),
-            ]));
+        if is_expanded {
+            for line in wrap_text_plain(&cleaned, content_w) {
+                lines.push(Line::from(vec![
+                    Span::styled(" ║", Style::default().fg(border_color)),
+                    Span::raw("  "),
+                    Span::styled(line, Style::default().fg(Color::Rgb(200, 200, 200))),
+                ]));
+            }
+        } else {
+            let truncated = truncate_text(&cleaned, 300);
+            for line in wrap_text_plain(&truncated, content_w) {
+                lines.push(Line::from(vec![
+                    Span::styled(" ║", Style::default().fg(border_color)),
+                    Span::raw("  "),
+                    Span::styled(line, Style::default().fg(Color::Rgb(200, 200, 200))),
+                ]));
+            }
         }
     }
     // Tool stats
@@ -2227,43 +2244,6 @@ fn short_file_path(fp: Option<&str>) -> String {
 /// Collapse multi-line input into a single line
 fn compact_oneline(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn first_n_sentences(text: &str, n: usize) -> String {
-    let collapsed: String = text.split_whitespace().collect::<Vec<&str>>().join(" ");
-    if collapsed.is_empty() {
-        return String::new();
-    }
-    let mut end_idx = 0;
-    let mut count = 0;
-    let chars: Vec<(usize, char)> = collapsed.char_indices().collect();
-    for i in 0..chars.len() {
-        let (pos, c) = chars[i];
-        if c == '.' || c == '!' || c == '?' {
-            count += 1;
-            end_idx = pos + c.len_utf8();
-            if count == n {
-                break;
-            }
-        }
-    }
-    if count > 0 {
-        let result = collapsed[..end_idx].trim().to_string();
-        if end_idx < collapsed.len() {
-            return format!("{}…", result);
-        }
-        return result;
-    }
-    if collapsed.chars().count() > 500 {
-        let target = 497;
-        let byte_pos = collapsed
-            .char_indices()
-            .nth(target)
-            .map(|(i, _)| i)
-            .unwrap_or(collapsed.len());
-        return format!("{}…", &collapsed[..byte_pos]);
-    }
-    collapsed
 }
 
 fn safe_truncate_plain(s: &str, max_len: usize) -> Cow<'_, str> {

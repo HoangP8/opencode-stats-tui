@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 
 // Fast path constants for performance
 pub const MAX_MESSAGES_TO_LOAD: usize = 100;
-const MAX_CHARS_PER_TEXT_PART: usize = 500;
+const MAX_CHARS_PER_TEXT_PART: usize = 2000;
 
 static HOME_DIR: OnceLock<String> = OnceLock::new();
 static OPENCODE_ROOT_PATH: OnceLock<PathBuf> = OnceLock::new();
