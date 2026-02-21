@@ -47,6 +47,11 @@ pub struct SessionModal {
     pub expanded_tools: FxHashSet<Box<str>>,
     // Clickable chat header line indices (content-space y, ClickTarget)
     chat_click_targets: Vec<(u16, ChatClickTarget)>,
+    // Tracks which agents/models are expanded in the info panel
+    expanded_info_agents: FxHashSet<Box<str>>,
+    expanded_info_models: FxHashSet<Box<str>>,
+    // Clickable info header line indices (content-space y, InfoClickTarget)
+    info_click_targets: Vec<(u16, InfoClickTarget)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +59,12 @@ pub enum ChatClickTarget {
     Agent(Box<str>),
     Message(usize),
     ToolBox(Box<str>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InfoClickTarget {
+    Agent(Box<str>),
+    Model(Box<str>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +80,9 @@ impl SessionModal {
         self.expanded_messages.clear();
         self.expanded_tools.clear();
         self.chat_click_targets.clear();
+        self.expanded_info_agents.clear();
+        self.expanded_info_models.clear();
+        self.info_click_targets.clear();
     }
 
     pub fn new() -> Self {
@@ -86,6 +100,9 @@ impl SessionModal {
             expanded_messages: FxHashSet::default(),
             expanded_tools: FxHashSet::default(),
             chat_click_targets: Vec::new(),
+            expanded_info_agents: FxHashSet::default(),
+            expanded_info_models: FxHashSet::default(),
+            info_click_targets: Vec::new(),
         }
     }
 
@@ -237,6 +254,30 @@ impl SessionModal {
                 let (x, y) = (mouse.column, mouse.row);
                 if Self::contains_point(self.cached_rects.info, x, y) {
                     self.selected_column = ModalColumn::Info;
+                    if let Some(info_rect) = self.cached_rects.info {
+                        let content_y =
+                            (y.saturating_sub(info_rect.y + 1)) as u16 + self.info_scroll;
+                        if let Ok(pos) = self
+                            .info_click_targets
+                            .binary_search_by_key(&content_y, |(line_idx, _)| *line_idx)
+                        {
+                            let target = &self.info_click_targets[pos].1;
+                            match target {
+                                InfoClickTarget::Agent(name) => {
+                                    let name = name.clone();
+                                    if !self.expanded_info_agents.remove(&name) {
+                                        self.expanded_info_agents.insert(name);
+                                    }
+                                }
+                                InfoClickTarget::Model(name) => {
+                                    let name = name.clone();
+                                    if !self.expanded_info_models.remove(&name) {
+                                        self.expanded_info_models.insert(name);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     return true;
                 }
                 if Self::contains_point(self.cached_rects.chat, x, y) {
@@ -350,6 +391,7 @@ impl SessionModal {
         session_titles: &FxHashMap<Box<str>, String>,
         border_style: Style,
     ) {
+        self.info_click_targets.clear();
         let mut lines = Vec::with_capacity(50);
         let device = crate::device::get_device_info();
         let device_display = device.display_name();
@@ -458,6 +500,12 @@ impl SessionModal {
                 } else {
                     Color::Rgb(255, 165, 0)
                 };
+                let is_expanded = self.expanded_info_agents.contains(&agent.name);
+                let toggle_label = if is_expanded {
+                    " (▼ collapse)"
+                } else {
+                    " (▶ expand)"
+                };
                 let mut model_list: Vec<&str> = agent.models.iter().map(|m| m.as_ref()).collect();
                 model_list.sort_unstable();
                 let model_suffix = if !model_list.is_empty() {
@@ -465,13 +513,18 @@ impl SessionModal {
                 } else {
                     String::new()
                 };
-                let prefix_len = 6;
-                let max_content =
-                    (area.width.saturating_sub(2) as usize).saturating_sub(prefix_len);
+                let prefix_len = 6; // "    ● "
+                let toggle_len = toggle_label.chars().count();
+                let max_content = (area.width.saturating_sub(2) as usize)
+                    .saturating_sub(prefix_len + toggle_len);
                 let agent_name = &agent.name;
                 let full_text = format!("{}{}", agent_name, model_suffix);
                 let display = safe_truncate_plain(&full_text, max_content);
                 let name_len = agent_name.chars().count();
+                self.info_click_targets.push((
+                    lines.len() as u16,
+                    InfoClickTarget::Agent(agent.name.clone()),
+                ));
                 if display.chars().count() <= name_len {
                     lines.push(Line::from(vec![
                         Span::raw("    "),
@@ -480,6 +533,7 @@ impl SessionModal {
                             display.into_owned(),
                             Style::default().fg(name_color).add_modifier(Modifier::BOLD),
                         ),
+                        Span::styled(toggle_label, Style::default().fg(Color::DarkGray)),
                     ]));
                 } else {
                     let name_part: String = display.chars().take(name_len).collect();
@@ -492,47 +546,62 @@ impl SessionModal {
                             Style::default().fg(name_color).add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(suffix_part, Style::default().fg(Color::Magenta)),
+                        Span::styled(toggle_label, Style::default().fg(Color::DarkGray)),
                     ]));
                 }
-                let agent_active_dur = format_active_duration(agent.active_duration_ms);
-                lines.push(Line::from(vec![
-                    Span::styled("      Duration   ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{:>10}", agent_active_dur),
-                        Style::default().fg(Color::Rgb(100, 200, 255)),
-                    ),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled("      Messages   ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
-                        format!("{:>10}", agent.messages),
-                        Style::default().fg(Color::White),
-                    ),
-                ]));
-                let token_rows = [
-                    ("Input", format_number(agent.tokens.input), Color::Blue),
-                    ("Output", format_number(agent.tokens.output), Color::Green),
-                    (
-                        "Thinking",
-                        format_number(agent.tokens.reasoning),
-                        Color::Rgb(255, 165, 0),
-                    ),
-                    (
-                        "Cache R",
-                        format_number(agent.tokens.cache_read),
-                        Color::Yellow,
-                    ),
-                    (
-                        "Cache W",
-                        format_number(agent.tokens.cache_write),
-                        Color::Yellow,
-                    ),
-                ];
-                for (label, value, color) in &token_rows {
+                if is_expanded {
+                    let agent_active_dur = format_active_duration(agent.active_duration_ms);
                     lines.push(Line::from(vec![
-                        Span::styled(format!("      {:<11}", label), Style::default().fg(*color)),
-                        Span::styled(format!("{:>10}", value), Style::default().fg(Color::White)),
+                        Span::styled(
+                            format!("      {:<9}", "Duration"),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            format!("{:>8}", agent_active_dur),
+                            Style::default().fg(Color::Rgb(100, 200, 255)),
+                        ),
                     ]));
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("      {:<9}", "Messages"),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            format!("{:>8}", agent.messages),
+                            Style::default().fg(Color::White),
+                        ),
+                    ]));
+                    let token_rows = [
+                        ("Input", format_number(agent.tokens.input), Color::Blue),
+                        ("Output", format_number(agent.tokens.output), Color::Green),
+                        (
+                            "Thinking",
+                            format_number(agent.tokens.reasoning),
+                            Color::Rgb(255, 165, 0),
+                        ),
+                        (
+                            "Cache R",
+                            format_number(agent.tokens.cache_read),
+                            Color::Yellow,
+                        ),
+                        (
+                            "Cache W",
+                            format_number(agent.tokens.cache_write),
+                            Color::Yellow,
+                        ),
+                    ];
+                    for (label, value, color) in &token_rows {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("      {:<9}", label),
+                                Style::default().fg(*color),
+                            ),
+                            Span::styled(
+                                format!("{:>8}", value),
+                                Style::default().fg(Color::White),
+                            ),
+                        ]));
+                    }
                 }
                 lines.push(Line::from(""));
             }
@@ -544,110 +613,124 @@ impl SessionModal {
         lines.push(Line::from(""));
         let details = self.session_details.as_ref();
         if let Some(d) = details {
-            for (idx, model) in d.model_stats.iter().enumerate() {
-                let prefix = if d.model_stats.len() > 1 {
-                    format!("MODEL {}:", idx + 1)
-                } else {
-                    "MODEL:".to_string()
-                };
-                let header_prefix = format!("  {} ", prefix);
-                let model_max = (area.width.saturating_sub(2) as usize)
-                    .saturating_sub(header_prefix.chars().count());
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        header_prefix,
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        safe_truncate_plain(&model.name, model_max),
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                let left_labels = [
-                    ("Input", format_number(model.tokens.input), Color::Blue),
-                    ("Output", format_number(model.tokens.output), Color::Green),
-                    (
-                        "Thinking",
-                        format_number(model.tokens.reasoning),
-                        Color::Rgb(255, 165, 0),
-                    ),
-                    (
-                        "Cache R",
-                        format_number(model.tokens.cache_read),
-                        Color::Yellow,
-                    ),
-                    (
-                        "Cache W",
-                        format_number(model.tokens.cache_write),
-                        Color::Yellow,
-                    ),
-                ];
-                let responses = model.messages.saturating_sub(model.prompts);
-                let model_cost = model.cost;
-                // Use OpenRouter pricing for estimated cost (what you would pay at standard rates)
-                let model_est = estimate_cost(&model.name, &model.tokens).unwrap_or(model_cost);
-                let model_savings = model_est - model_cost; // Positive when you saved money
-                let right_labels = [
-                    ("Prompts", model.prompts.to_string(), Color::Cyan),
-                    ("Responses", responses.to_string(), Color::Green),
-                    ("Cost", format!("${:.2}", model_cost), Color::White),
-                    (
-                        "Est. Cost",
-                        format!("${:.2}", model_est),
-                        Color::Rgb(150, 150, 150),
-                    ),
-                    (
-                        "Savings",
-                        format!("${:.2}", model_savings),
-                        if model_savings > 0.0 {
-                            Color::Green
-                        } else {
-                            Color::DarkGray
-                        },
-                    ),
-                ];
-                let inner_width = area.width.saturating_sub(2) as usize;
-                let show_right_column = inner_width >= 55;
-                for i in 0..5 {
-                    let mut spans = Vec::with_capacity(7);
-                    spans.push(Span::raw("      "));
-                    if i < left_labels.len() {
-                        let (label, value, color) = &left_labels[i];
-                        spans.push(Span::styled(
-                            format!("{:<11}", label),
-                            Style::default().fg(*color),
-                        ));
-                        spans.push(Span::styled(
-                            format!("{:>10}", value),
-                            Style::default().fg(Color::White),
-                        ));
-                    } else if show_right_column {
-                        spans.push(Span::raw(" ".repeat(21)));
-                    }
-                    if show_right_column {
-                        spans.push(Span::styled(
-                            "   │   ",
-                            Style::default().fg(Color::Rgb(40, 40, 50)),
-                        ));
-                        if i < right_labels.len() {
-                            let (label, value, color) = &right_labels[i];
-                            spans.push(Span::styled(
-                                format!("{:<11}", label),
-                                Style::default().fg(*color),
-                            ));
-                            spans.push(Span::styled(
-                                format!("{:>10}", value),
-                                Style::default().fg(Color::White),
-                            ));
+            if !d.model_stats.is_empty() {
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  MODELS ({})", d.model_stats.len()),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )]));
+                lines.push(Line::from(""));
+                for model in &d.model_stats {
+                    let is_expanded = self.expanded_info_models.contains(&model.name);
+                    let toggle_label = if is_expanded {
+                        " (▼ collapse)"
+                    } else {
+                        " (▶ expand)"
+                    };
+                    let prefix_len = 6; // "    ● "
+                    let toggle_len = toggle_label.chars().count();
+                    let model_max = (area.width.saturating_sub(2) as usize)
+                        .saturating_sub(prefix_len + toggle_len);
+                    self.info_click_targets.push((
+                        lines.len() as u16,
+                        InfoClickTarget::Model(model.name.clone()),
+                    ));
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled("● ", Style::default().fg(Color::Magenta)),
+                        Span::styled(
+                            safe_truncate_plain(&model.name, model_max),
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(toggle_label, Style::default().fg(Color::DarkGray)),
+                    ]));
+                    if is_expanded {
+                        let left_labels = [
+                            ("Input", format_number(model.tokens.input), Color::Blue),
+                            ("Output", format_number(model.tokens.output), Color::Green),
+                            (
+                                "Thinking",
+                                format_number(model.tokens.reasoning),
+                                Color::Rgb(255, 165, 0),
+                            ),
+                            (
+                                "Cache R",
+                                format_number(model.tokens.cache_read),
+                                Color::Yellow,
+                            ),
+                            (
+                                "Cache W",
+                                format_number(model.tokens.cache_write),
+                                Color::Yellow,
+                            ),
+                        ];
+                        let responses = model.messages.saturating_sub(model.prompts);
+                        let model_cost = model.cost;
+                        let model_est =
+                            estimate_cost(&model.name, &model.tokens).unwrap_or(model_cost);
+                        let model_savings = model_est - model_cost;
+                        let right_labels = [
+                            ("Prompts", model.prompts.to_string(), Color::Cyan),
+                            ("Responses", responses.to_string(), Color::Green),
+                            ("Cost", format!("${:.2}", model_cost), Color::White),
+                            (
+                                "Est. Cost",
+                                format!("${:.2}", model_est),
+                                Color::Rgb(150, 150, 150),
+                            ),
+                            (
+                                "Savings",
+                                format!("${:.2}", model_savings),
+                                if model_savings > 0.0 {
+                                    Color::Green
+                                } else {
+                                    Color::DarkGray
+                                },
+                            ),
+                        ];
+                        let inner_width = area.width.saturating_sub(2) as usize;
+                        let show_right_column = inner_width >= 48;
+                        for i in 0..5 {
+                            let mut spans = Vec::with_capacity(7);
+                            spans.push(Span::raw("      "));
+                            if i < left_labels.len() {
+                                let (label, value, color) = &left_labels[i];
+                                spans.push(Span::styled(
+                                    format!("{:<9}", label),
+                                    Style::default().fg(*color),
+                                ));
+                                spans.push(Span::styled(
+                                    format!("{:>8}", value),
+                                    Style::default().fg(Color::White),
+                                ));
+                            } else if show_right_column {
+                                spans.push(Span::raw(" ".repeat(17)));
+                            }
+                            if show_right_column {
+                                spans.push(Span::styled(
+                                    "   │   ",
+                                    Style::default().fg(Color::Rgb(40, 40, 50)),
+                                ));
+                                if i < right_labels.len() {
+                                    let (label, value, color) = &right_labels[i];
+                                    spans.push(Span::styled(
+                                        format!("{:<9}", label),
+                                        Style::default().fg(*color),
+                                    ));
+                                    spans.push(Span::styled(
+                                        format!("{:>8}", value),
+                                        Style::default().fg(Color::White),
+                                    ));
+                                }
+                            }
+                            lines.push(Line::from(spans));
                         }
                     }
-                    lines.push(Line::from(spans));
+                    lines.push(Line::from(""));
                 }
-                lines.push(Line::from(""));
             }
         }
         lines.push(Line::from(vec![Span::styled(
@@ -661,42 +744,32 @@ impl SessionModal {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )]));
-        lines.push(Line::from(vec![
-            Span::styled("      Tokens     ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{:>10}", format_number(session.tokens.total())),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+        let total_labels: Vec<(&str, String, Color)> = vec![
+            (
+                "Tokens",
+                format_number(session.tokens.total()),
+                Color::White,
             ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("      Prompts    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{:>10}", session.prompts),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+            ("Prompts", session.prompts.to_string(), Color::Cyan),
+            (
+                "Responses",
+                session.messages.saturating_sub(session.prompts).to_string(),
+                Color::Green,
             ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("      Responses  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{:>10}", session.messages.saturating_sub(session.prompts)),
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("      Cost       ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{:>10}", format!("${:.2}", session.cost)),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
+            ("Cost", format!("${:.2}", session.cost), Color::White),
+        ];
+        for (label, value, color) in &total_labels {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("      {:<9}", label),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("{:>8}", value),
+                    Style::default().fg(*color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
         let total_cost = session.cost;
         // Use OpenRouter pricing for estimated cost (what you would pay at standard rates)
         let est_cost = session
@@ -719,9 +792,12 @@ impl SessionModal {
             )
         };
         lines.push(Line::from(vec![
-            Span::styled("      Savings    ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("{:>10}", savings_text),
+                format!("      {:<9}", "Savings"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("{:>8}", savings_text),
                 Style::default()
                     .fg(savings_color)
                     .add_modifier(Modifier::BOLD),
@@ -741,9 +817,17 @@ impl SessionModal {
                     .add_modifier(Modifier::BOLD),
             )]));
             let max_val_len = 6usize;
+            // fixed overhead: 4(indent) + 10([status]) + 1(space) + 2(gap) + 7+7(+N │ -N) + 3(│sp) + 5
             let needed_width = 4 + 10 + 1 + 2 + (max_val_len + 1) * 2 + 3 + 5;
-            let path_display_width =
-                (area.width.saturating_sub(2) as usize).saturating_sub(needed_width);
+            let max_avail = (area.width.saturating_sub(2) as usize).saturating_sub(needed_width);
+            // Adapt to longest filename (git diff --stat style), capped by panel width and 35
+            let longest_path = session
+                .file_diffs
+                .iter()
+                .map(|f| f.path.chars().count())
+                .max()
+                .unwrap_or(0);
+            let path_display_width = longest_path.max(8).min(35).min(max_avail);
             let show_diffs = (area.width.saturating_sub(2) as usize) >= needed_width;
             for f in &session.file_diffs {
                 let status_text = match f.status.as_ref() {
