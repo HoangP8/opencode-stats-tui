@@ -5,7 +5,7 @@ use crate::stats::{
     ChatMessage, DayStat, MessageContent, ModelUsage, ToolUsage, Totals,
 };
 use crate::stats_cache::StatsCache;
-use chrono::Datelike;
+use chrono::{Datelike, NaiveDate};
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -55,9 +55,10 @@ enum LeftPanel {
 
 #[derive(PartialEq, Clone, Copy)]
 enum RightPanel {
-    Detail,
-    List,
-    Tools,
+    Detail,   // OVERVIEW panel (top right in Stats view)
+    Activity, // ACTIVITY heatmap panel
+    List,     // SESSIONS/PROJECTS
+    Tools,    // TOOLS USED
 }
 
 /// Cached panel rectangles for efficient mouse hit-testing
@@ -69,9 +70,10 @@ struct PanelRects {
     days: Option<Rect>,
     models: Option<Rect>,
     // Right panels (context-dependent based on left_panel)
-    detail: Option<Rect>, // SESSION INFO or MODEL INFO
-    list: Option<Rect>,   // SESSIONS or MODEL RANKING
-    tools: Option<Rect>,  // TOOLS USED (only in Models view)
+    detail: Option<Rect>,   // SESSION INFO or MODEL INFO
+    activity: Option<Rect>, // ACTIVITY heatmap (Stats view)
+    list: Option<Rect>,     // SESSIONS or MODEL RANKING
+    tools: Option<Rect>,    // TOOLS USED (only in Models view)
 }
 
 impl PanelRects {
@@ -87,6 +89,9 @@ impl PanelRects {
         }
         if Self::contains_point(self.models, x, y) {
             return Some("models");
+        }
+        if Self::contains_point(self.activity, x, y) {
+            return Some("activity");
         }
         if Self::contains_point(self.detail, x, y) {
             return Some("detail");
@@ -104,6 +109,16 @@ impl PanelRects {
     fn contains_point(rect: Option<Rect>, x: u16, y: u16) -> bool {
         rect.is_some_and(|r| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
     }
+}
+
+#[derive(Clone, Copy)]
+struct HeatmapLayout {
+    inner: Rect,
+    label_w: u16,
+    weeks: usize,
+    grid_start: NaiveDate,
+    week_w: u16,
+    extra_cols: u16,
 }
 
 pub struct App {
@@ -129,8 +144,7 @@ pub struct App {
     model_usage: Vec<ModelUsage>,
     model_list_state: ListState,
     tool_usage: Vec<ToolUsage>,
-    tool_scroll: u16,
-    tool_max_scroll: u16,
+
     detail_scroll: u16,
     detail_max_scroll: u16,
     model_tool_scroll: u16,
@@ -166,6 +180,20 @@ pub struct App {
     // Phase 1 optimizations
     cached_git_branch: Option<(Box<str>, Option<String>)>, // (path_root, branch) - avoid fs I/O per frame
     cached_max_cost_width: usize,
+
+    // Overview panel data (General Usage right panel)
+    overview_projects: Vec<(String, usize)>, // (project_name, session_count) sorted desc
+    overview_project_scroll: usize,
+    overview_project_max_scroll: usize,
+    overview_tool_scroll: usize,
+    overview_tool_max_scroll: usize,
+    overview_heatmap_layout: Option<HeatmapLayout>,
+    overview_heatmap_inspect: bool,
+    overview_heatmap_selected_day: Option<String>,
+    overview_heatmap_selected_tokens: u64,
+    overview_heatmap_selected_sessions: usize,
+    overview_heatmap_selected_cost: f64,
+    overview_heatmap_selected_active_ms: i64,
 
     // Live stats: Cache and file watching
     stats_cache: Option<StatsCache>,
@@ -434,8 +462,6 @@ impl App {
             model_usage,
             model_list_state,
             tool_usage,
-            tool_scroll: 0,
-            tool_max_scroll: 0,
             detail_scroll: 0,
             detail_max_scroll: 0,
             model_tool_scroll: 0,
@@ -454,13 +480,26 @@ impl App {
             chat_max_scroll: 0,
 
             focus: Focus::Left,
-            left_panel: LeftPanel::Days,
-            right_panel: RightPanel::List,
+            left_panel: LeftPanel::Stats,
+            right_panel: RightPanel::Detail,
             is_active: false,
             models_active: false,
             exit: false,
             selected_model_index,
             current_chat_session_id: None,
+
+            overview_projects: Vec::new(),
+            overview_project_scroll: 0,
+            overview_project_max_scroll: 0,
+            overview_tool_scroll: 0,
+            overview_tool_max_scroll: 0,
+            overview_heatmap_layout: None,
+            overview_heatmap_inspect: false,
+            overview_heatmap_selected_day: None,
+            overview_heatmap_selected_tokens: 0,
+            overview_heatmap_selected_sessions: 0,
+            overview_heatmap_selected_cost: 0.0,
+            overview_heatmap_selected_active_ms: 0,
 
             modal: SessionModal::new(),
 
@@ -487,6 +526,7 @@ impl App {
         app.update_session_list();
         app.precompute_day_strings();
         app.recompute_max_cost_width();
+        app.compute_overview_data();
 
         // Ensure all displays are current
         app.should_redraw = true;
@@ -506,6 +546,28 @@ impl App {
             max_len = max_len.max(s.len());
         }
         self.cached_max_cost_width = max_len;
+    }
+
+    fn compute_overview_data(&mut self) {
+        // Aggregate projects from all sessions across all days
+        let mut project_counts: FxHashMap<String, usize> = FxHashMap::default();
+        for day_stat in self.per_day.values() {
+            for session in day_stat.sessions.values() {
+                let path = session.path_root.as_ref();
+                let name = if path.is_empty() {
+                    "home".to_string()
+                } else {
+                    path.rsplit('/')
+                        .find(|s| !s.is_empty())
+                        .unwrap_or("home")
+                        .to_string()
+                };
+                *project_counts.entry(name).or_insert(0) += 1;
+            }
+        }
+        let mut projects: Vec<(String, usize)> = project_counts.into_iter().collect();
+        projects.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        self.overview_projects = projects;
     }
 
     #[inline]
@@ -1012,6 +1074,7 @@ impl App {
         // Always recalculate cached values that depend on current data
         self.precompute_day_strings();
         self.recompute_max_cost_width();
+        self.compute_overview_data();
 
         self.cached_session_items.clear();
         self.cached_session_width = 0;
@@ -1203,180 +1266,231 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => {
-                if self.is_active || self.models_active {
+                if self.is_active || self.models_active || self.overview_heatmap_inspect {
                     self.is_active = false;
                     self.models_active = false;
+                    self.overview_heatmap_inspect = false;
                 } else {
                     self.exit = true;
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                if self.focus == Focus::Right && self.left_panel == LeftPanel::Models {
-                    match self.right_panel {
-                        RightPanel::List => self.right_panel = RightPanel::Tools,
+                if self.focus == Focus::Right {
+                    match self.left_panel {
+                        LeftPanel::Stats => {
+                            if self.right_panel == RightPanel::Tools {
+                                self.right_panel = RightPanel::List;
+                            } else {
+                                self.focus = Focus::Left;
+                            }
+                        }
+                        LeftPanel::Models => {
+                            if self.right_panel == RightPanel::List {
+                                self.right_panel = RightPanel::Tools;
+                            } else {
+                                self.focus = Focus::Left;
+                            }
+                        }
                         _ => self.focus = Focus::Left,
                     }
-                } else if self.focus == Focus::Right
-                    && self.left_panel == LeftPanel::Days
-                    && self.is_active
-                {
-                    self.focus = Focus::Left;
-                    self.right_panel = RightPanel::List;
-                } else {
-                    self.focus = Focus::Left;
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                if self.focus == Focus::Right && self.left_panel == LeftPanel::Models {
-                    if self.right_panel == RightPanel::Tools {
-                        self.right_panel = RightPanel::List;
+                if self.focus == Focus::Left {
+                    self.focus = Focus::Right;
+                    match self.left_panel {
+                        LeftPanel::Stats => self.right_panel = RightPanel::Detail,
+                        LeftPanel::Days => self.right_panel = RightPanel::List,
+                        LeftPanel::Models => self.right_panel = RightPanel::Tools,
                     }
-                } else if self.focus == Focus::Left
-                    && self.left_panel == LeftPanel::Days
-                    && self.is_active
-                {
-                    self.focus = Focus::Right;
-                    self.right_panel = RightPanel::List;
                 } else {
-                    self.focus = Focus::Right;
+                    match self.left_panel {
+                        LeftPanel::Stats => {
+                            if self.right_panel == RightPanel::List {
+                                self.right_panel = RightPanel::Tools;
+                            }
+                        }
+                        LeftPanel::Models => {
+                            if self.right_panel == RightPanel::Tools {
+                                self.right_panel = RightPanel::List;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.is_active || self.models_active {
-                    // Active mode: Scroll within the focused panel
+                    // ACTIVE MODE: Scroll within the focused panel
                     match self.focus {
                         Focus::Left => match self.left_panel {
-                            LeftPanel::Stats => {} // Not interactive
+                            LeftPanel::Stats => {}
                             LeftPanel::Days => {
                                 self.day_previous();
-                                self.update_session_list(); // Auto-update preview
+                                self.update_session_list();
                             }
                             LeftPanel::Models => {
                                 self.model_previous();
                                 self.selected_model_index = self.model_list_state.selected();
-                                // Auto-update preview
                             }
                         },
                         Focus::Right => match self.left_panel {
-                            LeftPanel::Stats => {
-                                self.tool_scroll = self.tool_scroll.saturating_sub(1);
-                            }
+                            LeftPanel::Stats => match self.right_panel {
+                                RightPanel::List => {
+                                    self.overview_project_scroll =
+                                        self.overview_project_scroll.saturating_sub(1);
+                                }
+                                RightPanel::Tools => {
+                                    self.overview_tool_scroll =
+                                        self.overview_tool_scroll.saturating_sub(1);
+                                }
+                                _ => {}
+                            },
                             LeftPanel::Days => match self.right_panel {
+                                RightPanel::List => self.session_previous(),
                                 RightPanel::Detail => {
                                     self.detail_scroll = self.detail_scroll.saturating_sub(1);
-                                }
-                                RightPanel::List => {
-                                    if self.session_list_state.selected() == Some(0) {
-                                        self.right_panel = RightPanel::Detail;
-                                    } else {
-                                        self.session_previous();
-                                    }
                                 }
                                 _ => {}
                             },
                             LeftPanel::Models => match self.right_panel {
-                                RightPanel::Detail => {}
-                                RightPanel::Tools => {
-                                    self.model_tool_scroll =
-                                        self.model_tool_scroll.saturating_sub(1);
-                                }
                                 RightPanel::List => {
                                     self.model_previous();
                                     self.selected_model_index = self.model_list_state.selected();
                                 }
+                                RightPanel::Tools => {
+                                    self.model_tool_scroll =
+                                        self.model_tool_scroll.saturating_sub(1);
+                                }
+                                _ => {}
                             },
                         },
                     }
                 } else {
+                    // INACTIVE MODE: Navigate between panels
                     match self.focus {
-                        Focus::Left => match self.left_panel {
-                            LeftPanel::Stats => {}
-                            LeftPanel::Days => self.left_panel = LeftPanel::Stats,
-                            LeftPanel::Models => self.left_panel = LeftPanel::Days,
-                        },
-                        Focus::Right => match self.left_panel {
-                            LeftPanel::Models => match self.right_panel {
-                                RightPanel::Detail => {}
-                                RightPanel::Tools | RightPanel::List => {
-                                    self.right_panel = RightPanel::Detail
-                                }
-                            },
-                            LeftPanel::Stats | LeftPanel::Days => match self.right_panel {
-                                RightPanel::Detail => {}
-                                _ => self.right_panel = RightPanel::Detail,
-                            },
-                        },
+                        Focus::Left => {
+                            // Navigate between left panels: Stats <- Days <- Models
+                            match self.left_panel {
+                                LeftPanel::Stats => {}
+                                LeftPanel::Days => self.left_panel = LeftPanel::Stats,
+                                LeftPanel::Models => self.left_panel = LeftPanel::Days,
+                            }
+                        }
+                        Focus::Right => {
+                            // Navigate between right panels vertically
+                            match self.left_panel {
+                                LeftPanel::Stats => match self.right_panel {
+                                    RightPanel::List | RightPanel::Tools => {
+                                        self.right_panel = RightPanel::Activity;
+                                    }
+                                    RightPanel::Activity => {
+                                        self.right_panel = RightPanel::Detail;
+                                    }
+                                    _ => {}
+                                },
+                                LeftPanel::Days => match self.right_panel {
+                                    RightPanel::List => self.right_panel = RightPanel::Detail,
+                                    _ => {}
+                                },
+                                LeftPanel::Models => match self.right_panel {
+                                    RightPanel::List | RightPanel::Tools => {
+                                        self.right_panel = RightPanel::Detail;
+                                    }
+                                    _ => {}
+                                },
+                            }
+                        }
                     }
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.is_active || self.models_active {
-                    // Active mode: Scroll within the focused panel
+                    // ACTIVE MODE: Scroll within the focused panel
                     match self.focus {
                         Focus::Left => match self.left_panel {
                             LeftPanel::Stats => {}
                             LeftPanel::Days => {
                                 self.day_next();
-                                self.update_session_list(); // Auto-update preview
+                                self.update_session_list();
                             }
                             LeftPanel::Models => {
                                 self.model_next();
                                 self.selected_model_index = self.model_list_state.selected();
-                                // Auto-update preview
                             }
                         },
                         Focus::Right => match self.left_panel {
-                            LeftPanel::Stats => {
-                                if self.tool_scroll < self.tool_max_scroll {
-                                    self.tool_scroll += 1;
+                            LeftPanel::Stats => match self.right_panel {
+                                RightPanel::List => {
+                                    if self.overview_project_scroll
+                                        < self.overview_project_max_scroll
+                                    {
+                                        self.overview_project_scroll += 1;
+                                    }
                                 }
-                            }
+                                RightPanel::Tools => {
+                                    if self.overview_tool_scroll < self.overview_tool_max_scroll {
+                                        self.overview_tool_scroll += 1;
+                                    }
+                                }
+                                _ => {}
+                            },
                             LeftPanel::Days => match self.right_panel {
+                                RightPanel::List => self.session_next(),
                                 RightPanel::Detail => {
                                     if self.detail_scroll < self.detail_max_scroll {
                                         self.detail_scroll += 1;
-                                    } else {
-                                        self.right_panel = RightPanel::List;
                                     }
                                 }
-                                RightPanel::List => self.session_next(),
                                 _ => {}
                             },
                             LeftPanel::Models => match self.right_panel {
-                                RightPanel::Detail => self.right_panel = RightPanel::Tools,
-                                RightPanel::Tools => {
-                                    if self.model_tool_scroll < self.model_tool_max_scroll {
-                                        self.model_tool_scroll += 1;
-                                    } else {
-                                        self.right_panel = RightPanel::List;
-                                    }
-                                }
                                 RightPanel::List => {
                                     self.model_next();
                                     self.selected_model_index = self.model_list_state.selected();
                                 }
+                                RightPanel::Tools => {
+                                    if self.model_tool_scroll < self.model_tool_max_scroll {
+                                        self.model_tool_scroll += 1;
+                                    }
+                                }
+                                _ => {}
                             },
                         },
                     }
                 } else {
+                    // INACTIVE MODE: Navigate between panels
                     match self.focus {
-                        Focus::Left => match self.left_panel {
-                            LeftPanel::Stats => self.left_panel = LeftPanel::Days,
-                            LeftPanel::Days => self.left_panel = LeftPanel::Models,
-                            LeftPanel::Models => {}
-                        },
-                        Focus::Right => match self.left_panel {
-                            LeftPanel::Models => {
-                                if self.right_panel == RightPanel::Detail {
-                                    self.right_panel = RightPanel::Tools;
-                                }
+                        Focus::Left => {
+                            // Navigate between left panels: Stats -> Days -> Models
+                            match self.left_panel {
+                                LeftPanel::Stats => self.left_panel = LeftPanel::Days,
+                                LeftPanel::Days => self.left_panel = LeftPanel::Models,
+                                LeftPanel::Models => {}
                             }
-                            LeftPanel::Stats | LeftPanel::Days => match self.right_panel {
-                                RightPanel::Detail => self.right_panel = RightPanel::List,
-                                RightPanel::List => {}
-                                _ => {}
-                            },
-                        },
+                        }
+                        Focus::Right => {
+                            // Navigate between right panels vertically
+                            match self.left_panel {
+                                LeftPanel::Stats => match self.right_panel {
+                                    RightPanel::Detail => {
+                                        self.right_panel = RightPanel::Activity;
+                                    }
+                                    RightPanel::Activity => {
+                                        self.right_panel = RightPanel::List;
+                                    }
+                                    _ => {}
+                                },
+                                LeftPanel::Days => match self.right_panel {
+                                    RightPanel::Detail => self.right_panel = RightPanel::List,
+                                    _ => {}
+                                },
+                                LeftPanel::Models => match self.right_panel {
+                                    RightPanel::Detail => self.right_panel = RightPanel::Tools,
+                                    _ => {}
+                                },
+                            }
+                        }
                     }
                 }
             }
@@ -1535,14 +1649,35 @@ impl App {
                                 self.is_active = false;
                             }
                         },
-                        Focus::Right => {
-                            if self.left_panel == LeftPanel::Days
-                                && self.right_panel == RightPanel::List
-                            {
-                                self.is_active = true;
+                        Focus::Right => match self.left_panel {
+                            LeftPanel::Stats => {
+                                if self.right_panel == RightPanel::Activity {
+                                    self.overview_heatmap_inspect = !self.overview_heatmap_inspect;
+                                } else if self.right_panel == RightPanel::List
+                                    || self.right_panel == RightPanel::Tools
+                                {
+                                    self.is_active = true;
+                                }
                             }
-                        }
+                            LeftPanel::Days => {
+                                if self.right_panel == RightPanel::List {
+                                    self.is_active = true;
+                                }
+                            }
+                            LeftPanel::Models => {
+                                if self.right_panel == RightPanel::List
+                                    || self.right_panel == RightPanel::Tools
+                                {
+                                    self.models_active = true;
+                                }
+                            }
+                        },
                     }
+                } else if self.focus == Focus::Right
+                    && self.left_panel == LeftPanel::Stats
+                    && self.right_panel == RightPanel::Activity
+                {
+                    self.overview_heatmap_inspect = !self.overview_heatmap_inspect;
                 } else if self.focus == Focus::Right
                     && self.left_panel == LeftPanel::Days
                     && self.right_panel == RightPanel::List
@@ -1593,16 +1728,14 @@ impl App {
                         // GENERAL USAGE is not scrollable, do nothing
                         true
                     }
+                    Some("activity") => {
+                        // Activity heatmap does not use wheel scrolling currently
+                        true
+                    }
                     Some("detail") => {
                         // Only scroll if the detail panel is currently focused
                         if self.focus == Focus::Right && self.right_panel == RightPanel::Detail {
-                            if self.left_panel == LeftPanel::Stats {
-                                if mouse.kind == MouseEventKind::ScrollUp {
-                                    self.tool_scroll = self.tool_scroll.saturating_sub(1);
-                                } else if self.tool_scroll < self.tool_max_scroll {
-                                    self.tool_scroll += 1;
-                                }
-                            } else if self.left_panel == LeftPanel::Days {
+                            if self.left_panel == LeftPanel::Days {
                                 if mouse.kind == MouseEventKind::ScrollUp {
                                     self.detail_scroll = self.detail_scroll.saturating_sub(1);
                                 } else if self.detail_scroll < self.detail_max_scroll {
@@ -1615,16 +1748,42 @@ impl App {
                     Some("tools") => {
                         // Only scroll if Tools are currently highlighted
                         if self.focus == Focus::Right && self.right_panel == RightPanel::Tools {
-                            if mouse.kind == MouseEventKind::ScrollUp {
-                                self.model_tool_scroll = self.model_tool_scroll.saturating_sub(1);
-                            } else if self.model_tool_scroll < self.model_tool_max_scroll {
-                                self.model_tool_scroll += 1;
+                            if self.left_panel == LeftPanel::Stats {
+                                if mouse.kind == MouseEventKind::ScrollUp {
+                                    self.overview_tool_scroll =
+                                        self.overview_tool_scroll.saturating_sub(1);
+                                } else if self.overview_tool_scroll < self.overview_tool_max_scroll
+                                {
+                                    self.overview_tool_scroll += 1;
+                                }
+                            } else {
+                                if mouse.kind == MouseEventKind::ScrollUp {
+                                    self.model_tool_scroll =
+                                        self.model_tool_scroll.saturating_sub(1);
+                                } else if self.model_tool_scroll < self.model_tool_max_scroll {
+                                    self.model_tool_scroll += 1;
+                                }
                             }
                         }
                         true
                     }
                     Some("list") => {
-                        if self.left_panel == LeftPanel::Models {
+                        if self.left_panel == LeftPanel::Stats {
+                            // TOP PROJECTS: Scroll only if active
+                            if self.focus == Focus::Right
+                                && self.right_panel == RightPanel::List
+                                && self.is_active
+                            {
+                                if mouse.kind == MouseEventKind::ScrollUp {
+                                    self.overview_project_scroll =
+                                        self.overview_project_scroll.saturating_sub(1);
+                                } else if self.overview_project_scroll
+                                    < self.overview_project_max_scroll
+                                {
+                                    self.overview_project_scroll += 1;
+                                }
+                            }
+                        } else if self.left_panel == LeftPanel::Models {
                             // MODEL RANKING: Scroll only if Models are active
                             if self.left_panel == LeftPanel::Models && self.models_active {
                                 if mouse.kind == MouseEventKind::ScrollUp {
@@ -1657,9 +1816,10 @@ impl App {
                 self.handle_mouse_single_click_optimized(pos, area.height)
             }
             MouseEventKind::Down(MouseButton::Right) => {
-                if self.is_active || self.models_active {
+                if self.is_active || self.models_active || self.overview_heatmap_inspect {
                     self.is_active = false;
                     self.models_active = false;
+                    self.overview_heatmap_inspect = false;
                 } else {
                     self.exit = true;
                 }
@@ -1728,6 +1888,14 @@ impl App {
                     self.focus = Focus::Right;
                     self.right_panel = RightPanel::Detail;
                 }
+                "activity" => {
+                    self.focus = Focus::Right;
+                    self.left_panel = LeftPanel::Stats;
+                    self.right_panel = RightPanel::Activity;
+                    if self.overview_heatmap_inspect {
+                        self.select_heatmap_day_from_mouse(x, y);
+                    }
+                }
                 "tools" => {
                     self.focus = Focus::Right;
                     self.right_panel = RightPanel::Tools;
@@ -1777,6 +1945,75 @@ impl App {
         } else {
             false
         }
+    }
+
+    fn select_heatmap_day_from_mouse(&mut self, x: u16, y: u16) {
+        let Some(layout) = self.overview_heatmap_layout else {
+            return;
+        };
+
+        // Row 0 is month labels; day rows are 1..=7
+        if y <= layout.inner.y {
+            return;
+        }
+        let day_row = (y - layout.inner.y - 1) as usize;
+        if day_row >= 7 {
+            return;
+        }
+
+        let start_x = layout.inner.x.saturating_add(layout.label_w);
+        if x < start_x {
+            return;
+        }
+        let mut rel_x = x - start_x;
+        let mut col = 0usize;
+        while col < layout.weeks {
+            let w = layout.week_w
+                + if (col as u16) < layout.extra_cols {
+                    1
+                } else {
+                    0
+                };
+            if rel_x <= w {
+                break;
+            }
+            rel_x = rel_x.saturating_sub(w);
+            col += 1;
+        }
+        if col >= layout.weeks {
+            return;
+        }
+
+        let date = layout.grid_start + chrono::Duration::days((col * 7 + day_row) as i64);
+
+        // Use max date from actual data instead of system date
+        let today = self
+            .per_day
+            .keys()
+            .filter_map(|day_str| chrono::NaiveDate::parse_from_str(day_str, "%Y-%m-%d").ok())
+            .max()
+            .unwrap_or_else(|| chrono::Local::now().date_naive());
+
+        let start_365 = today - chrono::Duration::days(364);
+        if date < start_365 || date > today {
+            return;
+        }
+
+        let key = date.format("%Y-%m-%d").to_string();
+        let (sessions, tokens, cost, active_ms) = self
+            .per_day
+            .get(&key)
+            .map(|ds| {
+                let active: i64 = ds.sessions.values().map(|s| s.active_duration_ms).sum();
+                (ds.sessions.len(), ds.tokens.total(), ds.cost, active)
+            })
+            .unwrap_or((0, 0, 0.0, 0));
+
+        self.overview_heatmap_selected_day = Some(key);
+        self.overview_heatmap_selected_sessions = sessions;
+        self.overview_heatmap_selected_tokens = tokens;
+        self.overview_heatmap_selected_cost = cost;
+        self.overview_heatmap_selected_active_ms = active_ms;
     }
 
     fn render(&mut self, frame: &mut Frame) {
@@ -1858,15 +2095,23 @@ impl App {
                 Span::styled(" back", t),
             ]);
         } else {
+            // Don't show "Enter" for GENERAL USAGE panel (Stats) as it doesn't activate
+            let show_enter = !(self.focus == Focus::Left && self.left_panel == LeftPanel::Stats);
             spans.extend_from_slice(&[
                 Span::styled("↑↓", k),
                 Span::styled(" navigate", t),
                 sep.clone(),
                 Span::styled("←→/Click", k),
                 Span::styled(" focus", t),
-                sep.clone(),
-                Span::styled("Enter/Scroll", k),
-                Span::styled(" activate", t),
+            ]);
+            if show_enter {
+                spans.extend_from_slice(&[
+                    sep.clone(),
+                    Span::styled("Enter", k),
+                    Span::styled(" activate", t),
+                ]);
+            }
+            spans.extend_from_slice(&[
                 sep.clone(),
                 Span::styled("Esc/q/Right-click", k),
                 Span::styled(" quit", t),
@@ -1911,21 +2156,21 @@ impl App {
             chunks[0],
             border_style,
             self.focus == Focus::Left && self.left_panel == LeftPanel::Stats,
-            self.is_active,
+            false,
         );
         self.render_day_list(
             frame,
             chunks[1],
             border_style,
             self.focus == Focus::Left && self.left_panel == LeftPanel::Days,
-            self.is_active, // Linked with Sessions
+            self.is_active && self.left_panel == LeftPanel::Days,
         );
         self.render_model_list(
             frame,
             chunks[2],
             border_style,
             self.focus == Focus::Left && self.left_panel == LeftPanel::Models,
-            self.models_active, // Independent - only when Enter on Models
+            self.models_active && self.left_panel == LeftPanel::Models,
         );
     }
 
@@ -2338,11 +2583,56 @@ impl App {
 
         match self.left_panel {
             LeftPanel::Stats => {
-                // Tool usage takes entire right panel
-                self.cached_rects.detail = Some(area);
-                self.cached_rects.list = None;
-                self.cached_rects.tools = None;
-                self.render_tool_usage_panel(frame, area, border_style, is_focused, self.is_active)
+                // Simplified layout for Stats view
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(8),  // Overview (4 lines content + borders)
+                        Constraint::Length(10), // Activity (8 lines content + borders)
+                        Constraint::Min(0),     // Projects | Tools takes all remaining space
+                    ])
+                    .split(area);
+
+                let bottom_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(chunks[2]);
+
+                // Cache rects for mouse hit-testing
+                self.cached_rects.detail = Some(chunks[0]);
+                self.cached_rects.activity = Some(chunks[1]);
+                self.cached_rects.list = Some(bottom_chunks[0]);
+                self.cached_rects.tools = Some(bottom_chunks[1]);
+
+                let overview_hl = is_focused && self.right_panel == RightPanel::Detail;
+                self.render_overview_panel(frame, chunks[0], border_style, overview_hl);
+
+                let activity_hl = is_focused && self.right_panel == RightPanel::Activity;
+                self.render_activity_heatmap(frame, chunks[1], border_style, activity_hl);
+
+                let projects_hl = is_focused && self.right_panel == RightPanel::List;
+                self.render_projects_panel(
+                    frame,
+                    bottom_chunks[0],
+                    if projects_hl {
+                        border_style
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                    projects_hl,
+                );
+
+                let tools_hl = is_focused && self.right_panel == RightPanel::Tools;
+                self.render_overview_tools_panel(
+                    frame,
+                    bottom_chunks[1],
+                    if tools_hl {
+                        border_style
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                    tools_hl,
+                );
             }
             LeftPanel::Days => {
                 let chunks = Layout::default()
@@ -2352,6 +2642,7 @@ impl App {
 
                 // Cache right panel rects for Days view
                 self.cached_rects.detail = Some(chunks[0]);
+                self.cached_rects.activity = None;
                 self.cached_rects.list = Some(chunks[1]);
                 self.cached_rects.tools = None;
 
@@ -2381,19 +2672,19 @@ impl App {
                 );
             }
             LeftPanel::Models => {
+                self.cached_rects.activity = None;
                 // Cache right panel rects for Models view (done in render_model_detail)
                 self.render_model_detail(frame, area, border_style, is_focused, self.models_active)
             }
         }
     }
 
-    fn render_tool_usage_panel(
-        &mut self,
+    fn render_overview_panel(
+        &self,
         frame: &mut Frame,
         area: Rect,
         border_style: Style,
         is_highlighted: bool,
-        _is_active: bool,
     ) {
         let title_color = if is_highlighted {
             Color::Cyan
@@ -2407,6 +2698,668 @@ impl App {
             } else {
                 Style::default().fg(Color::DarkGray)
             })
+            .title(
+                Line::from(Span::styled(
+                    " OVERVIEW ",
+                    Style::default()
+                        .fg(title_color)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Center),
+            );
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        // Compute stats
+        let total_sessions = self.totals.sessions.len();
+        let total_days = self.day_list.len();
+        let start_day = self.day_list.last().cloned().unwrap_or_else(|| "—".into());
+        let active_days = total_days;
+
+        let days_since_start = if let Some(first) = self.day_list.last() {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(first, "%Y-%m-%d") {
+                let today = chrono::Local::now().date_naive();
+                (today - d).num_days().max(1) as usize
+            } else {
+                total_days.max(1)
+            }
+        } else {
+            1
+        };
+
+        let avg_sess_per_day = if active_days > 0 {
+            total_sessions as f64 / active_days as f64
+        } else {
+            0.0
+        };
+
+        let avg_cost_per_sess = if total_sessions > 0 {
+            self.totals.display_cost() / total_sessions as f64
+        } else {
+            0.0
+        };
+
+        let (peak_day, peak_count) = self
+            .per_day
+            .iter()
+            .map(|(d, s)| (d.clone(), s.sessions.len()))
+            .max_by_key(|(_, c)| *c)
+            .unwrap_or_else(|| ("—".into(), 0));
+        let peak_display = self
+            .cached_day_strings
+            .get(&peak_day)
+            .cloned()
+            .unwrap_or(peak_day);
+
+        let longest_ms: i64 = self
+            .per_day
+            .values()
+            .flat_map(|d| d.sessions.values())
+            .map(|s| s.active_duration_ms)
+            .max()
+            .unwrap_or(0);
+
+        let total_active_ms: i64 = self
+            .per_day
+            .values()
+            .flat_map(|d| d.sessions.values())
+            .map(|s| s.active_duration_ms)
+            .sum();
+
+        let fav_lang = {
+            let mut ext_counts: FxHashMap<&str, u64> = FxHashMap::default();
+            for day_stat in self.per_day.values() {
+                for session in day_stat.sessions.values() {
+                    for fd in &session.file_diffs {
+                        let ext = fd.path.rsplit('.').next().unwrap_or("");
+                        let lang = match ext {
+                            "rs" => "Rust",
+                            "py" => "Python",
+                            "js" => "JavaScript",
+                            "ts" | "tsx" => "TypeScript",
+                            "go" => "Go",
+                            "java" => "Java",
+                            "c" | "h" => "C",
+                            "cpp" | "cc" | "cxx" | "hpp" => "C++",
+                            "rb" => "Ruby",
+                            "swift" => "Swift",
+                            "kt" => "Kotlin",
+                            "lua" => "Lua",
+                            "sh" | "bash" | "zsh" => "Shell",
+                            "css" | "scss" | "sass" => "CSS",
+                            "html" | "htm" => "HTML",
+                            "json" => "JSON",
+                            "yaml" | "yml" => "YAML",
+                            "toml" => "TOML",
+                            "md" | "mdx" => "Markdown",
+                            "sql" => "SQL",
+                            "svelte" => "Svelte",
+                            "vue" => "Vue",
+                            "dart" => "Dart",
+                            "zig" => "Zig",
+                            "ex" | "exs" => "Elixir",
+                            _ => "",
+                        };
+                        if !lang.is_empty() {
+                            *ext_counts.entry(lang).or_insert(0) +=
+                                (fd.additions + fd.deletions).max(1);
+                        }
+                    }
+                }
+            }
+            ext_counts
+                .into_iter()
+                .max_by_key(|(_, c)| *c)
+                .map(|(l, _)| l.to_string())
+                .unwrap_or_else(|| "—".into())
+        };
+
+        let start_display = if let Ok(d) = chrono::NaiveDate::parse_from_str(&start_day, "%Y-%m-%d")
+        {
+            let month = match d.month() {
+                1 => "Jan",
+                2 => "Feb",
+                3 => "Mar",
+                4 => "Apr",
+                5 => "May",
+                6 => "Jun",
+                7 => "Jul",
+                8 => "Aug",
+                9 => "Sep",
+                10 => "Oct",
+                11 => "Nov",
+                _ => "Dec",
+            };
+            format!("{} {:02}, {}", month, d.day(), d.year())
+        } else {
+            start_day
+        };
+
+        let label_style = Style::default().fg(Color::Rgb(140, 140, 160));
+        let val_col = 18usize;
+
+        if inner.width < 50 {
+            // 1-column layout for narrow screens
+            let all_lines = vec![
+                Line::from(vec![
+                    Span::styled("Peak: ", label_style),
+                    Span::styled(peak_display, Style::default().fg(Color::Yellow)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Long: ", label_style),
+                    Span::styled(
+                        format_active_duration(longest_ms),
+                        Style::default().fg(Color::Rgb(100, 200, 255)),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Avg:  ", label_style),
+                    Span::styled(
+                        format!("{:.1}", avg_sess_per_day),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Fav:  ", label_style),
+                    Span::styled(fav_lang, Style::default().fg(Color::Magenta)),
+                ]),
+            ];
+            frame.render_widget(Paragraph::new(all_lines), inner);
+        } else {
+            // 2-column layout (standard)
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(inner);
+
+            let left_lines = vec![
+                Line::from(vec![
+                    Span::styled(format!("  {:<w$}", "Peak Day", w = val_col), label_style),
+                    Span::styled(
+                        format!("{} ({}s)", peak_display, peak_count),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        format!("  {:<w$}", "Longest Session", w = val_col),
+                        label_style,
+                    ),
+                    Span::styled(
+                        format_active_duration(longest_ms),
+                        Style::default().fg(Color::Rgb(100, 200, 255)),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        format!("  {:<w$}", "Avg Sessions/Day", w = val_col),
+                        label_style,
+                    ),
+                    Span::styled(
+                        format!("{:.1}", avg_sess_per_day),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        format!("  {:<w$}", "Total Active", w = val_col),
+                        label_style,
+                    ),
+                    Span::styled(
+                        format_active_duration(total_active_ms),
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+            ];
+
+            let right_lines = vec![
+                Line::from(vec![
+                    Span::styled(format!("  {:<w$}", "Start Day", w = val_col), label_style),
+                    Span::styled(start_display, Style::default().fg(Color::White)),
+                ]),
+                Line::from(vec![
+                    Span::styled(format!("  {:<w$}", "Active Days", w = val_col), label_style),
+                    Span::styled(
+                        format!("{} / {}", active_days, days_since_start),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        format!("  {:<w$}", "Avg Cost/Session", w = val_col),
+                        label_style,
+                    ),
+                    Span::styled(
+                        format!("${:.2}", avg_cost_per_sess),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(
+                        format!("  {:<w$}", "Fav Language", w = val_col),
+                        label_style,
+                    ),
+                    Span::styled(
+                        fav_lang,
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+            ];
+
+            frame.render_widget(Paragraph::new(left_lines), cols[0]);
+            frame.render_widget(Paragraph::new(right_lines), cols[1]);
+        }
+    }
+
+    /// Activity heatmap: last 365 days, Mon-Sun rows, adaptive to terminal width.
+    fn render_activity_heatmap(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        border_style: Style,
+        is_focused: bool,
+    ) {
+        let title_color = if is_focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if is_focused {
+                border_style
+            } else {
+                Style::default().fg(Color::DarkGray)
+            })
+            .title(
+                Line::from(Span::styled(
+                    " ACTIVITY ",
+                    Style::default()
+                        .fg(title_color)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Center),
+            )
+            .title_bottom(
+                Line::from(Span::styled(
+                    if self.overview_heatmap_inspect {
+                        " Inspect: ON (click day) │ Enter/Esc: off "
+                    } else {
+                        " "
+                    },
+                    Style::default().fg(Color::DarkGray),
+                ))
+                .alignment(Alignment::Center),
+            );
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if inner.width < 16 || inner.height < 6 {
+            self.overview_heatmap_layout = None;
+            return;
+        }
+
+        // Use max date from actual data instead of system date
+        let today = self
+            .per_day
+            .keys()
+            .filter_map(|day_str| chrono::NaiveDate::parse_from_str(day_str, "%Y-%m-%d").ok())
+            .max()
+            .unwrap_or_else(|| chrono::Local::now().date_naive());
+
+        let start_365 = today - chrono::Duration::days(364);
+        let start_offset = start_365.weekday().num_days_from_monday() as i64;
+        let grid_start = start_365 - chrono::Duration::days(start_offset);
+
+        let total_days_365 = (today - grid_start).num_days().max(0) as usize + 1;
+        let total_weeks_365 = total_days_365.div_ceil(7);
+
+        let label_w = 6u16;
+        let avail_w = inner.width.saturating_sub(label_w + 1);
+        if avail_w < 2 {
+            self.overview_heatmap_layout = None;
+            return;
+        }
+
+        // Fit up to full 365-day window, otherwise show latest weeks that fit.
+        let max_weeks_fit = (avail_w / 2) as usize;
+        if max_weeks_fit == 0 {
+            self.overview_heatmap_layout = None;
+            return;
+        }
+
+        let weeks = total_weeks_365.min(max_weeks_fit).max(1);
+        let start_week = total_weeks_365.saturating_sub(weeks);
+        let render_start = grid_start + chrono::Duration::days((start_week * 7) as i64);
+
+        // Use full available width exactly by distributing remainder columns.
+        let week_w = (avail_w / weeks as u16).max(2);
+        let extra_cols = avail_w.saturating_sub(week_w * weeks as u16);
+
+        let mut grid: Vec<[Option<u64>; 7]> = vec![[None; 7]; weeks];
+        let mut max_tokens: u64 = 1;
+
+        for (w, col) in grid.iter_mut().enumerate() {
+            for (d, cell) in col.iter_mut().enumerate() {
+                let date = render_start + chrono::Duration::days((w * 7 + d) as i64);
+                if date < start_365 || date > today {
+                    continue;
+                }
+                let key = date.format("%Y-%m-%d").to_string();
+                let tokens = self
+                    .per_day
+                    .get(&key)
+                    .map(|ds| ds.tokens.total())
+                    .unwrap_or(0);
+                *cell = Some(tokens);
+                max_tokens = max_tokens.max(tokens);
+            }
+        }
+
+        self.overview_heatmap_layout = Some(HeatmapLayout {
+            inner,
+            label_w,
+            weeks,
+            grid_start: render_start,
+            week_w,
+            extra_cols,
+        });
+
+        let week_width_at = |idx: usize| week_w + if (idx as u16) < extra_cols { 1 } else { 0 };
+
+        // Month labels centered over each visible month range.
+        let mut month_row: Vec<char> = vec![' '; avail_w as usize];
+        let mut month_ranges: Vec<(u32, u16, u16)> = Vec::new(); // month, x_start, x_end
+        let mut x_cursor: u16 = 0;
+        let mut cur_month: Option<u32> = None;
+        let mut range_start: u16 = 0;
+        for w in 0..weeks {
+            let d0 = render_start + chrono::Duration::days((w * 7) as i64);
+            let m = d0.month();
+            if cur_month.is_none() {
+                cur_month = Some(m);
+                range_start = x_cursor;
+            } else if cur_month != Some(m) {
+                month_ranges.push((cur_month.unwrap_or(m), range_start, x_cursor));
+                cur_month = Some(m);
+                range_start = x_cursor;
+            }
+            x_cursor = x_cursor.saturating_add(week_width_at(w));
+        }
+        if let Some(m) = cur_month {
+            month_ranges.push((m, range_start, x_cursor));
+        }
+
+        let mut last_label_end: i32 = -2;
+        for (m, x0, x1) in month_ranges {
+            let name = match m {
+                1 => "Jan",
+                2 => "Feb",
+                3 => "Mar",
+                4 => "Apr",
+                5 => "May",
+                6 => "Jun",
+                7 => "Jul",
+                8 => "Aug",
+                9 => "Sep",
+                10 => "Oct",
+                11 => "Nov",
+                _ => "Dec",
+            };
+            let span_w = x1.saturating_sub(x0) as usize;
+            if span_w < name.len() {
+                continue;
+            }
+            let center = (x0 as usize + x1 as usize) / 2;
+            let start = center.saturating_sub(name.len() / 2) as i32;
+            let end = start + name.len() as i32 - 1;
+            if start <= last_label_end + 1 {
+                continue;
+            }
+            if start < 0 || end >= month_row.len() as i32 {
+                continue;
+            }
+            for (i, ch) in name.chars().enumerate() {
+                month_row[(start as usize) + i] = ch;
+            }
+            last_label_end = end;
+        }
+
+        let day_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+        let mut lines: Vec<Line> = Vec::with_capacity(11);
+        if inner.height > 8 {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{:<w$}", "", w = label_w as usize),
+                    Style::default(),
+                ),
+                Span::styled(
+                    month_row.iter().collect::<String>(),
+                    Style::default().fg(Color::Rgb(140, 140, 160)),
+                ),
+            ]));
+        }
+
+        let selected_key = self.overview_heatmap_selected_day.as_deref();
+
+        // 7 day rows (show all labels)
+        for d in 0..7usize {
+            let mut spans: Vec<Span> = Vec::with_capacity(weeks + 1);
+            let label = format!(" {:<w$}", day_labels[d], w = (label_w - 1) as usize);
+            spans.push(Span::styled(
+                label,
+                Style::default().fg(Color::Rgb(100, 100, 120)),
+            ));
+
+            for (w, week) in grid.iter().enumerate().take(weeks) {
+                let col_w = week_width_at(w) as usize;
+                let date = render_start + chrono::Duration::days((w * 7 + d) as i64);
+                let key = date.format("%Y-%m-%d").to_string();
+                let is_selected = selected_key.is_some_and(|k| k == key);
+
+                match week[d] {
+                    None => {
+                        spans.push(Span::styled(" ".repeat(col_w), Style::default()));
+                    }
+                    Some(0) => {
+                        let ch = if is_selected { '░' } else { '█' };
+                        spans.push(Span::styled(
+                            ch.to_string().repeat(col_w),
+                            Style::default().fg(Color::Rgb(28, 32, 38)),
+                        ));
+                    }
+                    Some(day_tokens) => {
+                        let ratio = day_tokens as f64 / max_tokens as f64;
+                        let color = if ratio <= 0.20 {
+                            Color::Rgb(24, 66, 44)
+                        } else if ratio <= 0.40 {
+                            Color::Rgb(28, 102, 58)
+                        } else if ratio <= 0.60 {
+                            Color::Rgb(42, 138, 74)
+                        } else if ratio <= 0.80 {
+                            Color::Rgb(64, 181, 96)
+                        } else if ratio <= 0.95 {
+                            Color::Rgb(94, 230, 126)
+                        } else {
+                            Color::Rgb(118, 255, 149)
+                        };
+
+                        let ch = if is_selected { '▓' } else { '█' };
+                        spans.push(Span::styled(
+                            ch.to_string().repeat(col_w),
+                            Style::default().fg(color),
+                        ));
+                    }
+                }
+            }
+            lines.push(Line::from(spans));
+        }
+
+        if inner.height > 9 {
+            lines.push(Line::from(""));
+        }
+        let mut legend = vec![
+            Span::styled(
+                format!("{:<w$}", "", w = label_w as usize),
+                Style::default(),
+            ),
+            Span::styled("Less ", Style::default().fg(Color::Rgb(100, 100, 120))),
+            Span::styled("██", Style::default().fg(Color::Rgb(28, 32, 38))),
+            Span::styled("██", Style::default().fg(Color::Rgb(24, 66, 44))),
+            Span::styled("██", Style::default().fg(Color::Rgb(28, 102, 58))),
+            Span::styled("██", Style::default().fg(Color::Rgb(42, 138, 74))),
+            Span::styled("██", Style::default().fg(Color::Rgb(64, 181, 96))),
+            Span::styled("██", Style::default().fg(Color::Rgb(94, 230, 126))),
+            Span::styled(" More ", Style::default().fg(Color::Rgb(100, 100, 120))),
+        ];
+        if let Some(day) = &self.overview_heatmap_selected_day {
+            legend.push(Span::styled(
+                format!(
+                    "   [{}] tok:{}  sess:{}  cost:${:.2}  active:{}",
+                    day,
+                    format_number(self.overview_heatmap_selected_tokens),
+                    self.overview_heatmap_selected_sessions,
+                    self.overview_heatmap_selected_cost,
+                    format_active_duration(self.overview_heatmap_selected_active_ms)
+                ),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(legend));
+
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_projects_panel(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        border_style: Style,
+        is_highlighted: bool,
+    ) {
+        let title_color = if is_highlighted {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(
+                Line::from(Span::styled(
+                    " TOP PROJECTS ",
+                    Style::default()
+                        .fg(title_color)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Center),
+            )
+            .title_bottom(
+                Line::from(Span::styled(
+                    if is_highlighted {
+                        " ↑↓: scroll "
+                    } else {
+                        " "
+                    },
+                    Style::default().fg(Color::DarkGray),
+                ))
+                .alignment(Alignment::Center),
+            );
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if self.overview_projects.is_empty() {
+            frame.render_widget(
+                Paragraph::new("No project data")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center),
+                inner,
+            );
+            return;
+        }
+
+        let visible = inner.height as usize;
+        self.overview_project_max_scroll = self.overview_projects.len().saturating_sub(visible);
+        self.overview_project_scroll = self
+            .overview_project_scroll
+            .min(self.overview_project_max_scroll);
+
+        let max_count = self
+            .overview_projects
+            .first()
+            .map(|(_, c)| *c)
+            .unwrap_or(1)
+            .max(1);
+        let name_width = 14.min(inner.width.saturating_sub(16) as usize).max(6);
+        let bar_max = inner.width.saturating_sub((name_width + 12) as u16) as usize;
+
+        let lines: Vec<Line> = self
+            .overview_projects
+            .iter()
+            .enumerate()
+            .skip(self.overview_project_scroll)
+            .take(visible)
+            .map(|(i, (name, count))| {
+                let bar_len = (*count as f64 / max_count as f64 * bar_max as f64) as usize;
+                let filled = "█".repeat(bar_len);
+                let empty = "░".repeat(bar_max.saturating_sub(bar_len));
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {:>2}. ", i + 1),
+                        Style::default().fg(Color::Rgb(100, 100, 120)),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{:<width$} ",
+                            safe_truncate_plain(name, name_width),
+                            width = name_width
+                        ),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(filled, Style::default().fg(Color::Cyan)),
+                    Span::styled(empty, Style::default().fg(Color::Rgb(40, 40, 50))),
+                    Span::styled(
+                        format!(" {:>3}", count),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            })
+            .collect();
+
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn render_overview_tools_panel(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        border_style: Style,
+        is_highlighted: bool,
+    ) {
+        let title_color = if is_highlighted {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
             .title(
                 Line::from(Span::styled(
                     " TOOL USAGE ",
@@ -2432,57 +3385,59 @@ impl App {
         frame.render_widget(block, area);
 
         if self.tool_usage.is_empty() {
-            let empty = Paragraph::new("No tool usage data")
-                .style(Style::default().fg(Color::DarkGray))
-                .alignment(Alignment::Center);
-            frame.render_widget(empty, inner);
+            frame.render_widget(
+                Paragraph::new("No tool data")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center),
+                inner,
+            );
             return;
         }
 
+        let visible = inner.height as usize;
+        self.overview_tool_max_scroll = self.tool_usage.len().saturating_sub(visible);
+        self.overview_tool_scroll = self.overview_tool_scroll.min(self.overview_tool_max_scroll);
+
         let total_count: u64 = self.tool_usage.iter().map(|t| t.count).sum();
-        let bar_max_width = inner.width.saturating_sub(30) as u64;
+        let name_w = 12.min(inner.width.saturating_sub(14) as usize).max(4);
+        let bar_max = inner.width.saturating_sub((name_w + 14) as u16) as usize;
 
-        let visible_height = inner.height as usize;
-        self.tool_max_scroll = (self.tool_usage.len().saturating_sub(visible_height)) as u16;
-        self.tool_scroll = self.tool_scroll.min(self.tool_max_scroll);
+        let lines: Vec<Line> = self
+            .tool_usage
+            .iter()
+            .skip(self.overview_tool_scroll)
+            .take(visible)
+            .map(|tool| {
+                let pct = if total_count > 0 {
+                    tool.count as f64 / total_count as f64
+                } else {
+                    0.0
+                };
+                let bar_len = (pct * bar_max as f64) as usize;
+                let filled = "█".repeat(bar_len);
+                let empty = "░".repeat(bar_max.saturating_sub(bar_len));
+                Line::from(vec![
+                    Span::styled(
+                        format!(
+                            " {:>width$} ",
+                            truncate_with_ellipsis(&tool.name, name_w),
+                            width = name_w
+                        ),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(filled, Style::default().fg(Color::Magenta)),
+                    Span::styled(empty, Style::default().fg(Color::Rgb(40, 40, 50))),
+                    Span::styled(
+                        format!(" {:>5}", tool.count),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            })
+            .collect();
 
-        let mut lines: Vec<Line> = Vec::with_capacity(self.tool_usage.len());
-        for tool in &self.tool_usage {
-            let percentage = if total_count > 0 {
-                (tool.count as f64 / total_count as f64) * 100.0
-            } else {
-                0.0
-            };
-            let bar_width = if total_count > 0 {
-                ((tool.count as f64 / total_count as f64) * bar_max_width as f64) as usize
-            } else {
-                0
-            };
-            let filled = "█".repeat(bar_width);
-            let empty = "░".repeat(bar_max_width.saturating_sub(bar_width as u64) as usize);
-
-            // Truncate tool name to max 12 chars with ellipsis if needed
-            let tool_name_display = truncate_with_ellipsis(&tool.name, 12);
-
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {:>12} ", tool_name_display),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(filled, Style::default().fg(Color::Cyan)),
-                Span::styled(empty, Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!(" {:>5} ", tool.count),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled(
-                    format!("({:>5.1}%)", percentage),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ]));
-        }
-
-        frame.render_widget(Paragraph::new(lines).scroll((self.tool_scroll, 0)), inner);
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn render_model_detail(
