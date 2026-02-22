@@ -403,7 +403,7 @@ impl SessionModal {
         let project = session.path_root.as_ref();
         if !project.is_empty() {
             lines.push(Line::from(vec![Span::styled(
-                "  INFOR",
+                "  INFO",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -502,9 +502,9 @@ impl SessionModal {
                 };
                 let is_expanded = self.expanded_info_agents.contains(&agent.name);
                 let toggle_label = if is_expanded {
-                    " (▼ collapse)"
+                    " ▾ collapse"
                 } else {
-                    " (▶ expand)"
+                    " ▸ expand"
                 };
                 let mut model_list: Vec<&str> = agent.models.iter().map(|m| m.as_ref()).collect();
                 model_list.sort_unstable();
@@ -624,9 +624,9 @@ impl SessionModal {
                 for model in &d.model_stats {
                     let is_expanded = self.expanded_info_models.contains(&model.name);
                     let toggle_label = if is_expanded {
-                        " (▼ collapse)"
+                        " (▾ collapse)"
                     } else {
-                        " (▶ expand)"
+                        " (▸ expand)"
                     };
                     let prefix_len = 6; // "    ● "
                     let toggle_len = toggle_label.chars().count();
@@ -1068,9 +1068,9 @@ impl SessionModal {
                         let ag_dim = dim_color(ag_color);
                         let is_expanded = self.expanded_agents.contains(agent_name);
                         let toggle_label = if is_expanded {
-                            "▼ collapse"
+                            "▾ collapse"
                         } else {
-                            "▶ expand"
+                            "▸ expand"
                         };
                         let (total_tools, tool_stats) = aggregate_tools_in_group(msgs, msg_indices);
                         let card_w = box_w.saturating_sub(4);
@@ -1219,9 +1219,7 @@ impl SessionModal {
                                     preview.truncate(byte_pos);
                                     preview.push('…');
                                 }
-                                for line in
-                                    wrap_text_plain(&preview, card_w.saturating_sub(8))
-                                {
+                                for line in wrap_text_plain(&preview, card_w.saturating_sub(8)) {
                                     lines.push(Line::from(vec![
                                         Span::styled("   ┊  ", Style::default().fg(ag_dim)),
                                         Span::styled(
@@ -1391,9 +1389,9 @@ fn render_tool_stats_box<'a>(
     let tool_header_color = Color::Rgb(165, 165, 178);
     let tool_text_color = Color::Rgb(145, 145, 160);
     let toggle_label = if is_expanded {
-        "▼ collapse"
+        "▾ collapse"
     } else {
-        "▶ expand"
+        "▸ expand"
     };
 
     lines.push(Line::from(vec![
@@ -1734,9 +1732,9 @@ fn render_user_box<'a>(
 ) {
     let border_color = Color::Cyan;
     let toggle_label = if is_expanded {
-        "▼ collapse"
+        "▾ collapse"
     } else {
-        "▶ expand"
+        "▸ expand"
     };
     let label = format!(" USER #{} ", user_num);
     let dash_len = box_w.saturating_sub(label.chars().count() + 2 + toggle_label.len() + 1);
@@ -1817,9 +1815,9 @@ fn render_agent_box<'a>(
 ) {
     let border_color = Color::Green;
     let toggle_label = if is_expanded {
-        "▼ collapse"
+        "▾ collapse"
     } else {
-        "▶ expand"
+        "▸ expand"
     };
     let model_str = msg.model.as_deref().unwrap_or("");
     let label = if model_str.is_empty() {
