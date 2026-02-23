@@ -119,6 +119,7 @@ struct HeatmapLayout {
     grid_start: NaiveDate,
     week_w: u16,
     extra_cols: u16,
+    grid_pad: u16,
 }
 
 pub struct App {
@@ -188,7 +189,6 @@ pub struct App {
     overview_tool_scroll: usize,
     overview_tool_max_scroll: usize,
     overview_heatmap_layout: Option<HeatmapLayout>,
-    overview_heatmap_inspect: bool,
     overview_heatmap_selected_day: Option<String>,
     overview_heatmap_selected_tokens: u64,
     overview_heatmap_selected_sessions: usize,
@@ -494,7 +494,6 @@ impl App {
             overview_tool_scroll: 0,
             overview_tool_max_scroll: 0,
             overview_heatmap_layout: None,
-            overview_heatmap_inspect: false,
             overview_heatmap_selected_day: None,
             overview_heatmap_selected_tokens: 0,
             overview_heatmap_selected_sessions: 0,
@@ -1266,10 +1265,9 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => {
-                if self.is_active || self.models_active || self.overview_heatmap_inspect {
+                if self.is_active || self.models_active {
                     self.is_active = false;
                     self.models_active = false;
-                    self.overview_heatmap_inspect = false;
                 } else {
                     self.exit = true;
                 }
@@ -1651,9 +1649,7 @@ impl App {
                         },
                         Focus::Right => match self.left_panel {
                             LeftPanel::Stats => {
-                                if self.right_panel == RightPanel::Activity {
-                                    self.overview_heatmap_inspect = !self.overview_heatmap_inspect;
-                                } else if self.right_panel == RightPanel::List
+                                if self.right_panel == RightPanel::List
                                     || self.right_panel == RightPanel::Tools
                                 {
                                     self.is_active = true;
@@ -1673,11 +1669,6 @@ impl App {
                             }
                         },
                     }
-                } else if self.focus == Focus::Right
-                    && self.left_panel == LeftPanel::Stats
-                    && self.right_panel == RightPanel::Activity
-                {
-                    self.overview_heatmap_inspect = !self.overview_heatmap_inspect;
                 } else if self.focus == Focus::Right
                     && self.left_panel == LeftPanel::Days
                     && self.right_panel == RightPanel::List
@@ -1816,10 +1807,9 @@ impl App {
                 self.handle_mouse_single_click_optimized(pos, area.height)
             }
             MouseEventKind::Down(MouseButton::Right) => {
-                if self.is_active || self.models_active || self.overview_heatmap_inspect {
+                if self.is_active || self.models_active {
                     self.is_active = false;
                     self.models_active = false;
-                    self.overview_heatmap_inspect = false;
                 } else {
                     self.exit = true;
                 }
@@ -1892,9 +1882,8 @@ impl App {
                     self.focus = Focus::Right;
                     self.left_panel = LeftPanel::Stats;
                     self.right_panel = RightPanel::Activity;
-                    if self.overview_heatmap_inspect {
-                        self.select_heatmap_day_from_mouse(x, y);
-                    }
+                    // Always allow clicking to select a day
+                    self.select_heatmap_day_from_mouse(x, y);
                 }
                 "tools" => {
                     self.focus = Focus::Right;
@@ -1952,16 +1941,18 @@ impl App {
             return;
         };
 
-        // Row 0 is month labels; day rows are 1..=7
-        if y <= layout.inner.y {
+        // Month labels only exist when inner.height > 8; adjust offset accordingly
+        let has_month_row = layout.inner.height > 8;
+        let day_row_offset: u16 = if has_month_row { 1 } else { 0 };
+        if y < layout.inner.y + day_row_offset {
             return;
         }
-        let day_row = (y - layout.inner.y - 1) as usize;
+        let day_row = (y - layout.inner.y - day_row_offset) as usize;
         if day_row >= 7 {
             return;
         }
 
-        let start_x = layout.inner.x.saturating_add(layout.label_w);
+        let start_x = layout.inner.x.saturating_add(layout.label_w).saturating_add(layout.grid_pad);
         if x < start_x {
             return;
         }
@@ -1974,7 +1965,7 @@ impl App {
                 } else {
                     0
                 };
-            if rel_x <= w {
+            if rel_x < w {
                 break;
             }
             rel_x = rel_x.saturating_sub(w);
@@ -1994,8 +1985,7 @@ impl App {
             .max()
             .unwrap_or_else(|| chrono::Local::now().date_naive());
 
-        let start_365 = today - chrono::Duration::days(364);
-        if date < start_365 || date > today {
+        if date > today {
             return;
         }
 
@@ -2588,7 +2578,7 @@ impl App {
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(8),  // Overview (4 lines content + borders)
-                        Constraint::Length(10), // Activity (8 lines content + borders)
+                        Constraint::Length(11), // Activity (9 lines content + borders = month + 7 days + legend)
                         Constraint::Min(0),     // Projects | Tools takes all remaining space
                     ])
                     .split(area);
@@ -2990,14 +2980,14 @@ impl App {
                 .alignment(Alignment::Center),
             )
             .title_bottom(
-                Line::from(Span::styled(
-                    if self.overview_heatmap_inspect {
-                        " Inspect: ON (click day) │ Enter/Esc: off "
-                    } else {
-                        " "
-                    },
-                    Style::default().fg(Color::DarkGray),
-                ))
+                Line::from(if is_focused {
+                    Span::styled(
+                        " Click a day to see breakdown ",
+                        Style::default().fg(Color::DarkGray),
+                    )
+                } else {
+                    Span::styled(" ", Style::default())
+                })
                 .alignment(Alignment::Center),
             );
 
@@ -3031,8 +3021,9 @@ impl App {
             return;
         }
 
-        // Fit up to full 365-day window, otherwise show latest weeks that fit.
-        let max_weeks_fit = (avail_w / 2) as usize;
+        // Fixed column width of 2 chars; show as many weeks as fit, latest first.
+        let week_w: u16 = 2;
+        let max_weeks_fit = (avail_w / week_w) as usize;
         if max_weeks_fit == 0 {
             self.overview_heatmap_layout = None;
             return;
@@ -3042,9 +3033,9 @@ impl App {
         let start_week = total_weeks_365.saturating_sub(weeks);
         let render_start = grid_start + chrono::Duration::days((start_week * 7) as i64);
 
-        // Use full available width exactly by distributing remainder columns.
-        let week_w = (avail_w / weeks as u16).max(2);
-        let extra_cols = avail_w.saturating_sub(week_w * weeks as u16);
+        let extra_cols: u16 = 0;
+        // Left-align the grid (no padding between labels and grid)
+        let grid_pad: usize = 0;
 
         let mut grid: Vec<[Option<u64>; 7]> = vec![[None; 7]; weeks];
         let mut max_tokens: u64 = 1;
@@ -3052,9 +3043,11 @@ impl App {
         for (w, col) in grid.iter_mut().enumerate() {
             for (d, cell) in col.iter_mut().enumerate() {
                 let date = render_start + chrono::Duration::days((w * 7 + d) as i64);
-                if date < start_365 || date > today {
+                if date > today {
                     continue;
                 }
+                // Fill all days up to today (including pre-range days in the
+                // first partial week) so the first column is never half-empty.
                 let key = date.format("%Y-%m-%d").to_string();
                 let tokens = self
                     .per_day
@@ -3073,12 +3066,34 @@ impl App {
             grid_start: render_start,
             week_w,
             extra_cols,
+            grid_pad: grid_pad as u16,
         });
 
         let week_width_at = |idx: usize| week_w + if (idx as u16) < extra_cols { 1 } else { 0 };
 
+        let selected_key = self.overview_heatmap_selected_day.as_deref();
+
+        // Pre-compute selected cell coordinates for full-square border
+        let (sel_w, sel_d): (Option<usize>, Option<usize>) =
+            if let Some(sel_key) = selected_key {
+                if let Ok(sel_date) = chrono::NaiveDate::parse_from_str(sel_key, "%Y-%m-%d") {
+                    let days_from_start = (sel_date - render_start).num_days();
+                    if days_from_start >= 0 {
+                        let d = days_from_start as usize;
+                        (Some(d / 7), Some(d % 7))
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
         // Month labels centered over each visible month range.
-        let mut month_row: Vec<char> = vec![' '; avail_w as usize];
+        let grid_w = (week_w as usize) * weeks;
+        let mut month_row: Vec<char> = vec![' '; grid_w];
         let mut month_ranges: Vec<(u32, u16, u16)> = Vec::new(); // month, x_start, x_end
         let mut x_cursor: u16 = 0;
         let mut cur_month: Option<u32> = None;
@@ -3141,7 +3156,7 @@ impl App {
         if inner.height > 8 {
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{:<w$}", "", w = label_w as usize),
+                    format!("{:<w$}", "", w = label_w as usize + grid_pad),
                     Style::default(),
                 ),
                 Span::styled(
@@ -3151,37 +3166,32 @@ impl App {
             ]));
         }
 
-        let selected_key = self.overview_heatmap_selected_day.as_deref();
-
         // 7 day rows (show all labels)
         for d in 0..7usize {
-            let mut spans: Vec<Span> = Vec::with_capacity(weeks + 1);
+            let mut spans: Vec<Span> = Vec::with_capacity(weeks + 2);
             let label = format!(" {:<w$}", day_labels[d], w = (label_w - 1) as usize);
             spans.push(Span::styled(
                 label,
                 Style::default().fg(Color::Rgb(100, 100, 120)),
             ));
+            if grid_pad > 0 {
+                spans.push(Span::styled(
+                    " ".repeat(grid_pad),
+                    Style::default(),
+                ));
+            }
 
             for (w, week) in grid.iter().enumerate().take(weeks) {
                 let col_w = week_width_at(w) as usize;
-                let date = render_start + chrono::Duration::days((w * 7 + d) as i64);
-                let key = date.format("%Y-%m-%d").to_string();
-                let is_selected = selected_key.is_some_and(|k| k == key);
 
-                match week[d] {
-                    None => {
-                        spans.push(Span::styled(" ".repeat(col_w), Style::default()));
-                    }
-                    Some(0) => {
-                        let ch = if is_selected { '░' } else { '█' };
-                        spans.push(Span::styled(
-                            ch.to_string().repeat(col_w),
-                            Style::default().fg(Color::Rgb(28, 32, 38)),
-                        ));
-                    }
+                let is_selected_cell = sel_w == Some(w) && sel_d == Some(d);
+
+                let bg = match week[d] {
+                    None => None,
+                    Some(0) => Some(Color::Rgb(38, 42, 50)),
                     Some(day_tokens) => {
                         let ratio = day_tokens as f64 / max_tokens as f64;
-                        let color = if ratio <= 0.20 {
+                        Some(if ratio <= 0.20 {
                             Color::Rgb(24, 66, 44)
                         } else if ratio <= 0.40 {
                             Color::Rgb(28, 102, 58)
@@ -3193,13 +3203,33 @@ impl App {
                             Color::Rgb(94, 230, 126)
                         } else {
                             Color::Rgb(118, 255, 149)
-                        };
+                        })
+                    }
+                };
 
-                        let ch = if is_selected { '▓' } else { '█' };
-                        spans.push(Span::styled(
-                            ch.to_string().repeat(col_w),
-                            Style::default().fg(color),
-                        ));
+                match bg {
+                    None => {
+                        spans.push(Span::styled(" ".repeat(col_w), Style::default()));
+                    }
+                    Some(bg) => {
+                        if is_selected_cell {
+                            // Highlight: dot marker in center of cell
+                            let left_pad = (col_w - 1) / 2;
+                            let right_pad = col_w - left_pad - 1;
+                            let style = Style::default().bg(bg).fg(Color::White);
+                            if left_pad > 0 {
+                                spans.push(Span::styled(" ".repeat(left_pad), Style::default().bg(bg)));
+                            }
+                            spans.push(Span::styled("●", style));
+                            if right_pad > 0 {
+                                spans.push(Span::styled(" ".repeat(right_pad), Style::default().bg(bg)));
+                            }
+                        } else {
+                            spans.push(Span::styled(
+                                " ".repeat(col_w),
+                                Style::default().bg(bg),
+                            ));
+                        }
                     }
                 }
             }
@@ -3215,27 +3245,69 @@ impl App {
                 Style::default(),
             ),
             Span::styled("Less ", Style::default().fg(Color::Rgb(100, 100, 120))),
-            Span::styled("██", Style::default().fg(Color::Rgb(28, 32, 38))),
-            Span::styled("██", Style::default().fg(Color::Rgb(24, 66, 44))),
-            Span::styled("██", Style::default().fg(Color::Rgb(28, 102, 58))),
-            Span::styled("██", Style::default().fg(Color::Rgb(42, 138, 74))),
-            Span::styled("██", Style::default().fg(Color::Rgb(64, 181, 96))),
-            Span::styled("██", Style::default().fg(Color::Rgb(94, 230, 126))),
+            Span::styled("  ", Style::default().bg(Color::Rgb(38, 42, 50))),
+            Span::styled("  ", Style::default().bg(Color::Rgb(24, 66, 44))),
+            Span::styled("  ", Style::default().bg(Color::Rgb(28, 102, 58))),
+            Span::styled("  ", Style::default().bg(Color::Rgb(42, 138, 74))),
+            Span::styled("  ", Style::default().bg(Color::Rgb(64, 181, 96))),
+            Span::styled("  ", Style::default().bg(Color::Rgb(94, 230, 126))),
             Span::styled(" More ", Style::default().fg(Color::Rgb(100, 100, 120))),
         ];
         if let Some(day) = &self.overview_heatmap_selected_day {
+            let dim = Style::default().fg(Color::Rgb(100, 100, 120));
+            // Format date as "Feb 22, 2026 Sun"
+            let display_day = self
+                .cached_day_strings
+                .get(day.as_str())
+                .cloned()
+                .unwrap_or_else(|| {
+                    if let Ok(d) = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d") {
+                        let month = match d.month() {
+                            1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
+                            5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
+                            9 => "Sep", 10 => "Oct", 11 => "Nov", _ => "Dec",
+                        };
+                        let wday = match d.weekday() {
+                            chrono::Weekday::Mon => "Mon", chrono::Weekday::Tue => "Tue",
+                            chrono::Weekday::Wed => "Wed", chrono::Weekday::Thu => "Thu",
+                            chrono::Weekday::Fri => "Fri", chrono::Weekday::Sat => "Sat",
+                            chrono::Weekday::Sun => "Sun",
+                        };
+                        format!("{} {:02}, {} {}", month, d.day(), d.year(), wday)
+                    } else {
+                        day.clone()
+                    }
+                });
+            legend.push(Span::styled("  ", Style::default()));
             legend.push(Span::styled(
-                format!(
-                    "   [{}] tok:{}  sess:{}  cost:${:.2}  active:{}",
-                    day,
-                    format_number(self.overview_heatmap_selected_tokens),
-                    self.overview_heatmap_selected_sessions,
-                    self.overview_heatmap_selected_cost,
-                    format_active_duration(self.overview_heatmap_selected_active_ms)
-                ),
+                format!(" {} ", display_day),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
+            ));
+            legend.push(Span::styled(" ╱ ", dim));
+            legend.push(Span::styled("tok:", dim));
+            legend.push(Span::styled(
+                format_number(self.overview_heatmap_selected_tokens),
+                Style::default().fg(Color::Green),
+            ));
+            legend.push(Span::styled(" ╱ ", dim));
+            legend.push(Span::styled("sess:", dim));
+            legend.push(Span::styled(
+                format!("{}", self.overview_heatmap_selected_sessions),
+                Style::default().fg(Color::Cyan),
+            ));
+            legend.push(Span::styled(" ╱ ", dim));
+            legend.push(Span::styled("cost:", dim));
+            legend.push(Span::styled(
+                format!("${:.2}", self.overview_heatmap_selected_cost),
+                Style::default().fg(Color::Yellow),
+            ));
+            legend.push(Span::styled(" ╱ ", dim));
+            legend.push(Span::styled("active:", dim));
+            legend.push(Span::styled(
+                format_active_duration(self.overview_heatmap_selected_active_ms),
+                Style::default().fg(Color::Rgb(100, 200, 255)),
             ));
         }
         lines.push(Line::from(legend));
