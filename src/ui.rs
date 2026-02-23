@@ -194,6 +194,8 @@ pub struct App {
     overview_heatmap_selected_sessions: usize,
     overview_heatmap_selected_cost: f64,
     overview_heatmap_selected_active_ms: i64,
+    overview_heatmap_flash_time: Option<std::time::Instant>,
+    overview_heatmap_flash_state: bool, // Track last flicker state for optimization
 
     // Live stats: Cache and file watching
     stats_cache: Option<StatsCache>,
@@ -499,6 +501,8 @@ impl App {
             overview_heatmap_selected_sessions: 0,
             overview_heatmap_selected_cost: 0.0,
             overview_heatmap_selected_active_ms: 0,
+            overview_heatmap_flash_time: None,
+            overview_heatmap_flash_state: true,
 
             modal: SessionModal::new(),
 
@@ -1231,7 +1235,20 @@ impl App {
             }
 
             // Ensure we always redraw if needed, including after window resize
-            if self.should_redraw {
+            // Optimized flicker: only redraw when state changes (every 250ms)
+            let needs_flicker_redraw = if let Some(flash_time) = self.overview_heatmap_flash_time {
+                let flash_on = (flash_time.elapsed().as_millis() / 250) % 2 == 0;
+                if flash_on != self.overview_heatmap_flash_state {
+                    self.overview_heatmap_flash_state = flash_on;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if self.should_redraw || needs_flicker_redraw {
                 terminal.draw(|frame| self.render(frame))?;
                 self.should_redraw = false;
             }
@@ -1952,7 +1969,11 @@ impl App {
             return;
         }
 
-        let start_x = layout.inner.x.saturating_add(layout.label_w).saturating_add(layout.grid_pad);
+        let start_x = layout
+            .inner
+            .x
+            .saturating_add(layout.label_w)
+            .saturating_add(layout.grid_pad);
         if x < start_x {
             return;
         }
@@ -2004,6 +2025,7 @@ impl App {
         self.overview_heatmap_selected_tokens = tokens;
         self.overview_heatmap_selected_cost = cost;
         self.overview_heatmap_selected_active_ms = active_ms;
+        self.overview_heatmap_flash_time = Some(std::time::Instant::now());
     }
 
     fn render(&mut self, frame: &mut Frame) {
@@ -3074,22 +3096,21 @@ impl App {
         let selected_key = self.overview_heatmap_selected_day.as_deref();
 
         // Pre-compute selected cell coordinates for full-square border
-        let (sel_w, sel_d): (Option<usize>, Option<usize>) =
-            if let Some(sel_key) = selected_key {
-                if let Ok(sel_date) = chrono::NaiveDate::parse_from_str(sel_key, "%Y-%m-%d") {
-                    let days_from_start = (sel_date - render_start).num_days();
-                    if days_from_start >= 0 {
-                        let d = days_from_start as usize;
-                        (Some(d / 7), Some(d % 7))
-                    } else {
-                        (None, None)
-                    }
+        let (sel_w, sel_d): (Option<usize>, Option<usize>) = if let Some(sel_key) = selected_key {
+            if let Ok(sel_date) = chrono::NaiveDate::parse_from_str(sel_key, "%Y-%m-%d") {
+                let days_from_start = (sel_date - render_start).num_days();
+                if days_from_start >= 0 {
+                    let d = days_from_start as usize;
+                    (Some(d / 7), Some(d % 7))
                 } else {
                     (None, None)
                 }
             } else {
                 (None, None)
-            };
+            }
+        } else {
+            (None, None)
+        };
 
         // Month labels centered over each visible month range.
         let grid_w = (week_w as usize) * weeks;
@@ -3175,10 +3196,7 @@ impl App {
                 Style::default().fg(Color::Rgb(100, 100, 120)),
             ));
             if grid_pad > 0 {
-                spans.push(Span::styled(
-                    " ".repeat(grid_pad),
-                    Style::default(),
-                ));
+                spans.push(Span::styled(" ".repeat(grid_pad), Style::default()));
             }
 
             for (w, week) in grid.iter().enumerate().take(weeks) {
@@ -3212,24 +3230,21 @@ impl App {
                         spans.push(Span::styled(" ".repeat(col_w), Style::default()));
                     }
                     Some(bg) => {
-                        if is_selected_cell {
-                            // Highlight: dot marker in center of cell
-                            let left_pad = (col_w - 1) / 2;
-                            let right_pad = col_w - left_pad - 1;
-                            let style = Style::default().bg(bg).fg(Color::White);
-                            if left_pad > 0 {
-                                spans.push(Span::styled(" ".repeat(left_pad), Style::default().bg(bg)));
-                            }
-                            spans.push(Span::styled("●", style));
-                            if right_pad > 0 {
-                                spans.push(Span::styled(" ".repeat(right_pad), Style::default().bg(bg)));
+                        let style = if is_selected_cell {
+                            // Flicker effect: 500ms period (250ms on, 250ms off)
+                            let flash_on = self
+                                .overview_heatmap_flash_time
+                                .map(|t| (t.elapsed().as_millis() / 250) % 2 == 0)
+                                .unwrap_or(true);
+                            if flash_on {
+                                Style::default().bg(bg)
+                            } else {
+                                Style::default().bg(Color::Rgb(30, 30, 35))
                             }
                         } else {
-                            spans.push(Span::styled(
-                                " ".repeat(col_w),
-                                Style::default().bg(bg),
-                            ));
-                        }
+                            Style::default().bg(bg)
+                        };
+                        spans.push(Span::styled(" ".repeat(col_w), style));
                     }
                 }
             }
@@ -3263,14 +3278,26 @@ impl App {
                 .unwrap_or_else(|| {
                     if let Ok(d) = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d") {
                         let month = match d.month() {
-                            1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
-                            5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
-                            9 => "Sep", 10 => "Oct", 11 => "Nov", _ => "Dec",
+                            1 => "Jan",
+                            2 => "Feb",
+                            3 => "Mar",
+                            4 => "Apr",
+                            5 => "May",
+                            6 => "Jun",
+                            7 => "Jul",
+                            8 => "Aug",
+                            9 => "Sep",
+                            10 => "Oct",
+                            11 => "Nov",
+                            _ => "Dec",
                         };
                         let wday = match d.weekday() {
-                            chrono::Weekday::Mon => "Mon", chrono::Weekday::Tue => "Tue",
-                            chrono::Weekday::Wed => "Wed", chrono::Weekday::Thu => "Thu",
-                            chrono::Weekday::Fri => "Fri", chrono::Weekday::Sat => "Sat",
+                            chrono::Weekday::Mon => "Mon",
+                            chrono::Weekday::Tue => "Tue",
+                            chrono::Weekday::Wed => "Wed",
+                            chrono::Weekday::Thu => "Thu",
+                            chrono::Weekday::Fri => "Fri",
+                            chrono::Weekday::Sat => "Sat",
                             chrono::Weekday::Sun => "Sun",
                         };
                         format!("{} {:02}, {} {}", month, d.day(), d.year(), wday)
