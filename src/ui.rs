@@ -195,7 +195,6 @@ pub struct App {
     overview_heatmap_selected_cost: f64,
     overview_heatmap_selected_active_ms: i64,
     overview_heatmap_flash_time: Option<std::time::Instant>,
-    overview_heatmap_flash_state: bool, // Track last flicker state for optimization
 
     // Live stats: Cache and file watching
     stats_cache: Option<StatsCache>,
@@ -294,7 +293,7 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     for (idx, _) in s.char_indices() {
         count += 1;
         if count > max_chars {
-            let visible_chars = max_chars.saturating_sub(3);
+            let visible_chars = max_chars.saturating_sub(1);
             let byte_end = s
                 .char_indices()
                 .nth(visible_chars)
@@ -302,7 +301,7 @@ fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
                 .unwrap_or(idx);
             let mut result = String::with_capacity(byte_end + 3);
             result.push_str(&s[..byte_end]);
-            result.push_str("...");
+            result.push('…');
             return result;
         }
     }
@@ -502,7 +501,6 @@ impl App {
             overview_heatmap_selected_cost: 0.0,
             overview_heatmap_selected_active_ms: 0,
             overview_heatmap_flash_time: None,
-            overview_heatmap_flash_state: true,
 
             modal: SessionModal::new(),
 
@@ -1234,19 +1232,9 @@ impl App {
                 // should_redraw is now set in refresh_stats method itself
             }
 
-            // Ensure we always redraw if needed, including after window resize
-            // Optimized flicker: only redraw when state changes (every 250ms)
-            let needs_flicker_redraw = if let Some(flash_time) = self.overview_heatmap_flash_time {
-                let flash_on = (flash_time.elapsed().as_millis() / 250) % 2 == 0;
-                if flash_on != self.overview_heatmap_flash_state {
-                    self.overview_heatmap_flash_state = flash_on;
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
+            // Smooth pulse animation: only redraw when heatmap is visible (Stats view)
+            let needs_flicker_redraw =
+                self.overview_heatmap_flash_time.is_some() && self.left_panel == LeftPanel::Stats;
 
             if self.should_redraw || needs_flicker_redraw {
                 terminal.draw(|frame| self.render(frame))?;
@@ -1777,11 +1765,8 @@ impl App {
                     }
                     Some("list") => {
                         if self.left_panel == LeftPanel::Stats {
-                            // TOP PROJECTS: Scroll only if active
-                            if self.focus == Focus::Right
-                                && self.right_panel == RightPanel::List
-                                && self.is_active
-                            {
+                            // TOP PROJECTS: Scroll only if focused
+                            if self.focus == Focus::Right && self.right_panel == RightPanel::List {
                                 if mouse.kind == MouseEventKind::ScrollUp {
                                     self.overview_project_scroll =
                                         self.overview_project_scroll.saturating_sub(1);
@@ -2610,11 +2595,11 @@ impl App {
                     .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .split(chunks[2]);
 
-                // Cache rects for mouse hit-testing
+                // Cache rects for mouse hit-testing (tools=left, list=right)
                 self.cached_rects.detail = Some(chunks[0]);
                 self.cached_rects.activity = Some(chunks[1]);
-                self.cached_rects.list = Some(bottom_chunks[0]);
-                self.cached_rects.tools = Some(bottom_chunks[1]);
+                self.cached_rects.tools = Some(bottom_chunks[0]);
+                self.cached_rects.list = Some(bottom_chunks[1]);
 
                 let overview_hl = is_focused && self.right_panel == RightPanel::Detail;
                 self.render_overview_panel(frame, chunks[0], border_style, overview_hl);
@@ -2622,28 +2607,28 @@ impl App {
                 let activity_hl = is_focused && self.right_panel == RightPanel::Activity;
                 self.render_activity_heatmap(frame, chunks[1], border_style, activity_hl);
 
-                let projects_hl = is_focused && self.right_panel == RightPanel::List;
-                self.render_projects_panel(
-                    frame,
-                    bottom_chunks[0],
-                    if projects_hl {
-                        border_style
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
-                    projects_hl,
-                );
-
                 let tools_hl = is_focused && self.right_panel == RightPanel::Tools;
                 self.render_overview_tools_panel(
                     frame,
-                    bottom_chunks[1],
+                    bottom_chunks[0],
                     if tools_hl {
                         border_style
                     } else {
                         Style::default().fg(Color::DarkGray)
                     },
                     tools_hl,
+                );
+
+                let projects_hl = is_focused && self.right_panel == RightPanel::List;
+                self.render_projects_panel(
+                    frame,
+                    bottom_chunks[1],
+                    if projects_hl {
+                        border_style
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                    projects_hl,
                 );
             }
             LeftPanel::Days => {
@@ -3187,6 +3172,13 @@ impl App {
             ]));
         }
 
+        // Precompute pulse blend factor once (avoids per-cell trig)
+        let flash_blend = self.overview_heatmap_flash_time.map(|t| {
+            let ms = t.elapsed().as_millis() as f64;
+            // Smooth sine pulse: 600ms period, peaks at 40% white blend
+            (1.0 - (ms * std::f64::consts::TAU / 600.0).cos()) * 0.2
+        });
+
         // 7 day rows (show all labels)
         for d in 0..7usize {
             let mut spans: Vec<Span> = Vec::with_capacity(weeks + 2);
@@ -3231,15 +3223,15 @@ impl App {
                     }
                     Some(bg) => {
                         let style = if is_selected_cell {
-                            // Flicker effect: 500ms period (250ms on, 250ms off)
-                            let flash_on = self
-                                .overview_heatmap_flash_time
-                                .map(|t| (t.elapsed().as_millis() / 250) % 2 == 0)
-                                .unwrap_or(true);
-                            if flash_on {
-                                Style::default().bg(bg)
+                            if let (Some(blend), Color::Rgb(r, g, b)) = (flash_blend, bg) {
+                                // Smooth sine pulse: blend toward white
+                                Style::default().bg(Color::Rgb(
+                                    (r as f64 + (255.0 - r as f64) * blend) as u8,
+                                    (g as f64 + (255.0 - g as f64) * blend) as u8,
+                                    (b as f64 + (255.0 - b as f64) * blend) as u8,
+                                ))
                             } else {
-                                Style::default().bg(Color::Rgb(30, 30, 35))
+                                Style::default().bg(bg)
                             }
                         } else {
                             Style::default().bg(bg)
@@ -3382,12 +3374,16 @@ impl App {
         frame.render_widget(block, area);
 
         if self.overview_projects.is_empty() {
-            frame.render_widget(
-                Paragraph::new("No project data")
-                    .style(Style::default().fg(Color::DarkGray))
-                    .alignment(Alignment::Center),
-                inner,
-            );
+            let placeholder = "░".repeat(inner.width.saturating_sub(2) as usize);
+            let lines: Vec<Line> = (0..inner.height)
+                .map(|_| {
+                    Line::styled(
+                        placeholder.clone(),
+                        Style::default().fg(Color::Rgb(30, 30, 40)),
+                    )
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
             return;
         }
 
@@ -3397,14 +3393,14 @@ impl App {
             .overview_project_scroll
             .min(self.overview_project_max_scroll);
 
-        let max_count = self
-            .overview_projects
-            .first()
-            .map(|(_, c)| *c)
-            .unwrap_or(1)
-            .max(1);
-        let name_width = 14.min(inner.width.saturating_sub(16) as usize).max(6);
-        let bar_max = inner.width.saturating_sub((name_width + 12) as u16) as usize;
+        let total_count: u64 = self.overview_projects.iter().map(|(_, c)| *c as u64).sum();
+        // Fixed layout: " X. " (5) + "name " (15) + bar + " XXXXX" (6) = 26
+        let name_width = 14;
+        let bar_max = inner.width.saturating_sub(26) as usize;
+
+        // Solid bar colors - Cyan for TOP PROJECTS
+        let bar_color = Color::Cyan;
+        let empty_color = Color::Rgb(38, 42, 50);
 
         let lines: Vec<Line> = self
             .overview_projects
@@ -3413,9 +3409,17 @@ impl App {
             .skip(self.overview_project_scroll)
             .take(visible)
             .map(|(i, (name, count))| {
-                let bar_len = (*count as f64 / max_count as f64 * bar_max as f64) as usize;
-                let filled = "█".repeat(bar_len);
-                let empty = "░".repeat(bar_max.saturating_sub(bar_len));
+                let pct = if total_count > 0 {
+                    *count as f64 / total_count as f64
+                } else {
+                    0.0
+                };
+                let bar_len = (pct * bar_max as f64) as usize;
+
+                // Optimized: use single spans for filled and empty portions
+                let filled_str: String = " ".repeat(bar_len);
+                let empty_str: String = " ".repeat(bar_max.saturating_sub(bar_len));
+
                 Line::from(vec![
                     Span::styled(
                         format!(" {:>2}. ", i + 1),
@@ -3424,15 +3428,15 @@ impl App {
                     Span::styled(
                         format!(
                             "{:<width$} ",
-                            safe_truncate_plain(name, name_width),
+                            truncate_with_ellipsis(name, name_width),
                             width = name_width
                         ),
                         Style::default().fg(Color::White),
                     ),
-                    Span::styled(filled, Style::default().fg(Color::Cyan)),
-                    Span::styled(empty, Style::default().fg(Color::Rgb(40, 40, 50))),
+                    Span::styled(filled_str, Style::default().bg(bar_color)),
+                    Span::styled(empty_str, Style::default().bg(empty_color)),
                     Span::styled(
-                        format!(" {:>3}", count),
+                        format!(" {:>5}", count),
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
@@ -3484,12 +3488,16 @@ impl App {
         frame.render_widget(block, area);
 
         if self.tool_usage.is_empty() {
-            frame.render_widget(
-                Paragraph::new("No tool data")
-                    .style(Style::default().fg(Color::DarkGray))
-                    .alignment(Alignment::Center),
-                inner,
-            );
+            let placeholder = "░".repeat(inner.width.saturating_sub(2) as usize);
+            let lines: Vec<Line> = (0..inner.height)
+                .map(|_| {
+                    Line::styled(
+                        placeholder.clone(),
+                        Style::default().fg(Color::Rgb(30, 30, 40)),
+                    )
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
             return;
         }
 
@@ -3498,8 +3506,13 @@ impl App {
         self.overview_tool_scroll = self.overview_tool_scroll.min(self.overview_tool_max_scroll);
 
         let total_count: u64 = self.tool_usage.iter().map(|t| t.count).sum();
-        let name_w = 12.min(inner.width.saturating_sub(14) as usize).max(4);
-        let bar_max = inner.width.saturating_sub((name_w + 14) as u16) as usize;
+        // Fixed layout: " name " (16) + bar + " XXXXX" (6) = 22
+        let name_w = 14;
+        let bar_max = inner.width.saturating_sub(22) as usize;
+
+        // Soft pink color (not bright magenta)
+        let bar_color = Color::Rgb(220, 100, 160);
+        let empty_color = Color::Rgb(38, 42, 50);
 
         let lines: Vec<Line> = self
             .tool_usage
@@ -3513,23 +3526,26 @@ impl App {
                     0.0
                 };
                 let bar_len = (pct * bar_max as f64) as usize;
-                let filled = "█".repeat(bar_len);
-                let empty = "░".repeat(bar_max.saturating_sub(bar_len));
+
+                // Optimized: use single spans for filled and empty portions
+                let filled_str: String = " ".repeat(bar_len);
+                let empty_str: String = " ".repeat(bar_max.saturating_sub(bar_len));
+
                 Line::from(vec![
                     Span::styled(
                         format!(
-                            " {:>width$} ",
+                            " {:<width$} ",
                             truncate_with_ellipsis(&tool.name, name_w),
                             width = name_w
                         ),
                         Style::default().fg(Color::White),
                     ),
-                    Span::styled(filled, Style::default().fg(Color::Magenta)),
-                    Span::styled(empty, Style::default().fg(Color::Rgb(40, 40, 50))),
+                    Span::styled(filled_str, Style::default().bg(bar_color)),
+                    Span::styled(empty_str, Style::default().bg(empty_color)),
                     Span::styled(
                         format!(" {:>5}", tool.count),
                         Style::default()
-                            .fg(Color::Magenta)
+                            .fg(Color::Rgb(220, 100, 160))
                             .add_modifier(Modifier::BOLD),
                     ),
                 ])
@@ -3837,30 +3853,38 @@ impl App {
                 let mut tools: Vec<_> = model.tools.iter().collect();
                 tools.sort_unstable_by(|a, b| b.1.cmp(a.1));
                 let total: u64 = tools.iter().map(|(_, c)| **c).sum();
-                let bar_max = tools_inner.width.saturating_sub(16) as u64;
+                // Fixed layout: 14 (name) + bar + 6 (count)
+                // Fixed layout: " name " (16) + bar + " XXXXX" (6) = 22
+                let bar_max = tools_inner.width.saturating_sub(22) as usize;
 
                 self.model_tool_max_scroll =
                     (tools.len().saturating_sub(tools_inner.height as usize)) as u16;
                 self.model_tool_scroll = self.model_tool_scroll.min(self.model_tool_max_scroll);
 
-                // Optimized: pre-allocate with known capacity for lines
+                // Soft pink color (not bright magenta)
+                let bar_color = Color::Rgb(220, 100, 160);
+                let empty_color = Color::Rgb(38, 42, 50);
+
+                // Optimized: use single spans for filled and empty portions
                 let lines: Vec<Line> = tools
                     .into_iter()
                     .map(|(name, count)| {
                         let width = ((*count as f64 / total as f64) * bar_max as f64) as usize;
-                        let filled = "█".repeat(width);
-                        let empty = "░".repeat(bar_max as usize - width);
+
+                        let filled_str: String = " ".repeat(width);
+                        let empty_str: String = " ".repeat(bar_max.saturating_sub(width));
+
                         Line::from(vec![
                             Span::styled(
-                                format!("{:<12}", safe_truncate_plain(name, 12)),
+                                format!(" {:<14} ", truncate_with_ellipsis(name, 14)),
                                 Style::default().fg(Color::White),
                             ),
-                            Span::styled(filled, Style::default().fg(Color::Magenta)),
-                            Span::styled(empty, Style::default().fg(Color::DarkGray)),
+                            Span::styled(filled_str, Style::default().bg(bar_color)),
+                            Span::styled(empty_str, Style::default().bg(empty_color)),
                             Span::styled(
-                                format!("{:>3}", count),
+                                format!(" {:>5}", count),
                                 Style::default()
-                                    .fg(Color::Yellow)
+                                    .fg(Color::Rgb(220, 100, 160))
                                     .add_modifier(Modifier::BOLD),
                             ),
                         ])
@@ -3871,10 +3895,19 @@ impl App {
                     tools_inner,
                 );
             } else {
-                let empty = Paragraph::new("No tools used")
-                    .style(Style::default().fg(Color::DarkGray))
-                    .alignment(Alignment::Center);
-                frame.render_widget(empty, tools_inner);
+                let placeholder = "░".repeat(tools_inner.width.saturating_sub(2) as usize);
+                let lines: Vec<Line> = (0..tools_inner.height)
+                    .map(|_| {
+                        Line::styled(
+                            placeholder.clone(),
+                            Style::default().fg(Color::Rgb(30, 30, 40)),
+                        )
+                    })
+                    .collect();
+                frame.render_widget(
+                    Paragraph::new(lines).alignment(Alignment::Center),
+                    tools_inner,
+                );
             }
         }
 
@@ -3945,19 +3978,22 @@ impl App {
                 } else {
                     0
                 };
-                let filled = "█".repeat(bar_width.min(bar_max_width));
-                let empty = "░".repeat(bar_max_width.saturating_sub(bar_width));
+
+                // Build continuous bar with background colors
+                let bar_color = if is_selected {
+                    Color::Rgb(0, 200, 200) // Cyan
+                } else {
+                    Color::Rgb(80, 80, 100) // Dim gray
+                };
+                let empty_color = Color::Rgb(38, 42, 50);
+
+                // Optimized: use single spans for filled and empty portions
+                let filled_str: String = " ".repeat(bar_width.min(bar_max_width));
+                let empty_str: String = " ".repeat(bar_max_width.saturating_sub(bar_width));
 
                 Line::from(vec![
-                    Span::styled(
-                        filled,
-                        Style::default().fg(if is_selected {
-                            Color::Cyan
-                        } else {
-                            Color::DarkGray
-                        }),
-                    ),
-                    Span::styled(empty, Style::default().fg(Color::DarkGray)),
+                    Span::styled(filled_str, Style::default().bg(bar_color)),
+                    Span::styled(empty_str, Style::default().bg(empty_color)),
                     Span::styled(
                         suffix,
                         Style::default()
