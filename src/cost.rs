@@ -1,6 +1,7 @@
 //! OpenRouter pricing lookup for cost estimation.
 
 use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -15,6 +16,11 @@ pub struct ModelPricing {
 }
 
 static PRICING_CACHE: OnceLock<FxHashMap<String, ModelPricing>> = OnceLock::new();
+
+// Thread-local scratch buffer for fuzzy matching to avoid allocations per call
+thread_local! {
+    static FUZZY_SCRATCH: RefCell<Vec<u16>> = RefCell::new(Vec::with_capacity(256));
+}
 
 /// Initialize pricing cache (call once at startup).
 pub fn init_pricing() {
@@ -94,7 +100,7 @@ fn lookup_in_map(map: &FxHashMap<String, ModelPricing>, model_name: &str) -> Opt
     None
 }
 
-/// Estimate cost from model name and token usage.
+/// Estimate cost from model name and token usage
 pub fn estimate_cost(model_name: &str, tokens: &crate::stats::Tokens) -> Option<f64> {
     let p = lookup_pricing(model_name)?;
     Some(
@@ -106,14 +112,14 @@ pub fn estimate_cost(model_name: &str, tokens: &crate::stats::Tokens) -> Option<
     )
 }
 
-/// Normalize slug for comparison.
+/// Normalize slug for comparison
 fn normalize(slug: &str) -> String {
     slug.chars()
         .filter(|c| *c != '-' && *c != '.' && *c != ':')
         .collect()
 }
 
-/// Fuzzy match score using LCS.
+/// Fuzzy match score using LCS with scratch buffer
 fn fuzzy_score(a: &str, b: &str) -> usize {
     if a.is_empty() || b.is_empty() {
         return 0;
@@ -125,23 +131,41 @@ fn fuzzy_score(a: &str, b: &str) -> usize {
         return a.len().min(b.len()) * 2;
     }
 
-    // LCS on bytes
-    let a = a.as_bytes();
-    let b = b.as_bytes();
-    let mut prev = vec![0u16; b.len() + 1];
-    let mut curr = vec![0u16; b.len() + 1];
-    for &ac in a {
-        for (j, &bc) in b.iter().enumerate() {
-            curr[j + 1] = if ac == bc {
-                prev[j] + 1
-            } else {
-                prev[j + 1].max(curr[j])
-            };
+    // Use thread-local scratch buffer
+    FUZZY_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        let b_len = b.len() + 1;
+        let needed = b_len * 2;
+
+        // Ensure capacity
+        if scratch.len() < needed {
+            scratch.resize(needed, 0);
         }
-        std::mem::swap(&mut prev, &mut curr);
-        curr.iter_mut().for_each(|v| *v = 0);
-    }
-    prev[b.len()] as usize
+
+        // Split into prev and curr slices
+        let (prev, curr) = scratch.split_at_mut(b_len);
+
+        // Reset used portions
+        prev[..b_len].fill(0);
+        curr[..b_len].fill(0);
+
+        // LCS on bytes
+        let a = a.as_bytes();
+        let b = b.as_bytes();
+        for &ac in a {
+            for (j, &bc) in b.iter().enumerate() {
+                curr[j + 1] = if ac == bc {
+                    prev[j] + 1
+                } else {
+                    prev[j + 1].max(curr[j])
+                };
+            }
+            // Swap prev and curr by copying
+            prev[..b_len].copy_from_slice(&curr[..b_len]);
+            curr[..b_len].fill(0);
+        }
+        prev[b.len()] as usize
+    })
 }
 
 /// Strip trailing date suffix (MMDD or YYYYMMDD).
@@ -174,7 +198,6 @@ fn looks_like_yyyymmdd(tail: &str) -> bool {
     let dd: u32 = tail[6..8].parse().unwrap_or(0);
     (2020..=2100).contains(&yyyy) && (1..=12).contains(&mm) && (1..=31).contains(&dd)
 }
-
 
 /// Returns the path to the cache file.
 fn cache_path() -> PathBuf {

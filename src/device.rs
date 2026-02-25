@@ -16,7 +16,7 @@
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -189,7 +189,7 @@ fn probe_editor_clis() -> Option<String> {
 }
 
 /// Find the editor CLI binary. Check PATH first (instant), then scan server dir.
-fn find_editor_binary(name: &str, server_dir: &PathBuf) -> Option<PathBuf> {
+fn find_editor_binary(name: &str, server_dir: &Path) -> Option<PathBuf> {
     // Fast: check if it's in PATH
     if let Ok(output) = Command::new("which").arg(name).output() {
         if output.status.success() {

@@ -826,7 +826,7 @@ impl StatsCache {
             stats
                 .session_message_files
                 .entry(original_session_id.clone())
-                .or_insert_with(|| FxHashSet::default())
+                .or_default()
                 .insert(PathBuf::from(path));
         }
 

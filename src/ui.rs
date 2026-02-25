@@ -258,7 +258,7 @@ impl App {
             overview_heatmap_flash_time: None,
 
             modal: SessionModal::new(),
-            theme: Theme::default(),
+            theme: Theme,
 
             last_mouse_panel: None,
             last_session_click: None,
@@ -337,7 +337,7 @@ impl App {
             .selected()
             .and_then(|i| self.session_list.get(i))
             .map(|s| s.id.clone());
-        
+
         // Clear and rebuild session list from current data
         self.session_list.clear();
         if let Some(day) = self.selected_day() {
@@ -1046,10 +1046,11 @@ impl App {
                                 }
                                 _ => {}
                             },
-                            LeftPanel::Days => match self.right_panel {
-                                RightPanel::List => self.right_panel = RightPanel::Detail,
-                                _ => {}
-                            },
+                            LeftPanel::Days => {
+                                if self.right_panel == RightPanel::List {
+                                    self.right_panel = RightPanel::Detail;
+                                }
+                            }
                             LeftPanel::Models => match self.right_panel {
                                 RightPanel::List | RightPanel::Tools => {
                                     self.right_panel = RightPanel::Detail;
@@ -1132,14 +1133,16 @@ impl App {
                                 }
                                 _ => {}
                             },
-                            LeftPanel::Days => match self.right_panel {
-                                RightPanel::Detail => self.right_panel = RightPanel::List,
-                                _ => {}
-                            },
-                            LeftPanel::Models => match self.right_panel {
-                                RightPanel::Detail => self.right_panel = RightPanel::Tools,
-                                _ => {}
-                            },
+                            LeftPanel::Days => {
+                                if self.right_panel == RightPanel::Detail {
+                                    self.right_panel = RightPanel::List;
+                                }
+                            }
+                            LeftPanel::Models => {
+                                if self.right_panel == RightPanel::Detail {
+                                    self.right_panel = RightPanel::Tools;
+                                }
+                            }
                         },
                     }
                 }
@@ -1255,12 +1258,11 @@ impl App {
                             }
                         }
                         LeftPanel::Models => {
-                            if self.right_panel == RightPanel::List {
-                                if !self.model_usage.is_empty() {
-                                    let last = self.model_usage.len() - 1;
-                                    self.model_list_state.select(Some(last));
-                                    self.selected_model_index = Some(last);
-                                }
+                            if self.right_panel == RightPanel::List && !self.model_usage.is_empty()
+                            {
+                                let last = self.model_usage.len() - 1;
+                                self.model_list_state.select(Some(last));
+                                self.selected_model_index = Some(last);
                             }
                         }
                         _ => {}
@@ -1377,13 +1379,14 @@ impl App {
                     }
                     Some("detail") => {
                         // Only scroll if the detail panel is currently focused
-                        if self.focus == Focus::Right && self.right_panel == RightPanel::Detail {
-                            if self.left_panel == LeftPanel::Days {
-                                if mouse.kind == MouseEventKind::ScrollUp {
-                                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
-                                } else if self.detail_scroll < self.detail_max_scroll {
-                                    self.detail_scroll += 1;
-                                }
+                        if self.focus == Focus::Right
+                            && self.right_panel == RightPanel::Detail
+                            && self.left_panel == LeftPanel::Days
+                        {
+                            if mouse.kind == MouseEventKind::ScrollUp {
+                                self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                            } else if self.detail_scroll < self.detail_max_scroll {
+                                self.detail_scroll += 1;
                             }
                         }
                         true
@@ -1399,13 +1402,10 @@ impl App {
                                 {
                                     self.overview_tool_scroll += 1;
                                 }
-                            } else {
-                                if mouse.kind == MouseEventKind::ScrollUp {
-                                    self.model_tool_scroll =
-                                        self.model_tool_scroll.saturating_sub(1);
-                                } else if self.model_tool_scroll < self.model_tool_max_scroll {
-                                    self.model_tool_scroll += 1;
-                                }
+                            } else if mouse.kind == MouseEventKind::ScrollUp {
+                                self.model_tool_scroll = self.model_tool_scroll.saturating_sub(1);
+                            } else if self.model_tool_scroll < self.model_tool_max_scroll {
+                                self.model_tool_scroll += 1;
                             }
                         }
                         true

@@ -20,7 +20,7 @@ static OPENCODE_DB_PATH: OnceLock<PathBuf> = OnceLock::new();
 static DB_MODE: OnceLock<bool> = OnceLock::new();
 
 thread_local! {
-    static DB_CONN: RefCell<Option<Connection>> = RefCell::new(None);
+    static DB_CONN: RefCell<Option<Connection>> = const { RefCell::new(None) };
 }
 
 // ============================================================================
@@ -828,7 +828,7 @@ pub fn format_number_full(value: u64) -> String {
     let mut result = String::with_capacity(len + (len - 1) / 3);
     let bytes = s.as_bytes();
     for (i, &byte) in bytes.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
+        if i > 0 && (len - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(byte as char);
@@ -1348,8 +1348,8 @@ pub fn collect_stats() -> Stats {
     // Step 3: Build FullMessageData with cached parts
     let mut processed_data: Vec<FullMessageData> = raw_messages
         .into_iter()
-        .filter_map(|(msg, path, message_id)| {
-            let parts = msg
+        .map(|(msg, path, message_id)| {
+            let parts: Vec<PartData> = msg
                 .id
                 .as_ref()
                 .and_then(|id| {
@@ -1391,14 +1391,14 @@ pub fn collect_stats() -> Stats {
                 })
                 .unwrap_or_default();
 
-            Some(FullMessageData {
+            FullMessageData {
                 msg,
                 tools,
                 parts,
                 path,
                 message_id,
                 cumulative_diffs,
-            })
+            }
         })
         .collect();
 
@@ -1796,8 +1796,7 @@ pub fn collect_stats() -> Stats {
     }
 
     // Compute merged active durations from collected intervals
-    // Merge overlapping intervals to get true wall-clock time (handles parallel sub-agents)
-    fn merge_intervals_duration(intervals: &mut Vec<(i64, i64)>) -> i64 {
+    fn merge_intervals_duration(intervals: &mut [(i64, i64)]) -> i64 {
         if intervals.is_empty() {
             return 0;
         }
@@ -2698,7 +2697,7 @@ fn json_num(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::Array(arr) => {
-            let nums: Vec<String> = arr.iter().map(|x| json_num(x)).collect();
+            let nums: Vec<String> = arr.iter().map(json_num).collect();
             nums.join(", ")
         }
         _ => v.to_string(),
@@ -2868,18 +2867,14 @@ fn match_tool_calls_with_diffs(parts: &mut [MessageContent], incremental: &[File
                 let fp_name = fp_str.rsplit('/').next().unwrap_or(fp_str);
                 // Get last 2 path components without Vec allocation
                 let mut fp_parts: [&str; 2] = ["", ""];
-                let mut fp_idx = 0;
-                for seg in fp_str.rsplit('/').take(2) {
+                for (fp_idx, seg) in fp_str.rsplit('/').take(2).enumerate() {
                     fp_parts[1 - fp_idx] = seg;
-                    fp_idx += 1;
                 }
                 for d in incremental {
                     let d_path_str = &d.path;
                     let mut d_parts: [&str; 2] = ["", ""];
-                    let mut d_idx = 0;
-                    for seg in d_path_str.rsplit('/').take(2) {
+                    for (d_idx, seg) in d_path_str.rsplit('/').take(2).enumerate() {
                         d_parts[1 - d_idx] = seg;
-                        d_idx += 1;
                     }
                     if fp_parts == d_parts {
                         tc.additions = Some(d.additions);

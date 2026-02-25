@@ -47,6 +47,8 @@ pub struct SessionModal {
     expanded_info_agents: FxHashSet<Box<str>>,
     expanded_info_models: FxHashSet<Box<str>>,
     info_click_targets: Vec<(u16, InfoClickTarget)>,
+    cached_chat_blocks: Vec<ChatBlock>,
+    cached_msg_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +62,12 @@ pub enum ChatClickTarget {
 pub enum InfoClickTarget {
     Agent(Box<str>),
     Model(Box<str>),
+}
+
+#[derive(Debug, Clone)]
+pub enum ChatBlock {
+    Single(usize),
+    SubagentGroup(Vec<(Box<str>, Vec<usize>)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +90,8 @@ impl SessionModal {
         self.expanded_info_agents.clear();
         self.expanded_info_models.clear();
         self.info_click_targets.clear();
+        self.cached_chat_blocks.clear();
+        self.cached_msg_count = 0;
     }
 
     #[inline]
@@ -103,6 +113,8 @@ impl SessionModal {
             expanded_info_agents: FxHashSet::default(),
             expanded_info_models: FxHashSet::default(),
             info_click_targets: Vec::new(),
+            cached_chat_blocks: Vec::new(),
+            cached_msg_count: 0,
         }
     }
 
@@ -251,8 +263,7 @@ impl SessionModal {
                 if Self::contains_point(self.cached_rects.info, x, y) {
                     self.selected_column = ModalColumn::Info;
                     if let Some(info_rect) = self.cached_rects.info {
-                        let content_y =
-                            (y.saturating_sub(info_rect.y + 1)) as u16 + self.info_scroll;
+                        let content_y = y.saturating_sub(info_rect.y + 1) + self.info_scroll;
                         if let Ok(pos) = self
                             .info_click_targets
                             .binary_search_by_key(&content_y, |(line_idx, _)| *line_idx)
@@ -279,8 +290,7 @@ impl SessionModal {
                 if Self::contains_point(self.cached_rects.chat, x, y) {
                     self.selected_column = ModalColumn::Chat;
                     if let Some(chat_rect) = self.cached_rects.chat {
-                        let content_y =
-                            (y.saturating_sub(chat_rect.y + 1)) as u16 + self.chat_scroll;
+                        let content_y = y.saturating_sub(chat_rect.y + 1) + self.chat_scroll;
                         // Binary search since targets are sorted by line index
                         if let Ok(pos) = self
                             .chat_click_targets
@@ -842,7 +852,7 @@ impl SessionModal {
                 .map(|f| f.path.chars().count())
                 .max()
                 .unwrap_or(0);
-            let path_display_width = longest_path.max(8).min(35).min(max_avail);
+            let path_display_width = longest_path.clamp(8, 35).min(max_avail);
             let show_diffs = (area.width.saturating_sub(2) as usize) >= needed_width;
             for f in &session.file_diffs {
                 let status_text = match f.status.as_ref() {
@@ -1001,50 +1011,49 @@ impl SessionModal {
         let inner_w = area.width.saturating_sub(2) as usize;
         let box_w = inner_w.saturating_sub(2);
 
-        // ── Phase 1: group messages into blocks ──
-        enum ChatBlock {
-            Single(usize),
-            SubagentGroup(Vec<(Box<str>, Vec<usize>)>),
-        }
+        // ── Phase 1: use cached blocks or rebuild if messages changed ──
         let msgs = &*self.chat_messages;
-        let mut blocks: Vec<ChatBlock> = Vec::with_capacity(msgs.len());
-        let mut i = 0;
-        while i < msgs.len() {
-            if msgs[i].is_subagent {
-                let start = i;
-                while i < msgs.len() && msgs[i].is_subagent {
+        if self.cached_chat_blocks.is_empty() || self.cached_msg_count != msgs.len() {
+            self.cached_chat_blocks.clear();
+            self.cached_msg_count = msgs.len();
+            let mut i = 0;
+            while i < msgs.len() {
+                if msgs[i].is_subagent {
+                    let start = i;
+                    while i < msgs.len() && msgs[i].is_subagent {
+                        i += 1;
+                    }
+                    let mut agent_order: Vec<Box<str>> = Vec::with_capacity(4);
+                    let mut agent_msgs: FxHashMap<Box<str>, Vec<usize>> = FxHashMap::default();
+                    for (idx, msg) in msgs.iter().enumerate().take(i).skip(start) {
+                        let name: Box<str> =
+                            msg.agent_label.clone().unwrap_or_else(|| "subagent".into());
+                        if let Some(indices) = agent_msgs.get_mut(&name) {
+                            indices.push(idx);
+                        } else {
+                            agent_order.push(name.clone());
+                            agent_msgs.insert(name, vec![idx]);
+                        }
+                    }
+                    let groups: Vec<(Box<str>, Vec<usize>)> = agent_order
+                        .into_iter()
+                        .map(|n| (n.clone(), agent_msgs.remove(&n).unwrap_or_default()))
+                        .collect();
+                    self.cached_chat_blocks
+                        .push(ChatBlock::SubagentGroup(groups));
+                } else {
+                    self.cached_chat_blocks.push(ChatBlock::Single(i));
                     i += 1;
                 }
-                let mut agent_order: Vec<Box<str>> = Vec::with_capacity(4);
-                let mut agent_msgs: FxHashMap<Box<str>, Vec<usize>> = FxHashMap::default();
-                for idx in start..i {
-                    let name: Box<str> = msgs[idx]
-                        .agent_label
-                        .clone()
-                        .unwrap_or_else(|| "subagent".into());
-                    if let Some(indices) = agent_msgs.get_mut(&name) {
-                        indices.push(idx);
-                    } else {
-                        agent_order.push(name.clone());
-                        agent_msgs.insert(name, vec![idx]);
-                    }
-                }
-                let groups: Vec<(Box<str>, Vec<usize>)> = agent_order
-                    .into_iter()
-                    .map(|n| (n.clone(), agent_msgs.remove(&n).unwrap_or_default()))
-                    .collect();
-                blocks.push(ChatBlock::SubagentGroup(groups));
-            } else {
-                blocks.push(ChatBlock::Single(i));
-                i += 1;
             }
         }
+        let blocks = &self.cached_chat_blocks;
 
         // ── Phase 2: render blocks ──
         self.chat_click_targets.clear();
         let mut user_count = 0usize;
         let mut agent_count = 0usize;
-        for block in &blocks {
+        for block in blocks {
             match block {
                 ChatBlock::Single(idx) => {
                     let msg = &msgs[*idx];
@@ -1155,7 +1164,7 @@ impl SessionModal {
                                 }
                             }
                             let wrap_w = card_w.saturating_sub(8);
-                            
+
                             if !all_task_text.is_empty() {
                                 for (i, line) in
                                     wrap_text_plain(&all_task_text, wrap_w).iter().enumerate()
@@ -1447,7 +1456,7 @@ fn render_tool_stats_box<'a>(
     ]));
 
     let mut tools: Vec<(&String, &ToolStatsEntry)> = tool_stats.iter().collect();
-    tools.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(&b.0)));
+    tools.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
 
     let tools_len = tools.len();
     for (idx, (name, entry)) in tools.iter().enumerate() {
@@ -1641,7 +1650,7 @@ fn tool_invocation_secondary_detail(
             let has_range_params = inv
                 .input
                 .as_deref()
-                .map_or(false, |inp| inp.contains("offset") || inp.contains("limit"));
+                .is_some_and(|inp| inp.contains("offset") || inp.contains("limit"));
             if !has_range_params {
                 return Some(format!(
                     "{} (full file)",
@@ -1686,8 +1695,8 @@ fn clean_text_with_breaks(text: &str) -> String {
             }
             if j + 1 < chars.len() {
                 // Add the **title** and a newline after
-                for k in i..=j + 1 {
-                    result.push(chars[k]);
+                for ch in &chars[i..=j + 1] {
+                    result.push(*ch);
                 }
                 // Check if next char is not already newline
                 if j + 2 < chars.len() && !chars[j + 2].is_whitespace() {
@@ -1790,24 +1799,22 @@ fn render_user_box<'a>(
             Span::styled(" │", Style::default().fg(border_color)),
             Span::styled("  (empty)", Style::default().fg(colors.text_muted)),
         ]));
+    } else if is_expanded {
+        for line in wrap_text_plain(&cleaned, content_w) {
+            lines.push(Line::from(vec![
+                Span::styled(" │", Style::default().fg(border_color)),
+                Span::raw("  "),
+                Span::styled(line, Style::default().fg(colors.text_primary)),
+            ]));
+        }
     } else {
-        if is_expanded {
-            for line in wrap_text_plain(&cleaned, content_w) {
-                lines.push(Line::from(vec![
-                    Span::styled(" │", Style::default().fg(border_color)),
-                    Span::raw("  "),
-                    Span::styled(line, Style::default().fg(colors.text_primary)),
-                ]));
-            }
-        } else {
-            let truncated = truncate_text(&cleaned, 300);
-            for line in wrap_text_plain(&truncated, content_w) {
-                lines.push(Line::from(vec![
-                    Span::styled(" │", Style::default().fg(border_color)),
-                    Span::raw("  "),
-                    Span::styled(line, Style::default().fg(colors.text_primary)),
-                ]));
-            }
+        let truncated = truncate_text(&cleaned, 300);
+        for line in wrap_text_plain(&truncated, content_w) {
+            lines.push(Line::from(vec![
+                Span::styled(" │", Style::default().fg(border_color)),
+                Span::raw("  "),
+                Span::styled(line, Style::default().fg(colors.text_primary)),
+            ]));
         }
     }
     lines.push(Line::from(vec![
@@ -2191,9 +2198,8 @@ fn extract_json_field(input: &str, field: &str) -> Option<String> {
     // skip `: ` or `:`
     let after_colon = after_key.trim_start().strip_prefix(':')?;
     let trimmed = after_colon.trim_start();
-    if trimmed.starts_with('"') {
+    if let Some(content) = trimmed.strip_prefix('"') {
         // String value — find closing quote (handle escaped quotes)
-        let content = &trimmed[1..];
         let mut end = 0;
         let mut escaped = false;
         for ch in content.chars() {
@@ -2214,9 +2220,7 @@ fn extract_json_field(input: &str, field: &str) -> Option<String> {
         Some(inner.to_string())
     } else {
         // Number or other
-        let end = trimmed
-            .find(|c: char| c == ',' || c == '}' || c == '\n')
-            .unwrap_or(trimmed.len());
+        let end = trimmed.find(['}', ',', '\n']).unwrap_or(trimmed.len());
         Some(trimmed[..end].trim().to_string())
     }
 }
