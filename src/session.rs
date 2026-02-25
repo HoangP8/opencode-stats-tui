@@ -125,8 +125,9 @@ impl SessionModal {
         session_stat: &crate::stats::SessionStat,
         files: Option<&[std::path::PathBuf]>,
         day_filter: Option<&str>,
+        parent_map: &FxHashMap<Box<str>, Box<str>>,
     ) {
-        let details = load_session_details(session_id, files, day_filter);
+        let details = load_session_details(session_id, files, day_filter, parent_map);
         self.session_details = Some(details);
         self.current_session = Some(session_stat.clone());
         self.chat_messages = chat_messages;

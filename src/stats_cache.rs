@@ -812,7 +812,7 @@ impl StatsCache {
             }
         } else {
             stats.totals.messages += 1;
-            if is_user {
+            if is_user && !is_subagent_msg {
                 stats.totals.prompts += 1;
             }
         }

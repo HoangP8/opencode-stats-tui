@@ -479,6 +479,7 @@ impl App {
                 &session_stat,
                 Some(&files_vec),
                 current_day.as_deref(),
+                &self.parent_map,
             );
             cached.total_lines
         } else {
@@ -546,6 +547,7 @@ impl App {
                 &session_stat,
                 Some(&files_vec),
                 current_day.as_deref(),
+                &self.parent_map,
             );
 
             total_lines
@@ -807,6 +809,7 @@ impl App {
                     session_id,
                     Some(&files_vec),
                     current_day.as_deref(),
+                    &self.parent_map,
                 );
                 self.modal.session_details = Some(details);
             }

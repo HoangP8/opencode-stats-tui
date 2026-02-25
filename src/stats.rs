@@ -1587,7 +1587,7 @@ pub fn collect_stats() -> Stats {
             per_day.get_mut(&day).unwrap()
         };
         day_stat.messages += 1;
-        if is_user {
+        if is_user && !is_subagent_msg {
             day_stat.prompts += 1;
         }
         day_stat.cost += cost;
@@ -1631,7 +1631,7 @@ pub fn collect_stats() -> Stats {
         // Accumulate data for this day's session (separate from other days)
         let session_stat = Arc::make_mut(session_stat_arc);
         session_stat.messages += 1;
-        if is_user {
+        if is_user && !is_subagent_msg {
             session_stat.prompts += 1;
         }
         session_stat.cost += cost;
@@ -2230,10 +2230,12 @@ pub fn load_session_details(
     session_id: &str,
     files: Option<&[std::path::PathBuf]>,
     day_filter: Option<&str>,
+    parent_map: &FxHashMap<Box<str>, Box<str>>,
 ) -> SessionDetails {
     struct MsgStats {
         model: Box<str>,
         is_user: bool,
+        is_subagent: bool,
         tokens: Tokens,
         cost: f64,
     }
@@ -2253,7 +2255,7 @@ pub fn load_session_details(
                 cost: 0.0,
             });
         entry.messages += 1;
-        if ms.is_user {
+        if ms.is_user && !ms.is_subagent {
             entry.prompts += 1;
         }
         entry.cost += ms.cost;
@@ -2348,6 +2350,10 @@ pub fn load_session_details(
             let mut tokens = Tokens::default();
             add_tokens(&mut tokens, &msg.tokens);
             let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
+            let is_subagent = msg
+                .session_id
+                .as_ref()
+                .is_some_and(|sid| parent_map.contains_key(sid.as_str()));
 
             // Estimate reasoning tokens from cached parts if tokens.reasoning is 0
             if tokens.reasoning == 0 && !is_user {
@@ -2369,6 +2375,7 @@ pub fn load_session_details(
             MsgStats {
                 model: model_id,
                 is_user,
+                is_subagent,
                 tokens,
                 cost,
             }
