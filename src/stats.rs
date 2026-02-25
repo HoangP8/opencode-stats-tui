@@ -1,27 +1,31 @@
-use fxhash::{FxHashMap, FxHashSet};
+//! Statistics collection from opencode storage.
+
 use rayon::prelude::*;
 use rusqlite::{params, Connection, OpenFlags};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-// Fast path constants for performance
-pub const MAX_MESSAGES_TO_LOAD: usize = 100;
 const MAX_CHARS_PER_TEXT_PART: usize = 2000;
+const DB_MESSAGE_PREFIX: &str = "db://message/";
 
 static HOME_DIR: OnceLock<String> = OnceLock::new();
 static OPENCODE_ROOT_PATH: OnceLock<PathBuf> = OnceLock::new();
 static OPENCODE_DB_PATH: OnceLock<PathBuf> = OnceLock::new();
 static DB_MODE: OnceLock<bool> = OnceLock::new();
-const DB_MESSAGE_PREFIX: &str = "db://message/";
+
 thread_local! {
     static DB_CONN: RefCell<Option<Connection>> = RefCell::new(None);
 }
+
+// ============================================================================
+// Path & Database Helpers
+// ============================================================================
 
 #[inline]
 fn get_home() -> &'static str {
@@ -108,85 +112,173 @@ pub(crate) fn load_message_from_path(path: &Path) -> Option<Message> {
                 .ok()
             })?;
 
-        // Keep original algorithm intact by adapting DB row shape
-        // to legacy JSON payload fields expected by Message struct.
-        let mut value: serde_json::Value = serde_json::from_str(&data).ok()?;
-        let obj = value.as_object_mut()?;
+        let mut msg: Message = serde_json::from_str(&data).ok()?;
 
-        obj.entry("id".to_string())
-            .or_insert_with(|| serde_json::Value::String(row_id));
-        obj.entry("sessionID".to_string())
-            .or_insert_with(|| serde_json::Value::String(row_session_id));
-
-        if !obj.contains_key("time") || obj.get("time").is_none_or(|v| !v.is_object()) {
-            obj.insert(
-                "time".to_string(),
-                serde_json::json!({ "created": row_time_created }),
-            );
-        } else if let Some(time_obj) = obj.get_mut("time").and_then(|v| v.as_object_mut()) {
-            time_obj
-                .entry("created".to_string())
-                .or_insert_with(|| serde_json::Value::from(row_time_created));
+        // Populate missing fields from DB row
+        if msg.id.is_none() || msg.id.as_ref().is_some_and(|id| id.0.is_empty()) {
+            msg.id = Some(LenientString(row_id));
+        }
+        if msg.session_id.is_none() || msg.session_id.as_ref().is_some_and(|s| s.0.is_empty()) {
+            msg.session_id = Some(LenientString(row_session_id));
+        }
+        if msg.time.is_none() {
+            msg.time = Some(TimeData {
+                created: Some(LenientI64(row_time_created)),
+                completed: None,
+            });
+        } else if msg.time.as_ref().is_some_and(|t| t.created.is_none()) {
+            if let Some(ref mut time) = msg.time {
+                time.created = Some(LenientI64(row_time_created));
+            }
         }
 
-        return serde_json::from_value(value).ok();
+        return Some(msg);
     }
 
     let bytes = fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-fn load_parts_for_message(message_id: &str, part_root: &Path) -> Vec<PartData> {
-    if is_db_mode() {
-        return with_opencode_db(|conn| {
-            let Ok(mut stmt) = conn.prepare_cached(
-                "SELECT data FROM part WHERE message_id = ?1 ORDER BY time_created ASC, id ASC",
-            ) else {
-                return Some(Vec::new());
-            };
-            let rows = stmt
-                .query_map(params![message_id], |r| r.get::<_, String>(0))
-                .ok();
-            let Some(rows) = rows else {
-                return Some(Vec::new());
-            };
-            Some(
-                rows.filter_map(|row| row.ok())
-                    .filter_map(|data| serde_json::from_str::<PartData>(&data).ok())
-                    .collect(),
-            )
-        })
-        .unwrap_or_default();
-    }
+// ============================================================================
+// Batch Part Loading
+// ============================================================================
 
-    let mut parts = Vec::new();
-    if let Ok(entries) = fs::read_dir(part_root.join(message_id)) {
-        let mut p_files: Vec<_> = entries.flatten().collect();
-        p_files.sort_by_key(|e| e.path());
-        for e in p_files {
-            if let Ok(bytes) = fs::read(e.path()) {
-                if let Ok(part) = serde_json::from_slice::<PartData>(&bytes) {
-                    parts.push(part);
+/// Batch-load parts for multiple messages
+fn batch_load_parts_db(message_ids: &[&str]) -> FxHashMap<Box<str>, Vec<PartData>> {
+    if message_ids.is_empty() {
+        return FxHashMap::default();
+    }
+    with_opencode_db(|conn| {
+        let mut result: FxHashMap<Box<str>, Vec<PartData>> =
+            FxHashMap::with_capacity_and_hasher(message_ids.len(), Default::default());
+        for chunk in message_ids.chunks(500) {
+            let placeholders: String = (0..chunk.len())
+                .map(|i| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT message_id, data FROM part WHERE message_id IN ({}) \
+                 ORDER BY message_id, time_created ASC, id ASC",
+                placeholders
+            );
+            let Ok(mut stmt) = conn.prepare(&sql) else {
+                continue;
+            };
+            let params: Vec<&dyn rusqlite::types::ToSql> = chunk
+                .iter()
+                .map(|s| s as &dyn rusqlite::types::ToSql)
+                .collect();
+            let Ok(rows) = stmt.query_map(params.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            }) else {
+                continue;
+            };
+            // Track current message_id to avoid re-allocating Box<str> per row
+            let mut cur_id: Box<str> = "".into();
+            for row in rows.flatten() {
+                let part = match serde_json::from_str::<PartData>(&row.1) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                // Rows ordered by message_id: only allocate key when id changes
+                if *cur_id != row.0 {
+                    cur_id = row.0.into_boxed_str();
+                    result.entry(cur_id.clone()).or_default();
+                }
+                if let Some(vec) = result.get_mut(&cur_id) {
+                    vec.push(part);
                 }
             }
         }
-    }
-    parts
+        Some(result)
+    })
+    .unwrap_or_default()
 }
 
+/// Convert raw parts to MessageContent, skipping reasoning parts
+fn parts_to_content(parts: Vec<PartData>) -> Vec<MessageContent> {
+    let mut result = Vec::with_capacity(parts.len());
+    for part in parts {
+        if part.part_type.as_deref() == Some("reasoning") {
+            continue;
+        }
+        if part.thought.is_some() {
+            result.push(MessageContent::Thinking(()));
+        }
+        let mut current_text: Option<Box<str>> = None;
+        if let Some(t) = part.text {
+            let truncated = truncate_string(&t, MAX_CHARS_PER_TEXT_PART);
+            current_text = Some(truncated.clone());
+            result.push(MessageContent::Text(truncated));
+        }
+        if let Some(tool) = part.tool {
+            let state_input = part.state.as_ref().and_then(|s| s.input.as_ref());
+            let fp: Option<Box<str>> = state_input
+                .and_then(|i| infer_tool_file_path(&tool, i).map(|s| s.into_boxed_str()));
+            let tool_detail = state_input
+                .map(|i| build_tool_detail(&tool, i).into_boxed_str())
+                .or(current_text);
+            result.push(MessageContent::ToolCall(ToolCallInfo {
+                name: tool.into(),
+                file_path: fp,
+                input: tool_detail,
+                additions: None,
+                deletions: None,
+            }));
+        }
+    }
+    result
+}
+
+/// Batch-load parts for multiple messages from filesystem in parallel.
+fn batch_load_parts_fs(
+    message_ids: &[&str],
+    part_root: &Path,
+) -> FxHashMap<Box<str>, Vec<PartData>> {
+    if message_ids.is_empty() {
+        return FxHashMap::default();
+    }
+    message_ids
+        .par_iter()
+        .filter_map(|msg_id| {
+            let mut parts = Vec::with_capacity(8);
+            if let Ok(entries) = fs::read_dir(part_root.join(msg_id)) {
+                let mut p_files: Vec<_> = entries.flatten().collect();
+                p_files.sort_by_key(|e| e.path());
+                for e in p_files {
+                    if let Ok(bytes) = fs::read(e.path()) {
+                        if let Ok(part) = serde_json::from_slice::<PartData>(&bytes) {
+                            parts.push(part);
+                        }
+                    }
+                }
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some((msg_id.to_string().into_boxed_str(), parts))
+            }
+        })
+        .collect()
+}
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
 impl Totals {
+    #[inline]
     pub fn display_cost(&self) -> f64 {
         self.cost
     }
 }
 
 impl DayStat {
+    #[inline]
     pub fn display_cost(&self) -> f64 {
         self.cost
     }
 }
-
-impl ModelUsage {}
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct Tokens {
@@ -225,7 +317,6 @@ pub struct SessionStat {
     pub path_cwd: Box<str>,
     pub path_root: Box<str>,
     pub file_diffs: Vec<FileDiff>,
-    // Session continuation tracking
     pub original_session_id: Option<Box<str>>,
     pub first_created_date: Option<Box<str>>,
     pub is_continuation: bool,
@@ -260,11 +351,11 @@ impl SessionStat {
             last_activity: 0,
             path_cwd: String::new().into_boxed_str(),
             path_root: String::new().into_boxed_str(),
-            file_diffs: Vec::new(),
+            file_diffs: Vec::with_capacity(4),
             original_session_id: None,
             first_created_date: None,
             is_continuation: false,
-            agents: Vec::new(),
+            agents: Vec::with_capacity(2),
             active_duration_ms: 0,
         }
     }
@@ -281,7 +372,7 @@ pub struct DayStat {
     pub prompts: u64,
     pub tokens: Tokens,
     pub diffs: Diffs,
-    pub sessions: HashMap<String, Arc<SessionStat>>,
+    pub sessions: FxHashMap<String, Arc<SessionStat>>,
     pub cost: f64,
 }
 
@@ -292,7 +383,7 @@ impl Default for DayStat {
             prompts: 0,
             tokens: Tokens::default(),
             diffs: Diffs::default(),
-            sessions: HashMap::with_capacity(4),
+            sessions: FxHashMap::default(),
             cost: 0.0,
         }
     }
@@ -300,24 +391,24 @@ impl Default for DayStat {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Totals {
-    pub sessions: HashSet<Box<str>>,
+    pub sessions: FxHashSet<Box<str>>,
     pub messages: u64,
     pub prompts: u64,
     pub tokens: Tokens,
     pub diffs: Diffs,
-    pub tools: HashMap<Box<str>, u64>,
+    pub tools: FxHashMap<Box<str>, u64>,
     pub cost: f64,
 }
 
 impl Default for Totals {
     fn default() -> Self {
         Self {
-            sessions: HashSet::with_capacity(16),
+            sessions: FxHashSet::default(),
             messages: 0,
             prompts: 0,
             tokens: Tokens::default(),
             diffs: Diffs::default(),
-            tools: HashMap::with_capacity(16),
+            tools: FxHashMap::default(),
             cost: 0.0,
         }
     }
@@ -336,14 +427,11 @@ pub struct Stats {
 }
 
 /// Key for session-day lookups.
-/// Uses String for now to avoid complex Borrow implementation for (str, str).
 pub type SessDayKey = String;
 
 fn make_sess_day_key(session: &str, day: &str) -> SessDayKey {
     format!("{}|{}", session, day)
 }
-
-impl Stats {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelUsage {
@@ -352,10 +440,10 @@ pub struct ModelUsage {
     pub provider: Box<str>,
     pub display_name: Box<str>,
     pub messages: u64,
-    pub sessions: HashSet<Box<str>>,
+    pub sessions: FxHashSet<Box<str>>,
     pub tokens: Tokens,
-    pub tools: HashMap<Box<str>, u64>,
-    pub agents: HashMap<Box<str>, u64>,
+    pub tools: FxHashMap<Box<str>, u64>,
+    pub agents: FxHashMap<Box<str>, u64>,
     pub cost: f64,
 }
 
@@ -389,6 +477,10 @@ pub struct ChatMessage {
     pub is_subagent: bool,
     pub agent_label: Option<Box<str>>,
 }
+
+// ============================================================================
+// Lenient Type Wrappers
+// ============================================================================
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct LenientU64(pub u64);
@@ -477,7 +569,6 @@ pub(crate) struct TokensData {
 }
 
 // DiffItem and Summary are used to extract cumulative diff state from messages
-// for per-day breakdown (since session_diff only has final state)
 #[derive(Deserialize, Default, Clone)]
 pub(crate) struct DiffItem {
     pub(crate) file: Option<LenientString>,
@@ -648,7 +739,7 @@ struct SessionData {
     parent_id: Option<LenientString>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 pub(crate) struct ToolStateInput {
     #[serde(rename = "filePath")]
     pub(crate) file_path: Option<String>,
@@ -669,14 +760,15 @@ pub(crate) struct ToolStateInput {
     pub(crate) limit: Option<serde_json::Value>,
     pub(crate) offset: Option<serde_json::Value>,
     pub(crate) todos: Option<serde_json::Value>,
+    pub(crate) ids: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 pub(crate) struct ToolState {
     pub(crate) input: Option<ToolStateInput>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 pub(crate) struct PartData {
     #[serde(rename = "type")]
     pub(crate) part_type: Option<String>,
@@ -685,6 +777,10 @@ pub(crate) struct PartData {
     pub(crate) thought: Option<String>,
     pub(crate) state: Option<ToolState>,
 }
+
+// ============================================================================
+// Formatting Utilities
+// ============================================================================
 
 #[inline]
 pub fn format_active_duration(ms: i64) -> String {
@@ -709,7 +805,6 @@ pub fn format_active_duration(ms: i64) -> String {
 
 #[inline]
 pub fn format_number(value: u64) -> String {
-    // Optimized: use integer division for K case to avoid float conversion
     if value >= 1_000_000_000 {
         format!("{:.1}B", value as f64 / 1_000_000_000.0)
     } else if value >= 1_000_000 {
@@ -727,17 +822,11 @@ pub fn format_number(value: u64) -> String {
 pub fn format_number_full(value: u64) -> String {
     let s = value.to_string();
     let len = s.len();
-
-    // Fast path: numbers with 3 or fewer digits don't need commas
     if len <= 3 {
         return s;
     }
-
-    // Optimized: use byte operations since to_string() always produces ASCII
-    // and pre-allocate correct capacity to avoid reallocations
     let mut result = String::with_capacity(len + (len - 1) / 3);
     let bytes = s.as_bytes();
-
     for (i, &byte) in bytes.iter().enumerate() {
         if i > 0 && (len - i) % 3 == 0 {
             result.push(',');
@@ -777,18 +866,15 @@ pub fn get_day(ts: Option<i64>) -> String {
     }
 }
 
-/// Detect if a session is a continuation from a previous day
-/// Returns (original_session_id, first_created_date) if continuation detected
+/// Detect if a session is a continuation from a previous day.
 #[inline]
 fn detect_session_continuation(
     session_id: &str,
     current_day: &str,
     all_session_first_days: &FxHashMap<String, String>,
 ) -> (Option<Box<str>>, Option<Box<str>>) {
-    // Check if this session was first seen on a different day
     if let Some(first_day) = all_session_first_days.get(session_id) {
         if first_day != current_day {
-            // This is a continuation - session started on a different day
             return (
                 Some(session_id.to_string().into_boxed_str()),
                 Some(first_day.clone().into_boxed_str()),
@@ -1081,6 +1167,10 @@ pub(crate) fn load_session_diff_map() -> FxHashMap<String, Vec<FileDiff>> {
     out
 }
 
+// ============================================================================
+// Session Diff Loading
+// ============================================================================
+
 pub(crate) fn load_session_diff_totals(
     session_diff_map: &FxHashMap<String, Vec<FileDiff>>,
 ) -> FxHashMap<String, (u64, u64)> {
@@ -1093,8 +1183,6 @@ pub(crate) fn load_session_diff_totals(
         })
         .collect();
 
-    // In DB mode, many sessions only expose summary_additions/summary_deletions
-    // while summary_diffs may be empty. Fill missing totals from session table.
     if is_db_mode() {
         let db_rows: Vec<(String, i64, i64)> = with_opencode_db(|conn| {
             let Ok(mut stmt) = conn.prepare(
@@ -1125,8 +1213,7 @@ pub(crate) fn load_session_diff_totals(
     totals
 }
 
-/// Compute incremental diffs: current cumulative state minus previous cumulative state
-/// For each file in current, subtract the values from previous (if present)
+/// Compute incremental diffs: current minus previous cumulative state.
 #[inline]
 fn compute_incremental_diffs(current: &[FileDiff], previous: &[FileDiff]) -> Vec<FileDiff> {
     if previous.is_empty() {
@@ -1175,9 +1262,30 @@ fn compute_incremental_diffs(current: &[FileDiff], previous: &[FileDiff]) -> Vec
     result
 }
 
+// ============================================================================
+// Main Statistics Collection
+// ============================================================================
+
 pub fn collect_stats() -> Stats {
     let mut totals = Totals::default();
     let (session_titles, parent_map) = load_session_titles();
+
+    let mut resolved_parent_map: FxHashMap<Box<str>, Box<str>> =
+        FxHashMap::with_capacity_and_hasher(parent_map.len(), Default::default());
+    for child in parent_map.keys() {
+        let mut cur = child.clone();
+        let mut depth = 0;
+        while let Some(p) = parent_map.get(&cur) {
+            cur = p.clone();
+            depth += 1;
+            if depth > 20 {
+                break;
+            }
+        }
+        resolved_parent_map.insert(child.clone(), cur);
+    }
+    let parent_map = resolved_parent_map;
+
     let mut children_map: FxHashMap<Box<str>, Vec<Box<str>>> = FxHashMap::default();
     for (child, parent) in &parent_map {
         children_map
@@ -1185,6 +1293,7 @@ pub fn collect_stats() -> Stats {
             .or_default()
             .push(child.clone());
     }
+
     let session_diff_map = load_session_diff_map();
     let message_path = get_storage_path("message");
     let part_path_str = get_storage_path("part");
@@ -1199,43 +1308,62 @@ pub fn collect_stats() -> Stats {
         FxHashMap::with_capacity_and_hasher(128, Default::default());
     let mut processed_message_ids: FxHashSet<Box<str>> =
         FxHashSet::with_capacity_and_hasher(msg_files.len(), Default::default());
-    // Track first day each session was seen for continuation detection
     let mut session_first_days: FxHashMap<String, String> =
         FxHashMap::with_capacity_and_hasher(64, Default::default());
 
     struct FullMessageData {
         msg: Message,
         tools: Vec<Box<str>>,
+        parts: Vec<PartData>,
         path: std::path::PathBuf,
         message_id: Box<str>,
-        cumulative_diffs: Vec<FileDiff>, // Cumulative diff state from summary.diffs
+        cumulative_diffs: Vec<FileDiff>,
     }
 
-    let mut processed_data: Vec<FullMessageData> = msg_files
+    // Step 1: Load all messages in parallel
+    let raw_messages: Vec<(Message, std::path::PathBuf, Box<str>)> = msg_files
         .par_iter()
         .filter_map(|p| {
             let msg: Message = load_message_from_path(p)?;
-
             let message_id = match &msg.id {
                 Some(id) if !id.0.is_empty() => id.0.clone().into_boxed_str(),
                 _ => p.to_string_lossy().to_string().into_boxed_str(),
             };
+            Some((msg, p.clone(), message_id))
+        })
+        .collect();
 
-            let mut tools = Vec::new();
-            if let Some(id) = &msg.id {
-                let id_str = &id.0;
-                if !id_str.is_empty() {
-                    for part in load_parts_for_message(id_str, part_root) {
-                        if part.part_type.as_deref() == Some("tool") {
-                            if let Some(tool) = part.tool {
-                                tools.push(tool.into());
-                            }
-                        }
-                    }
-                }
-            }
+    // Step 2: Batch load ALL parts
+    let all_msg_ids: Vec<&str> = raw_messages
+        .iter()
+        .filter_map(|(msg, _, _)| msg.id.as_ref().map(|id| id.0.as_str()))
+        .filter(|id| !id.is_empty())
+        .collect();
+    let all_parts_map: FxHashMap<Box<str>, Vec<PartData>> = if is_db_mode() {
+        batch_load_parts_db(&all_msg_ids)
+    } else {
+        batch_load_parts_fs(&all_msg_ids, part_root)
+    };
 
-            // Extract cumulative diff state from message summary
+    // Step 3: Build FullMessageData with cached parts
+    let mut processed_data: Vec<FullMessageData> = raw_messages
+        .into_iter()
+        .filter_map(|(msg, path, message_id)| {
+            let parts = msg
+                .id
+                .as_ref()
+                .and_then(|id| {
+                    let key: Box<str> = id.0.as_str().into();
+                    all_parts_map.get(&key).cloned()
+                })
+                .unwrap_or_default();
+
+            let tools: Vec<Box<str>> = parts
+                .iter()
+                .filter(|p| p.part_type.as_deref() == Some("tool"))
+                .filter_map(|p| p.tool.as_ref().map(|t| t.as_str().into()))
+                .collect();
+
             let cumulative_diffs: Vec<FileDiff> = msg
                 .summary
                 .as_ref()
@@ -1266,7 +1394,8 @@ pub fn collect_stats() -> Stats {
             Some(FullMessageData {
                 msg,
                 tools,
-                path: p.clone(),
+                parts,
+                path,
                 message_id,
                 cumulative_diffs,
             })
@@ -1281,23 +1410,20 @@ pub fn collect_stats() -> Stats {
             .unwrap_or(0)
     });
 
-    // Track union of latest per-file cumulative diff state per session per day
-    // Key: SessDayKey { session, day } -> { file_path -> latest FileDiff seen that day }
+    // Track per-file cumulative diff state per session per day
     let mut session_day_union_diffs: FxHashMap<SessDayKey, FxHashMap<Box<str>, FileDiff>> =
         FxHashMap::with_capacity_and_hasher(64, Default::default());
 
     let mut last_ts = None;
     let mut last_day_str = String::new();
     let mut session_overall_start: FxHashMap<Box<str>, i64> = FxHashMap::default();
-    // Collect (created, completed) intervals per (effective_session_id, day) for merged duration
     let mut session_day_intervals: FxHashMap<SessDayKey, Vec<(i64, i64)>> =
         FxHashMap::with_capacity_and_hasher(64, Default::default());
-    // Collect (created, completed) intervals per (effective_session_id, day, agent_name)
     let mut agent_intervals: FxHashMap<String, Vec<(i64, i64)>> =
         FxHashMap::with_capacity_and_hasher(64, Default::default());
 
+    // Process all messages
     for data in processed_data {
-        // Skip duplicate messages (same message_id seen before)
         if !processed_message_ids.insert(data.message_id) {
             continue;
         }
@@ -1310,7 +1436,6 @@ pub fn collect_stats() -> Stats {
             .unwrap_or_default()
             .into();
 
-        // Resolve child session to parent
         let effective_session_id: Box<str> = parent_map
             .get(&session_id_boxed)
             .cloned()
@@ -1324,7 +1449,6 @@ pub fn collect_stats() -> Stats {
             .map(|a| a.0.clone().into_boxed_str())
             .unwrap_or_else(|| "unknown".into());
 
-        // Track message files by ORIGINAL session id
         if !session_id_boxed.is_empty() {
             session_message_files
                 .entry(session_id_boxed.to_string())
@@ -1341,13 +1465,13 @@ pub fn collect_stats() -> Stats {
             last_day_str = d.clone();
             d
         };
+
         let role = msg.role.as_ref().map(|s| s.0.as_str()).unwrap_or("");
         let is_user = role == "user";
         let is_assistant = role == "assistant";
         let model_id = get_model_id(msg);
         let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
 
-        // Compute tokens for agent tracking
         let mut tokens_from_msg = if let Some(t) = &msg.tokens {
             Tokens {
                 input: t.input.map(|v| *v).unwrap_or(0),
@@ -1368,23 +1492,20 @@ pub fn collect_stats() -> Stats {
             Tokens::default()
         };
 
-        // If reasoning tokens are 0, estimate from reasoning parts text content
-        // (some providers store reasoning content in parts, not in tokens.reasoning field)
+        // Estimate reasoning tokens from parts if not provided
         if tokens_from_msg.reasoning == 0 && is_assistant {
-            if let Some(msg_id) = msg.id.as_ref() {
-                let parts = load_parts_for_message(&msg_id.0, part_root);
-                let reasoning_parts: Vec<_> = parts
+            let reasoning_parts: Vec<_> = data
+                .parts
+                .iter()
+                .filter(|p| p.part_type.as_deref() == Some("reasoning"))
+                .collect();
+            if !reasoning_parts.is_empty() {
+                let reasoning_chars: usize = reasoning_parts
                     .iter()
-                    .filter(|p| p.part_type.as_deref() == Some("reasoning"))
-                    .collect();
-                if !reasoning_parts.is_empty() {
-                    let reasoning_chars: usize = reasoning_parts
-                        .iter()
-                        .filter_map(|p| p.text.as_ref().map(|t| t.chars().count()))
-                        .sum();
-                    if reasoning_chars > 0 {
-                        tokens_from_msg.reasoning = (reasoning_chars / 4) as u64;
-                    }
+                    .filter_map(|p| p.text.as_ref().map(|t| t.chars().count()))
+                    .sum();
+                if reasoning_chars > 0 {
+                    tokens_from_msg.reasoning = (reasoning_chars / 4) as u64;
                 }
             }
         }
@@ -1403,7 +1524,7 @@ pub fn collect_stats() -> Stats {
             totals.sessions.insert(effective_session_id.clone());
         }
         totals.messages += 1;
-        if is_user {
+        if is_user && !is_subagent_msg {
             totals.prompts += 1;
         }
         totals.cost += cost;
@@ -1425,10 +1546,10 @@ pub fn collect_stats() -> Stats {
                     provider: provider.clone(),
                     display_name: format!("{}/{}", provider, short).into_boxed_str(),
                     messages: 0,
-                    sessions: HashSet::new(),
+                    sessions: FxHashSet::default(),
                     tokens: Tokens::default(),
-                    tools: HashMap::new(),
-                    agents: HashMap::new(),
+                    tools: FxHashMap::default(),
+                    agents: FxHashMap::default(),
                     cost: 0.0,
                 }
             });
@@ -1881,7 +2002,6 @@ fn load_session_chat_internal(
     files: Option<&[std::path::PathBuf]>,
     day_filter: Option<&str>,
     since_ts: Option<i64>,
-    apply_limit: bool,
 ) -> (Vec<ChatMessage>, i64) {
     let part_path_str = get_storage_path("part");
     let part_root = Path::new(&part_path_str);
@@ -1949,57 +2069,53 @@ fn load_session_chat_internal(
             .unwrap_or(0)
     });
 
-    if apply_limit && session_msgs.len() > MAX_MESSAGES_TO_LOAD {
-        let start = session_msgs.len() - MAX_MESSAGES_TO_LOAD;
-        session_msgs = session_msgs.split_off(start);
-    }
-
-    let session_msgs_with_parts: Vec<(Message, Vec<MessageContent>)> = session_msgs
-        .into_par_iter()
-        .map(|msg| {
-            let mut parts_vec = Vec::new();
-            if let Some(id) = &msg.id {
-                let id_str = &id.0;
-                if !id_str.is_empty() {
-                    for part in load_parts_for_message(id_str, part_root) {
-                        // Skip reasoning/thinking parts - we only want actual content
-                        if part.part_type.as_deref() == Some("reasoning") {
-                            continue;
-                        }
-                        if part.thought.is_some() {
-                            parts_vec.push(MessageContent::Thinking(()));
-                        }
-                        let mut current_text = None;
-                        if let Some(t) = part.text {
-                            current_text = Some(t.clone());
-                            parts_vec.push(MessageContent::Text(truncate_string(
-                                &t,
-                                MAX_CHARS_PER_TEXT_PART,
-                            )));
-                        }
-                        if let Some(tool) = part.tool {
-                            let state_input = part.state.as_ref().and_then(|s| s.input.as_ref());
-                            let fp: Option<Box<str>> = state_input.and_then(|i| {
-                                infer_tool_file_path(&tool, i).map(|s| s.into_boxed_str())
-                            });
-                            let tool_detail = state_input
-                                .map(|i| build_tool_detail(&tool, i))
-                                .or(current_text.map(|s| s.clone()))
-                                .map(|s| s.into());
-                            parts_vec.push(MessageContent::ToolCall(ToolCallInfo {
-                                name: tool.into(),
-                                file_path: fp,
-                                input: tool_detail,
-                                additions: None,
-                                deletions: None,
-                            }));
-                        }
-                    }
-                }
-            }
-            (msg, parts_vec)
-        })
-        .collect();
+    // Batch-load parts: single DB query instead of N individual queries
+    let session_msgs_with_parts: Vec<(Message, Vec<MessageContent>)> = if is_db_mode() {
+        let msg_ids: Vec<&str> = session_msgs
+            .iter()
+            .filter_map(|m| m.id.as_ref().map(|id| id.0.as_str()))
+            .filter(|id| !id.is_empty())
+            .collect();
+        let mut parts_map = batch_load_parts_db(&msg_ids);
+        session_msgs
+            .into_iter()
+            .map(|msg| {
+                let parts_vec = msg
+                    .id
+                    .as_ref()
+                    .and_then(|id| {
+                        let key: Box<str> = id.0.as_str().into();
+                        parts_map.remove(&key)
+                    })
+                    .map(parts_to_content)
+                    .unwrap_or_default();
+                (msg, parts_vec)
+            })
+            .collect()
+    } else {
+        // Batch-load parts for file mode
+        let msg_ids: Vec<&str> = session_msgs
+            .iter()
+            .filter_map(|m| m.id.as_ref().map(|id| id.0.as_str()))
+            .filter(|id| !id.is_empty())
+            .collect();
+        let mut parts_map = batch_load_parts_fs(&msg_ids, part_root);
+        session_msgs
+            .into_iter()
+            .map(|msg| {
+                let parts_vec = msg
+                    .id
+                    .as_ref()
+                    .and_then(|id| {
+                        let key: Box<str> = id.0.as_str().into();
+                        parts_map.remove(&key)
+                    })
+                    .map(parts_to_content)
+                    .unwrap_or_default();
+                (msg, parts_vec)
+            })
+            .collect()
+    };
 
     let mut max_ts = since_ts.unwrap_or(0);
     let mut merged: Vec<ChatMessage> = Vec::with_capacity(session_msgs_with_parts.len());
@@ -2094,7 +2210,7 @@ pub fn load_session_chat_with_max_ts(
     files: Option<&[std::path::PathBuf]>,
     day_filter: Option<&str>,
 ) -> (Vec<ChatMessage>, i64) {
-    load_session_chat_internal(Some(session_id), files, day_filter, None, true)
+    load_session_chat_internal(Some(session_id), files, day_filter, None)
 }
 
 #[derive(Clone)]
@@ -2125,9 +2241,9 @@ pub fn load_session_details(
 
     #[inline]
     fn fold_msg(
-        mut acc: HashMap<Box<str>, ModelTokenStats>,
+        mut acc: FxHashMap<Box<str>, ModelTokenStats>,
         ms: MsgStats,
-    ) -> HashMap<Box<str>, ModelTokenStats> {
+    ) -> FxHashMap<Box<str>, ModelTokenStats> {
         let entry = acc
             .entry(ms.model.clone())
             .or_insert_with(|| ModelTokenStats {
@@ -2151,9 +2267,9 @@ pub fn load_session_details(
     }
 
     fn reduce_maps(
-        mut a: HashMap<Box<str>, ModelTokenStats>,
-        b: HashMap<Box<str>, ModelTokenStats>,
-    ) -> HashMap<Box<str>, ModelTokenStats> {
+        mut a: FxHashMap<Box<str>, ModelTokenStats>,
+        b: FxHashMap<Box<str>, ModelTokenStats>,
+    ) -> FxHashMap<Box<str>, ModelTokenStats> {
         for (k, v) in b {
             let entry = a.entry(k).or_insert_with(|| ModelTokenStats {
                 name: v.name,
@@ -2174,55 +2290,20 @@ pub fn load_session_details(
         a
     }
 
-    fn parse_msg(msg: &Message, _msg_path: Option<&Path>) -> (Box<str>, bool, Tokens, f64) {
-        let role = msg.role.as_ref().map(|s| s.0.as_str()).unwrap_or("");
-        let is_user = role == "user";
-        let model_id = get_model_id(msg);
-        let mut tokens = Tokens::default();
-        add_tokens(&mut tokens, &msg.tokens);
-        let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
-
-        // Estimate reasoning tokens from parts if tokens.reasoning is 0
-        // (some providers store reasoning content in parts, not in tokens.reasoning field)
-        if tokens.reasoning == 0 && !is_user {
-            if let Some(msg_id) = msg.id.as_ref() {
-                let parts = load_parts_for_message(&msg_id.0, Path::new(""));
-                let reasoning_chars: usize = parts
-                    .iter()
-                    .filter(|p| p.part_type.as_deref() == Some("reasoning"))
-                    .filter_map(|p| p.text.as_ref().map(|t| t.chars().count()))
-                    .sum();
-                if reasoning_chars > 0 {
-                    tokens.reasoning = (reasoning_chars / 4) as u64;
-                }
-            }
-        }
-
-        (model_id, is_user, tokens, cost)
-    }
-
-    let model_map: HashMap<Box<str>, ModelTokenStats> = if let Some(f) = files {
+    // Step 1: Load all messages in parallel
+    let messages: Vec<Message> = if let Some(f) = files {
         f.par_iter()
             .filter_map(|p| {
                 let msg: Message = load_message_from_path(p)?;
-
                 if let Some(target_day) = day_filter {
                     let msg_day = get_day(msg.time.as_ref().and_then(|t| t.created.map(|v| *v)));
                     if msg_day != target_day {
                         return None;
                     }
                 }
-
-                let (model, is_user, tokens, cost) = parse_msg(&msg, Some(p));
-                Some(MsgStats {
-                    model,
-                    is_user,
-                    tokens,
-                    cost,
-                })
+                Some(msg)
             })
-            .fold(HashMap::new, fold_msg)
-            .reduce(HashMap::new, reduce_maps)
+            .collect()
     } else {
         let message_path = get_storage_path("message");
         let msg_files = list_message_files(Path::new(&message_path));
@@ -2233,25 +2314,68 @@ pub fn load_session_details(
                 if msg.session_id.as_ref().map(|s| s.as_ref()) != Some(session_id) {
                     return None;
                 }
-
                 if let Some(target_day) = day_filter {
                     let msg_day = get_day(msg.time.as_ref().and_then(|t| t.created.map(|v| *v)));
                     if msg_day != target_day {
                         return None;
                     }
                 }
-
-                let (model, is_user, tokens, cost) = parse_msg(&msg, Some(p));
-                Some(MsgStats {
-                    model,
-                    is_user,
-                    tokens,
-                    cost,
-                })
+                Some(msg)
             })
-            .fold(HashMap::new, fold_msg)
-            .reduce(HashMap::new, reduce_maps)
+            .collect()
     };
+
+    // Step 2: Batch load ALL parts
+    let msg_ids: Vec<&str> = messages
+        .iter()
+        .filter_map(|m| m.id.as_ref().map(|id| id.0.as_str()))
+        .filter(|id| !id.is_empty())
+        .collect();
+    let parts_map: FxHashMap<Box<str>, Vec<PartData>> = if is_db_mode() {
+        batch_load_parts_db(&msg_ids)
+    } else {
+        let part_path_str = get_storage_path("part");
+        let part_root = Path::new(&part_path_str);
+        batch_load_parts_fs(&msg_ids, part_root)
+    };
+
+    // Step 3: Process messages with cached parts
+    let model_map: FxHashMap<Box<str>, ModelTokenStats> = messages
+        .into_par_iter()
+        .map(|msg| {
+            let role = msg.role.as_ref().map(|s| s.0.as_str()).unwrap_or("");
+            let is_user = role == "user";
+            let model_id = get_model_id(&msg);
+            let mut tokens = Tokens::default();
+            add_tokens(&mut tokens, &msg.tokens);
+            let cost = msg.cost.as_ref().map(|c| **c).unwrap_or(0.0);
+
+            // Estimate reasoning tokens from cached parts if tokens.reasoning is 0
+            if tokens.reasoning == 0 && !is_user {
+                if let Some(msg_id) = msg.id.as_ref() {
+                    let key: Box<str> = msg_id.0.as_str().into();
+                    if let Some(parts) = parts_map.get(&key) {
+                        let reasoning_chars: usize = parts
+                            .iter()
+                            .filter(|p| p.part_type.as_deref() == Some("reasoning"))
+                            .filter_map(|p| p.text.as_ref().map(|t| t.chars().count()))
+                            .sum();
+                        if reasoning_chars > 0 {
+                            tokens.reasoning = (reasoning_chars / 4) as u64;
+                        }
+                    }
+                }
+            }
+
+            MsgStats {
+                model: model_id,
+                is_user,
+                tokens,
+                cost,
+            }
+        })
+        .fold(FxHashMap::default, fold_msg)
+        .reduce(FxHashMap::default, reduce_maps);
 
     let mut model_stats: Vec<ModelTokenStats> = model_map.into_values().collect();
     model_stats.sort_unstable_by(|a, b| b.tokens.total().cmp(&a.tokens.total()));
@@ -2282,10 +2406,8 @@ pub fn load_combined_session_chat(
         return (Vec::new(), 0);
     }
 
-    let part_path_str = get_storage_path("part");
-    let part_root = std::path::Path::new(&part_path_str);
-
-    let mut all_messages: Vec<(Message, Vec<MessageContent>, bool, Option<Box<str>>)> = all_files
+    // Load messages, filtering by day
+    let mut filtered_msgs: Vec<(Message, bool, Option<Box<str>>)> = all_files
         .par_iter()
         .filter_map(|p| {
             let msg: Message = load_message_from_path(p)?;
@@ -2301,57 +2423,66 @@ pub fn load_combined_session_chat(
             } else {
                 (false, None)
             };
-
-            let mut parts_vec = Vec::new();
-            if let Some(id) = &msg.id {
-                let id_str = &id.0;
-                if !id_str.is_empty() {
-                    for part in load_parts_for_message(id_str, part_root) {
-                        if part.thought.is_some() {
-                            parts_vec.push(MessageContent::Thinking(()));
-                        }
-                        let mut current_text = None;
-                        if let Some(t) = part.text {
-                            current_text = Some(t.clone());
-                            parts_vec.push(MessageContent::Text(truncate_string(
-                                &t,
-                                MAX_CHARS_PER_TEXT_PART,
-                            )));
-                        }
-                        if let Some(tool) = part.tool {
-                            let state_input = part.state.as_ref().and_then(|s| s.input.as_ref());
-                            let fp: Option<Box<str>> = state_input.and_then(|i| {
-                                infer_tool_file_path(&tool, i).map(|s| s.into_boxed_str())
-                            });
-                            let tool_detail = state_input
-                                .map(|i| build_tool_detail(&tool, i))
-                                .or(current_text.map(|s| s.clone()))
-                                .map(|s| s.into());
-                            parts_vec.push(MessageContent::ToolCall(ToolCallInfo {
-                                name: tool.into(),
-                                file_path: fp,
-                                input: tool_detail,
-                                additions: None,
-                                deletions: None,
-                            }));
-                        }
-                    }
-                }
-            }
-            Some((msg, parts_vec, is_sub, agent_lbl))
+            Some((msg, is_sub, agent_lbl))
         })
         .collect();
 
-    all_messages.sort_unstable_by_key(|(m, _, _, _)| {
+    filtered_msgs.sort_unstable_by_key(|(m, _, _)| {
         m.time
             .as_ref()
             .and_then(|t| t.created.map(|v| *v))
             .unwrap_or(0)
     });
-    if all_messages.len() > MAX_MESSAGES_TO_LOAD {
-        let start = all_messages.len() - MAX_MESSAGES_TO_LOAD;
-        all_messages.drain(..start);
-    }
+
+    // Batch-load parts
+    let all_messages: Vec<(Message, Vec<MessageContent>, bool, Option<Box<str>>)> = if is_db_mode()
+    {
+        let msg_ids: Vec<&str> = filtered_msgs
+            .iter()
+            .filter_map(|(m, _, _)| m.id.as_ref().map(|id| id.0.as_str()))
+            .filter(|id| !id.is_empty())
+            .collect();
+        let mut parts_map = batch_load_parts_db(&msg_ids);
+        filtered_msgs
+            .into_iter()
+            .map(|(msg, is_sub, agent_lbl)| {
+                let parts_vec = msg
+                    .id
+                    .as_ref()
+                    .and_then(|id| {
+                        let key: Box<str> = id.0.as_str().into();
+                        parts_map.remove(&key)
+                    })
+                    .map(parts_to_content)
+                    .unwrap_or_default();
+                (msg, parts_vec, is_sub, agent_lbl)
+            })
+            .collect()
+    } else {
+        let part_path_str = get_storage_path("part");
+        let part_root = std::path::Path::new(&part_path_str);
+        let msg_ids: Vec<&str> = filtered_msgs
+            .iter()
+            .filter_map(|(m, _, _)| m.id.as_ref().map(|id| id.0.as_str()))
+            .filter(|id| !id.is_empty())
+            .collect();
+        let mut parts_map = batch_load_parts_fs(&msg_ids, part_root);
+        filtered_msgs
+            .into_iter()
+            .map(|(msg, is_sub, agent_lbl)| {
+                let parts_vec = msg
+                    .id
+                    .as_ref()
+                    .and_then(|id| {
+                        let key: Box<str> = id.0.as_str().into();
+                        parts_map.remove(&key)
+                    })
+                    .map(parts_to_content)
+                    .unwrap_or_default();
+                (msg, parts_vec, is_sub, agent_lbl)
+            })
+            .collect()
+    };
 
     let mut max_ts: i64 = 0;
     let mut merged: Vec<ChatMessage> = Vec::with_capacity(all_messages.len());
@@ -2440,8 +2571,7 @@ pub fn load_combined_session_chat(
     (merged, max_ts)
 }
 
-/// Build a compact one-line detail string from tool state input fields.
-/// This replaces the old approach of using the part `text` (which is always empty for tools).
+/// Build a compact one-line detail string from tool state input fields
 fn build_tool_detail(tool_name: &str, input: &ToolStateInput) -> String {
     let lower = tool_name.to_ascii_lowercase();
     match lower.as_str() {
@@ -2535,7 +2665,7 @@ fn build_tool_detail(tool_name: &str, input: &ToolStateInput) -> String {
             }
         }
         _ => {
-            // Fallback: show whatever fields we have
+            // Fallback: show whatever fields we have (works for any MCP/plugin tool)
             let mut parts = Vec::new();
             if let Some(fp) = &input.file_path {
                 parts.push(short_path(fp));
@@ -2543,11 +2673,17 @@ fn build_tool_detail(tool_name: &str, input: &ToolStateInput) -> String {
             if let Some(p) = &input.pattern {
                 parts.push(format!("`{}`", p));
             }
+            if let Some(q) = &input.query {
+                parts.push(truncate_inline(q, 60));
+            }
             if let Some(c) = &input.command {
                 parts.push(c.lines().next().unwrap_or("").to_string());
             }
             if let Some(u) = &input.url {
                 parts.push(truncate_inline(u, 50));
+            }
+            if let Some(ids) = &input.ids {
+                parts.push(format!("{} items", ids.len()));
             }
             if parts.is_empty() {
                 String::new()

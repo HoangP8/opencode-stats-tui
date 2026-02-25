@@ -1,17 +1,17 @@
+//! Incremental statistics cache with file-based persistence.
+
 use bincode::{deserialize, serialize};
-use fxhash::{FxHashMap, FxHashSet};
 use parking_lot::RwLock;
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-// Type alias for complex return type to reduce complexity
 type SessionDiffs = FxHashMap<String, FxHashMap<String, crate::stats::FileDiff>>;
 type SessionSortedDays = FxHashMap<String, Vec<String>>;
 
@@ -48,7 +48,7 @@ pub struct CachedStats {
     pub children_map: FxHashMap<Box<str>, Vec<Box<str>>>,
 }
 
-/// Lightweight snapshot returned from update_files to avoid a separate full clone.
+/// Lightweight snapshot returned from update_files
 pub struct StatsUpdate {
     pub affected_sessions: FxHashSet<String>,
     pub totals: crate::stats::Totals,
@@ -864,17 +864,19 @@ impl StatsCache {
                 } else {
                     ("unknown", name_str)
                 };
-                let mut agents = HashMap::new();
+                let mut agents = FxHashMap::default();
                 agents.insert(agent_name.clone(), 1);
+                let mut sessions = FxHashSet::default();
+                sessions.insert(session_id.clone().into_boxed_str());
                 stats.model_usage.push(crate::stats::ModelUsage {
                     name: model_id.clone(),
                     short_name: n.into(),
                     provider: p.into(),
                     display_name: format!("{}/{}", p, n).into_boxed_str(),
                     messages: 1,
-                    sessions: [session_id.clone().into_boxed_str()].into(),
+                    sessions,
                     tokens: tokens_add,
-                    tools: HashMap::new(),
+                    tools: FxHashMap::default(),
                     agents,
                     cost,
                 });
@@ -885,7 +887,7 @@ impl StatsCache {
             let d = stats.per_day.entry(day.clone()).or_default();
             if is_new_message {
                 d.messages += 1;
-                if is_user {
+                if is_user && !is_subagent_msg {
                     d.prompts += 1;
                 }
             }
@@ -904,7 +906,7 @@ impl StatsCache {
 
             if is_new_message {
                 s.messages += 1;
-                if is_user {
+                if is_user && !is_subagent_msg {
                     s.prompts += 1;
                 }
             }
@@ -969,7 +971,7 @@ impl StatsCache {
                     }
                     agent.active_duration_ms += duration_add;
                 } else if is_new_message {
-                    let mut models = fxhash::FxHashSet::default();
+                    let mut models = FxHashSet::default();
                     if is_assistant {
                         models.insert(model_id.clone());
                     }

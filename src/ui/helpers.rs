@@ -1,6 +1,7 @@
-//! Helper functions and shared types for UI rendering
+//! UI helper functions and shared types.
 
 use crate::stats::{format_number, ChatMessage, MessageContent};
+use crate::theme::ThemeColors;
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
@@ -9,19 +10,18 @@ use ratatui::{
 };
 use std::borrow::Cow;
 
-/// Cached chat session data including pre-calculated scroll info
+/// Cached chat session data.
 pub struct CachedChat {
     pub messages: std::sync::Arc<Vec<ChatMessage>>,
     pub total_lines: u16,
 }
 
-/// Helper to create cache key from session_id and day
+/// Cache key from session_id and optional day.
 pub fn cache_key(session_id: &str, day: Option<&str>) -> String {
-    if let Some(d) = day {
-        format!("{}|{}", session_id, d)
-    } else {
-        session_id.to_string()
-    }
+    day.map_or_else(
+        || session_id.to_string(),
+        |d| format!("{}|{}", session_id, d),
+    )
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -39,58 +39,53 @@ pub enum LeftPanel {
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum RightPanel {
-    Detail,   // OVERVIEW panel (top right in Stats view)
-    Activity, // ACTIVITY heatmap panel
-    List,     // SESSIONS/PROJECTS
-    Tools,    // TOOLS USED
+    Detail,
+    Activity,
+    List,
+    Tools,
 }
 
-/// Cached panel rectangles for efficient mouse hit-testing
-/// Updated during render to match exactly what's displayed
+/// Cached panel rects for mouse hit-testing.
 #[derive(Default, Clone)]
 pub struct PanelRects {
-    // Left panels
     pub stats: Option<Rect>,
     pub days: Option<Rect>,
     pub models: Option<Rect>,
-    // Right panels (context-dependent based on left_panel)
-    pub detail: Option<Rect>,   // SESSION INFO or MODEL INFO
-    pub activity: Option<Rect>, // ACTIVITY heatmap (Stats view)
-    pub list: Option<Rect>,     // SESSIONS or MODEL RANKING
-    pub tools: Option<Rect>,    // TOOLS USED (only in Models view)
+    pub detail: Option<Rect>,
+    pub activity: Option<Rect>,
+    pub list: Option<Rect>,
+    pub tools: Option<Rect>,
 }
 
 impl PanelRects {
-    /// Optimized hit-test that returns early once a match is found
     #[inline(always)]
     pub fn find_panel(&self, x: u16, y: u16) -> Option<&'static str> {
-        // Check in order of most common usage for early return
-        if Self::contains_point(self.list, x, y) {
+        if self.contains(self.list, x, y) {
             return Some("list");
         }
-        if Self::contains_point(self.days, x, y) {
+        if self.contains(self.days, x, y) {
             return Some("days");
         }
-        if Self::contains_point(self.models, x, y) {
+        if self.contains(self.models, x, y) {
             return Some("models");
         }
-        if Self::contains_point(self.activity, x, y) {
+        if self.contains(self.activity, x, y) {
             return Some("activity");
         }
-        if Self::contains_point(self.detail, x, y) {
+        if self.contains(self.detail, x, y) {
             return Some("detail");
         }
-        if Self::contains_point(self.tools, x, y) {
+        if self.contains(self.tools, x, y) {
             return Some("tools");
         }
-        if Self::contains_point(self.stats, x, y) {
+        if self.contains(self.stats, x, y) {
             return Some("stats");
         }
         None
     }
 
     #[inline(always)]
-    fn contains_point(rect: Option<Rect>, x: u16, y: u16) -> bool {
+    fn contains(&self, rect: Option<Rect>, x: u16, y: u16) -> bool {
         rect.is_some_and(|r| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
     }
 }
@@ -106,12 +101,17 @@ pub struct HeatmapLayout {
     pub grid_pad: u16,
 }
 
-/// Helper: Create a stat paragraph with label and value
-pub fn stat_widget(label: &str, value: String, color: Color) -> Paragraph<'static> {
+/// Stat paragraph with label and value.
+pub fn stat_widget(
+    label: &str,
+    value: String,
+    color: Color,
+    colors: &ThemeColors,
+) -> Paragraph<'static> {
     Paragraph::new(vec![
         Line::from(Span::styled(
             label.to_string(),
-            Style::default().fg(Color::Rgb(180, 180, 180)),
+            Style::default().fg(colors.text_muted),
         )),
         Line::from(Span::styled(
             value,
@@ -121,60 +121,56 @@ pub fn stat_widget(label: &str, value: String, color: Color) -> Paragraph<'stati
     .alignment(Alignment::Center)
 }
 
-/// Helper: Formatting configuration for usage list rows
+/// Usage list row formatting config.
 pub struct UsageRowFormat {
     pub name_width: usize,
     pub cost_width: usize,
     pub sess_width: usize,
 }
 
-/// Helper: Create a list row with consistent formatting for usage lists
-/// Optimized with pre-allocated Vec capacity
+/// Create a usage list row.
 pub fn usage_list_row(
     name: String,
-    input_tokens: u64,
-    output_tokens: u64,
+    input: u64,
+    output: u64,
     cost: f64,
-    session_count: usize,
-    format: &UsageRowFormat,
+    sessions: usize,
+    fmt: &UsageRowFormat,
+    colors: &ThemeColors,
 ) -> Line<'static> {
-    let in_val = format_number(input_tokens);
-    let out_val = format_number(output_tokens);
+    let name_display: String = name.chars().take(fmt.name_width).collect();
+    let sep = Style::default().fg(colors.text_muted);
 
-    // Optimized: use format! with padding instead of manual loop
-    let name_display = format!(
-        "{:<width$}",
-        name.chars().take(format.name_width).collect::<String>(),
-        width = format.name_width
-    );
-
-    // Optimized: combine nested format! calls into single format
-    let spans = vec![
-        Span::styled(name_display, Style::default().fg(Color::White)),
-        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
-        Span::styled(format!("{:>7}", in_val), Style::default().fg(Color::Blue)),
-        Span::styled(" in ", Style::default().fg(Color::Rgb(180, 180, 180))),
+    Line::from(vec![
         Span::styled(
-            format!("{:>7}", out_val),
-            Style::default().fg(Color::Magenta),
+            format!("{:<1$}", name_display, fmt.name_width),
+            Style::default().fg(colors.text_primary),
         ),
-        Span::styled(" out", Style::default().fg(Color::Rgb(180, 180, 180))),
-        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+        Span::styled(" │ ", sep),
         Span::styled(
-            format!("${:>width$.2}", cost, width = format.cost_width),
-            Style::default().fg(Color::Yellow),
+            format!("{:>7}", format_number(input)),
+            Style::default().fg(colors.token_input()),
         ),
-        Span::styled(" │ ", Style::default().fg(Color::Rgb(180, 180, 180))),
+        Span::styled(" in ", sep),
         Span::styled(
-            format!("{:>width$} sess", session_count, width = format.sess_width),
-            Style::default().fg(Color::Cyan),
+            format!("{:>7}", format_number(output)),
+            Style::default().fg(colors.token_output()),
         ),
-    ];
-    Line::from(spans)
+        Span::styled(" out", sep),
+        Span::styled(" │ ", sep),
+        Span::styled(
+            format!("${:>1$.2}", cost, fmt.cost_width),
+            Style::default().fg(colors.cost()),
+        ),
+        Span::styled(" │ ", sep),
+        Span::styled(
+            format!("{:>1$} sess", sessions, fmt.sess_width),
+            Style::default().fg(colors.info),
+        ),
+    ])
 }
 
-/// Helper: Safely truncate a string to max characters without breaking UTF-8 (no ellipsis)
-/// Returns Cow to avoid allocation when no truncation needed
+/// Safe truncate without breaking UTF-8.
 pub fn safe_truncate_plain(s: &str, max_chars: usize) -> Cow<'_, str> {
     let mut count = 0;
     for (idx, _) in s.char_indices() {
@@ -186,18 +182,14 @@ pub fn safe_truncate_plain(s: &str, max_chars: usize) -> Cow<'_, str> {
     Cow::Borrowed(s)
 }
 
-/// Helper: Truncate a string to max characters and add ellipsis if truncated
+/// Truncate with ellipsis.
 pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     let mut count = 0;
     for (idx, _) in s.char_indices() {
         count += 1;
         if count > max_chars {
-            let visible_chars = max_chars.saturating_sub(1);
-            let byte_end = s
-                .char_indices()
-                .nth(visible_chars)
-                .map(|(i, _)| i)
-                .unwrap_or(idx);
+            let visible = max_chars.saturating_sub(1);
+            let byte_end = s.char_indices().nth(visible).map(|(i, _)| i).unwrap_or(idx);
             let mut result = String::with_capacity(byte_end + 3);
             result.push_str(&s[..byte_end]);
             result.push('…');
@@ -207,46 +199,99 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     s.into()
 }
 
-/// Helper: Smart truncate for host names.
-/// If the full name fits, show it. If not, show just the short name (before space/parenthesis) without ellipsis.
-pub fn truncate_host_name(full_name: &str, short_name: &str, max_chars: usize) -> String {
-    if full_name.chars().count() <= max_chars {
-        full_name.to_string()
+/// Smart truncate for host names.
+pub fn truncate_host_name(full: &str, short: &str, max: usize) -> String {
+    if full.chars().count() <= max {
+        full.to_string()
     } else {
-        // Not enough space - show clean short name, no ellipsis as requested
-        safe_truncate_plain(short_name, max_chars).into_owned()
+        safe_truncate_plain(short, max).into_owned()
     }
 }
 
-/// Calculate the actual number of rendered lines for a chat message
+/// Calculate rendered lines for a chat message.
 pub fn calculate_message_rendered_lines(msg: &ChatMessage) -> u16 {
-    let mut lines = 1u16; // Header line
-
+    let mut lines = 1u16;
     for part in &msg.parts {
         match part {
             MessageContent::Text(text) => {
-                let (_max_line_chars, max_lines) = match &*msg.role {
-                    "user" => (150, 5),
-                    "assistant" => (250, 8),
-                    _ => (200, 6),
+                let max_lines = match &*msg.role {
+                    "user" => 5,
+                    "assistant" => 8,
+                    _ => 6,
                 };
-
-                let line_count = text.lines().count();
-                lines += line_count.min(max_lines) as u16;
-
-                // Add indicator if truncated
-                if line_count > max_lines {
+                let n = text.lines().count();
+                lines += n.min(max_lines) as u16;
+                if n > max_lines {
                     lines += 1;
                 }
             }
-            MessageContent::ToolCall(_) => {
-                lines += 1;
-            }
-            MessageContent::Thinking(_) => {
-                lines += 1;
-            }
+            MessageContent::ToolCall(_) | MessageContent::Thinking(_) => lines += 1,
         }
     }
-
     lines
+}
+
+/// Month abbreviation (1-12).
+#[inline]
+pub fn month_abbr(m: u32) -> &'static str {
+    match m {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        _ => "Dec",
+    }
+}
+
+/// Weekday abbreviation.
+#[inline]
+pub fn weekday_abbr(w: chrono::Weekday) -> &'static str {
+    match w {
+        chrono::Weekday::Mon => "Mon",
+        chrono::Weekday::Tue => "Tue",
+        chrono::Weekday::Wed => "Wed",
+        chrono::Weekday::Thu => "Thu",
+        chrono::Weekday::Fri => "Fri",
+        chrono::Weekday::Sat => "Sat",
+        chrono::Weekday::Sun => "Sun",
+    }
+}
+
+/// Language name from file extension.
+pub fn lang_from_ext(ext: &str) -> Option<&'static str> {
+    Some(match ext {
+        "rs" => "Rust",
+        "py" => "Python",
+        "js" => "JavaScript",
+        "ts" | "tsx" => "TypeScript",
+        "go" => "Go",
+        "java" => "Java",
+        "c" | "h" => "C",
+        "cpp" | "cc" | "cxx" | "hpp" => "C++",
+        "rb" => "Ruby",
+        "swift" => "Swift",
+        "kt" => "Kotlin",
+        "lua" => "Lua",
+        "sh" | "bash" | "zsh" => "Shell",
+        "css" | "scss" | "sass" => "CSS",
+        "html" | "htm" => "HTML",
+        "json" => "JSON",
+        "yaml" | "yml" => "YAML",
+        "toml" => "TOML",
+        "md" | "mdx" => "Markdown",
+        "sql" => "SQL",
+        "svelte" => "Svelte",
+        "vue" => "Vue",
+        "dart" => "Dart",
+        "zig" => "Zig",
+        "ex" | "exs" => "Elixir",
+        _ => return None,
+    })
 }

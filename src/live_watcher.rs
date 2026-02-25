@@ -1,19 +1,22 @@
+//! Real-time file watcher for live statistics updates.
+
 use log::{error, info};
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use parking_lot::Mutex;
+use rustc_hash::FxHashSet;
 use std::{
     path::PathBuf,
     sync::{mpsc, Arc},
     time::{Duration, Instant},
 };
 
-/// Real-time file watcher with instant updates via channel-based wake
+/// Real-time file watcher with coalesced updates.
 pub struct LiveWatcher {
     watcher: RecommendedWatcher,
     storage_path: PathBuf,
     last_flush: Arc<Mutex<Instant>>,
     first_pending: Arc<Mutex<Option<Instant>>>,
-    changed_files: Arc<Mutex<Vec<PathBuf>>>,
+    changed_files: Arc<Mutex<FxHashSet<PathBuf>>>,
     on_change: Arc<dyn Fn(Vec<PathBuf>) + Send + Sync>,
 }
 
@@ -23,7 +26,7 @@ impl LiveWatcher {
         on_change: Arc<dyn Fn(Vec<PathBuf>) + Send + Sync>,
         wake_tx: mpsc::Sender<()>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let changed_files = Arc::new(Mutex::new(Vec::new()));
+        let changed_files = Arc::new(Mutex::new(FxHashSet::default()));
         let changed_files_clone = changed_files.clone();
 
         let config = Config::default().with_poll_interval(Duration::from_millis(50));
@@ -35,6 +38,7 @@ impl LiveWatcher {
                         let mut any_added = false;
                         for path in event.paths {
                             if let Some(path_str) = path.to_str() {
+                                // Skip temporary/editor files
                                 if path_str.contains(".swp")
                                     || path_str.contains(".tmp")
                                     || path_str.contains("~")
@@ -44,19 +48,16 @@ impl LiveWatcher {
                                 }
 
                                 let is_json = path.extension().is_some_and(|e| e == "json");
-                                // SQLite mode writes mostly hit opencode.db-wal/opencode.db-shm
-                                // (and sometimes opencode.db). Include these so live refresh stays reliable.
-                                let is_sqlite_file =
+                                let is_sqlite =
                                     path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
                                         n == "opencode.db"
                                             || n == "opencode.db-wal"
                                             || n == "opencode.db-shm"
                                     });
 
-                                if is_json || is_sqlite_file || event.kind.is_remove() {
+                                if is_json || is_sqlite || event.kind.is_remove() {
                                     let mut files = changed_files_clone.lock();
-                                    if !files.contains(&path) {
-                                        files.push(path.clone());
+                                    if files.insert(path.clone()) {
                                         any_added = true;
                                     }
                                 }
@@ -83,7 +84,7 @@ impl LiveWatcher {
         })
     }
 
-    /// Start watching
+    /// Start watching the storage directory.
     pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.watcher
             .watch(&self.storage_path, RecursiveMode::Recursive)?;
@@ -94,11 +95,9 @@ impl LiveWatcher {
         Ok(())
     }
 
-    /// Process pending changes with bounded coalesce (no silence requirement).
-    /// Flushes immediately if rate limit allows, or after bounded wait.
+    /// Process pending changes with bounded coalesce.
     pub fn process_changes(&self) {
         let mut files = self.changed_files.lock();
-
         if files.is_empty() {
             return;
         }
@@ -123,14 +122,14 @@ impl LiveWatcher {
             return;
         }
 
-        let changed = std::mem::take(&mut *files);
+        let changed: Vec<PathBuf> = files.drain().collect();
         *self.last_flush.lock() = now;
         *self.first_pending.lock() = None;
 
         (self.on_change)(changed);
     }
 
-    /// Check if there are pending changes
+    /// Check if there are pending changes.
     #[allow(dead_code)]
     pub fn has_pending_changes(&self) -> bool {
         !self.changed_files.lock().is_empty()

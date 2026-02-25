@@ -1,10 +1,4 @@
-//! Main UI module
-//!
-//! This module contains the TUI application for displaying opencode statistics.
-//! The UI is organized into three main panels:
-//! - GENERAL USAGE (Stats) - Shows overall statistics
-//! - DAILY USAGE (Days) - Shows per-day statistics and sessions
-//! - MODEL USAGE (Models) - Shows model-specific statistics
+//! Main UI module with three panels: Stats, Days, Models.
 
 mod days_panel;
 mod helpers;
@@ -15,11 +9,11 @@ use crate::live_watcher::LiveWatcher;
 use crate::session::SessionModal;
 use crate::stats::{load_session_chat_with_max_ts, DayStat, ModelUsage, ToolUsage, Totals};
 use crate::stats_cache::StatsCache;
+use crate::theme::Theme;
 use chrono::Datelike;
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use fxhash::{FxHashMap, FxHashSet};
 use helpers::{
     cache_key, calculate_message_rendered_lines, CachedChat, Focus, HeatmapLayout, LeftPanel,
     PanelRects, RightPanel,
@@ -27,16 +21,15 @@ use helpers::{
 use parking_lot::Mutex;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{ListState, Paragraph},
     Frame,
 };
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
-
-// App is defined in this module
 
 pub struct App {
     totals: Totals,
@@ -69,8 +62,7 @@ pub struct App {
     ranking_scroll: usize,
     ranking_max_scroll: usize,
 
-    // Phase 2: Render Caching
-    cached_day_strings: FxHashMap<String, String>, // Pre-formatted day strings with weekday names
+    cached_day_strings: FxHashMap<String, String>,
 
     chat_max_scroll: u16,
     focus: Focus,
@@ -83,23 +75,20 @@ pub struct App {
     current_chat_session_id: Option<String>,
 
     modal: SessionModal,
+    theme: Theme,
 
-    // Optimized mouse tracking
-    last_mouse_panel: Option<&'static str>, // Cache last panel for faster hit-testing
-    last_session_click: Option<(std::time::Instant, usize)>, // Double-click detection for sessions
+    //Mmouse tracking
+    last_mouse_panel: Option<&'static str>,
+    last_session_click: Option<(std::time::Instant, usize)>,
 
-    // Terminal size cache
     terminal_size: Rect,
-
-    // Cached panel rectangles for optimized mouse hit-testing
     cached_rects: PanelRects,
 
-    // Phase 1 optimizations
-    cached_git_branch: Option<(Box<str>, Option<String>)>, // (path_root, branch) - avoid fs I/O per frame
+    cached_git_branch: Option<(Box<str>, Option<String>)>,
     cached_max_cost_width: usize,
 
-    // Overview panel data (General Usage right panel)
-    overview_projects: Vec<(String, usize)>, // (project_name, session_count) sorted desc
+    // Overview panel data
+    overview_projects: Vec<(String, usize)>,
     overview_project_scroll: usize,
     overview_project_max_scroll: usize,
     overview_tool_scroll: usize,
@@ -112,7 +101,7 @@ pub struct App {
     overview_heatmap_selected_active_ms: i64,
     overview_heatmap_flash_time: Option<std::time::Instant>,
 
-    // Live stats: Cache and file watching
+    // Live stats: cache and file watching
     stats_cache: Option<StatsCache>,
     _storage_path: PathBuf,
     live_watcher: Option<LiveWatcher>,
@@ -123,12 +112,9 @@ pub struct App {
     wake_rx: mpsc::Receiver<()>,
 }
 
+/// The main application state.
 impl App {
     pub fn new() -> Self {
-        // Initialize logger
-        // env_logger::init();
-
-        // Get data source root path
         let storage_path = if crate::stats::is_db_mode() {
             crate::stats::get_opencode_root_path()
         } else {
@@ -138,7 +124,6 @@ impl App {
             PathBuf::from(storage_path).join("opencode").join("storage")
         };
 
-        // Initialize cache
         let stats_cache = StatsCache::new(storage_path.clone()).ok();
         log::info!("Initialized stats cache for: {}", storage_path.display());
 
@@ -174,7 +159,6 @@ impl App {
             )
         };
 
-        // Set up live watcher with channel-based wake for instant updates
         let needs_refresh = Arc::new(Mutex::new(Vec::new()));
         let needs_refresh_clone = needs_refresh.clone();
         let (wake_tx, wake_rx) = mpsc::channel();
@@ -274,6 +258,7 @@ impl App {
             overview_heatmap_flash_time: None,
 
             modal: SessionModal::new(),
+            theme: Theme::default(),
 
             last_mouse_panel: None,
             last_session_click: None,
@@ -300,11 +285,11 @@ impl App {
         app.recompute_max_cost_width();
         app.compute_overview_data();
 
-        // Ensure all displays are current
         app.should_redraw = true;
         app
     }
 
+    /// Recompute the maximum width of the cost column.
     fn recompute_max_cost_width(&mut self) {
         let mut max_len = 8usize;
         for day in &self.day_list {
@@ -321,7 +306,6 @@ impl App {
     }
 
     fn compute_overview_data(&mut self) {
-        // Aggregate projects from all sessions across all days
         let mut project_counts: FxHashMap<String, usize> = FxHashMap::default();
         for day_stat in self.per_day.values() {
             for session in day_stat.sessions.values() {
@@ -353,8 +337,8 @@ impl App {
             .selected()
             .and_then(|i| self.session_list.get(i))
             .map(|s| s.id.clone());
-
-        // Always clear and rebuild session list from current data
+        
+        // Clear and rebuild session list from current data
         self.session_list.clear();
         if let Some(day) = self.selected_day() {
             if let Some(stat) = self.per_day.get(&day) {
@@ -379,7 +363,7 @@ impl App {
             self.session_list_state.select(None);
         }
 
-        // Only clear current_chat_session_id if modal is NOT open
+        // Clear current_chat_session_id if modal is NOT open
         if !self.modal.open {
             self.current_chat_session_id = None;
         }
@@ -389,15 +373,13 @@ impl App {
         self.cached_day_items.clear();
         self.cached_day_width = 0;
 
-        // Invalidate git branch cache since selected session may have changed
         self.cached_git_branch = None;
 
         log::debug!("Session list updated: {} sessions", self.session_list.len());
     }
 
-    /// Precompute formatted day strings with weekday names (Phase 2 optimization)
+    /// Precompute formatted day strings
     fn precompute_day_strings(&mut self) {
-        // Only compute if not already cached
         for day in &self.day_list {
             if self.cached_day_strings.contains_key(day) {
                 continue;
@@ -441,6 +423,7 @@ impl App {
         }
     }
 
+    /// Get all message files for a session and its subagents
     fn combined_session_files(&self, session_id: &str) -> Vec<PathBuf> {
         let mut files: Vec<PathBuf> = self
             .session_message_files
@@ -571,6 +554,7 @@ impl App {
         self.chat_max_scroll = total_lines.saturating_sub(area_height.saturating_sub(4));
     }
 
+    /// Move to the next day in the day list
     fn day_next(&mut self) {
         if self.day_list.is_empty() {
             return;
@@ -582,6 +566,7 @@ impl App {
         self.should_redraw = true;
     }
 
+    /// Move to the previous day in the day list
     fn day_previous(&mut self) {
         let i = self.day_list_state.selected().unwrap_or(0);
         self.day_list_state.select(Some(i.saturating_sub(1)));
@@ -589,6 +574,7 @@ impl App {
         self.should_redraw = true;
     }
 
+    #[inline]
     fn model_next(&mut self) {
         if self.model_usage.is_empty() {
             return;
@@ -605,6 +591,7 @@ impl App {
         self.should_redraw = true;
     }
 
+    #[inline]
     fn session_next(&mut self) {
         if self.session_list.is_empty() {
             return;
@@ -625,13 +612,14 @@ impl App {
         self.should_redraw = true;
     }
 
+    #[inline]
     fn selected_day(&self) -> Option<String> {
         self.day_list_state
             .selected()
             .and_then(|i| self.day_list.get(i).cloned())
     }
 
-    /// Refresh stats from cache (for live updates)
+    /// Refresh stats from cache
     pub fn refresh_stats(&mut self, changed_files: Vec<PathBuf>) {
         if let Some(cache) = &self.stats_cache {
             let is_full_refresh = changed_files.is_empty();
@@ -674,7 +662,6 @@ impl App {
                 )
             };
 
-            // Update all stats
             self.totals = totals;
             self.per_day = per_day;
             self.session_titles = session_titles;
@@ -683,14 +670,9 @@ impl App {
             self.parent_map = parent_map;
             self.children_map = children_map;
 
-            // Always rebuild day list and sessions for consistency
             self.rebuild_day_and_session_lists(is_full_refresh);
-
-            // Update derived data that affects display
             self.update_derived_data();
 
-            // Live-refresh the open modal: reload chat + session details fresh.
-            // Simple and reliable — just reload instead of complex incremental merging.
             if self.modal.open {
                 if let Some(current) = self.current_chat_session_id.clone() {
                     self.refresh_open_modal(&current);
@@ -698,7 +680,6 @@ impl App {
                 }
             }
 
-            // Invalidate chat cache for affected sessions (not the open modal)
             if !affected_sessions.is_empty() {
                 self.invalidate_affected_chat_cache(&affected_sessions);
             }
@@ -734,7 +715,6 @@ impl App {
 
     /// Update all derived data that affects display formatting
     fn update_derived_data(&mut self) {
-        // Always update tool usage to reflect current totals
         let mut tool_usage: Vec<ToolUsage> = self
             .totals
             .tools
@@ -747,13 +727,11 @@ impl App {
         tool_usage.sort_unstable_by(|a, b| b.count.cmp(&a.count));
         self.tool_usage = tool_usage;
 
-        // Update model list state if needed
         if !self.model_usage.is_empty() && self.model_list_state.selected().is_none() {
             self.model_list_state.select(Some(0));
             self.selected_model_index = Some(0);
         }
 
-        // Always recalculate cached values that depend on current data
         self.precompute_day_strings();
         self.recompute_max_cost_width();
         self.compute_overview_data();
@@ -845,14 +823,13 @@ impl App {
             .retain(|key| self.chat_cache.contains_key(key));
     }
 
+    /// Main event loop for the UI
     pub fn run(&mut self, terminal: &mut ratatui::DefaultTerminal) -> io::Result<()> {
         self.should_redraw = true;
         let size = terminal.size()?;
         self.terminal_size = Rect::new(0, 0, size.width, size.height);
 
         while !self.exit {
-            // Short poll: 30ms keeps UI responsive while saving CPU.
-            // The wake channel from the file watcher will also wake us.
             if event::poll(std::time::Duration::from_millis(30))? {
                 while event::poll(std::time::Duration::from_millis(0))? {
                     match event::read()? {
@@ -884,15 +861,12 @@ impl App {
                 }
             }
 
-            // Drain wake signals from file watcher (non-blocking)
             while self.wake_rx.try_recv().is_ok() {}
 
-            // Process coalesced file changes
             if let Some(watcher) = &self.live_watcher {
                 watcher.process_changes();
             }
 
-            // Apply pending refresh with minimal throttle (30ms)
             {
                 let mut lock = self.needs_refresh.lock();
                 if !lock.is_empty() {
@@ -910,10 +884,8 @@ impl App {
                 let paths = std::mem::take(&mut self.pending_refresh_paths);
                 self.refresh_stats(paths);
                 self.last_refresh = Some(std::time::Instant::now());
-                // should_redraw is now set in refresh_stats method itself
             }
 
-            // Smooth pulse animation: only redraw when heatmap is visible (Stats view)
             let needs_flicker_redraw =
                 self.overview_heatmap_flash_time.is_some() && self.left_panel == LeftPanel::Stats;
 
@@ -926,12 +898,12 @@ impl App {
         Ok(())
     }
 
+    /// Input handling for the UI.
     fn handle_key_event(
         &mut self,
         key: crossterm::event::KeyEvent,
         term_height: u16,
     ) -> io::Result<()> {
-        // Global quit commands
         if (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
             || (key.code == KeyCode::Char('q')
                 && !self.is_active
@@ -1059,38 +1031,32 @@ impl App {
                 } else {
                     // INACTIVE MODE: Navigate between panels
                     match self.focus {
-                        Focus::Left => {
-                            // Navigate between left panels: Stats <- Days <- Models
-                            match self.left_panel {
-                                LeftPanel::Stats => {}
-                                LeftPanel::Days => self.left_panel = LeftPanel::Stats,
-                                LeftPanel::Models => self.left_panel = LeftPanel::Days,
-                            }
-                        }
-                        Focus::Right => {
-                            // Navigate between right panels vertically
-                            match self.left_panel {
-                                LeftPanel::Stats => match self.right_panel {
-                                    RightPanel::List | RightPanel::Tools => {
-                                        self.right_panel = RightPanel::Activity;
-                                    }
-                                    RightPanel::Activity => {
-                                        self.right_panel = RightPanel::Detail;
-                                    }
-                                    _ => {}
-                                },
-                                LeftPanel::Days => match self.right_panel {
-                                    RightPanel::List => self.right_panel = RightPanel::Detail,
-                                    _ => {}
-                                },
-                                LeftPanel::Models => match self.right_panel {
-                                    RightPanel::List | RightPanel::Tools => {
-                                        self.right_panel = RightPanel::Detail;
-                                    }
-                                    _ => {}
-                                },
-                            }
-                        }
+                        Focus::Left => match self.left_panel {
+                            LeftPanel::Stats => {}
+                            LeftPanel::Days => self.left_panel = LeftPanel::Stats,
+                            LeftPanel::Models => self.left_panel = LeftPanel::Days,
+                        },
+                        Focus::Right => match self.left_panel {
+                            LeftPanel::Stats => match self.right_panel {
+                                RightPanel::List | RightPanel::Tools => {
+                                    self.right_panel = RightPanel::Activity;
+                                }
+                                RightPanel::Activity => {
+                                    self.right_panel = RightPanel::Detail;
+                                }
+                                _ => {}
+                            },
+                            LeftPanel::Days => match self.right_panel {
+                                RightPanel::List => self.right_panel = RightPanel::Detail,
+                                _ => {}
+                            },
+                            LeftPanel::Models => match self.right_panel {
+                                RightPanel::List | RightPanel::Tools => {
+                                    self.right_panel = RightPanel::Detail;
+                                }
+                                _ => {}
+                            },
+                        },
                     }
                 }
             }
@@ -1151,36 +1117,30 @@ impl App {
                 } else {
                     // INACTIVE MODE: Navigate between panels
                     match self.focus {
-                        Focus::Left => {
-                            // Navigate between left panels: Stats -> Days -> Models
-                            match self.left_panel {
-                                LeftPanel::Stats => self.left_panel = LeftPanel::Days,
-                                LeftPanel::Days => self.left_panel = LeftPanel::Models,
-                                LeftPanel::Models => {}
-                            }
-                        }
-                        Focus::Right => {
-                            // Navigate between right panels vertically
-                            match self.left_panel {
-                                LeftPanel::Stats => match self.right_panel {
-                                    RightPanel::Detail => {
-                                        self.right_panel = RightPanel::Activity;
-                                    }
-                                    RightPanel::Activity => {
-                                        self.right_panel = RightPanel::List;
-                                    }
-                                    _ => {}
-                                },
-                                LeftPanel::Days => match self.right_panel {
-                                    RightPanel::Detail => self.right_panel = RightPanel::List,
-                                    _ => {}
-                                },
-                                LeftPanel::Models => match self.right_panel {
-                                    RightPanel::Detail => self.right_panel = RightPanel::Tools,
-                                    _ => {}
-                                },
-                            }
-                        }
+                        Focus::Left => match self.left_panel {
+                            LeftPanel::Stats => self.left_panel = LeftPanel::Days,
+                            LeftPanel::Days => self.left_panel = LeftPanel::Models,
+                            LeftPanel::Models => {}
+                        },
+                        Focus::Right => match self.left_panel {
+                            LeftPanel::Stats => match self.right_panel {
+                                RightPanel::Detail => {
+                                    self.right_panel = RightPanel::Activity;
+                                }
+                                RightPanel::Activity => {
+                                    self.right_panel = RightPanel::List;
+                                }
+                                _ => {}
+                            },
+                            LeftPanel::Days => match self.right_panel {
+                                RightPanel::Detail => self.right_panel = RightPanel::List,
+                                _ => {}
+                            },
+                            LeftPanel::Models => match self.right_panel {
+                                RightPanel::Detail => self.right_panel = RightPanel::Tools,
+                                _ => {}
+                            },
+                        },
                     }
                 }
             }
@@ -1701,10 +1661,16 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        // Render either the main dashboard OR the modal view - not both
+        let colors = self.theme.colors();
+
+        // Set terminal background to match theme
+        frame.render_widget(
+            ratatui::widgets::Block::default()
+                .style(ratatui::style::Style::default().bg(colors.bg_primary)),
+            frame.area(),
+        );
+
         if self.modal.open {
-            // Render ONLY the modal view - completely new clean screen
-            // Clear cached rects when modal is open
             self.cached_rects = PanelRects::default();
 
             let session_id = self
@@ -1714,11 +1680,10 @@ impl App {
             if let Some(id) = session_id {
                 if let Some(session) = self.session_list.iter().find(|s| s.id == id) {
                     self.modal
-                        .render(frame, frame.area(), session, &self.session_titles);
+                        .render(frame, frame.area(), session, &self.session_titles, colors);
                 }
             }
         } else {
-            // Render the main dashboard and cache panel rectangles
             let main_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -1736,11 +1701,12 @@ impl App {
     }
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
+        let colors = self.theme.colors();
         let k = Style::default()
-            .fg(Color::Rgb(140, 140, 160))
+            .fg(colors.text_secondary)
             .add_modifier(Modifier::BOLD);
-        let t = Style::default().fg(Color::DarkGray);
-        let sep = Span::styled(" │ ", Style::default().fg(Color::Rgb(50, 50, 70)));
+        let t = Style::default().fg(colors.text_muted);
+        let sep = Span::styled(" │ ", Style::default().fg(colors.border_muted));
 
         let mut spans: Vec<Span> = Vec::with_capacity(16);
 
@@ -1779,8 +1745,10 @@ impl App {
                 Span::styled(" back", t),
             ]);
         } else {
-            // Don't show "Enter" for GENERAL USAGE panel (Stats) as it doesn't activate
-            let show_enter = !(self.focus == Focus::Left && self.left_panel == LeftPanel::Stats);
+            let show_enter = !((self.focus == Focus::Left && self.left_panel == LeftPanel::Stats)
+                || (self.right_panel == RightPanel::Detail
+                    && (self.left_panel == LeftPanel::Stats
+                        || self.left_panel == LeftPanel::Models)));
             spans.extend_from_slice(&[
                 Span::styled("↑↓", k),
                 Span::styled(" navigate", t),
@@ -1803,19 +1771,20 @@ impl App {
         }
 
         let status_bar = Paragraph::new(Line::from(spans))
-            .style(Style::default().bg(Color::Rgb(15, 15, 25)))
+            .style(Style::default().bg(colors.bg_primary))
             .alignment(Alignment::Center);
         frame.render_widget(status_bar, area);
     }
 
     fn render_left_panel(&mut self, frame: &mut Frame, area: Rect) {
+        let colors = self.theme.colors();
         let is_focused = self.focus == Focus::Left;
         let border_style = if is_focused {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(colors.border_focus)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(colors.border_default)
         };
 
         let stats_height = 6;
@@ -1830,7 +1799,6 @@ impl App {
             ])
             .split(area);
 
-        // Cache panel rectangles for mouse hit-testing
         self.cached_rects.stats = Some(chunks[0]);
         self.cached_rects.days = Some(chunks[1]);
         self.cached_rects.models = Some(chunks[2]);
@@ -1859,24 +1827,24 @@ impl App {
     }
 
     fn render_right_panel(&mut self, frame: &mut Frame, area: Rect) {
+        let colors = self.theme.colors();
         let is_focused = self.focus == Focus::Right;
         let border_style = if is_focused {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(colors.border_focus)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(colors.border_default)
         };
 
         match self.left_panel {
             LeftPanel::Stats => {
-                // Simplified layout for Stats view
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(8),  // Overview (4 lines content + borders)
-                        Constraint::Length(11), // Activity (9 lines content + borders = month + 7 days + legend)
-                        Constraint::Min(0),     // Projects | Tools takes all remaining space
+                        Constraint::Length(8),
+                        Constraint::Length(11),
+                        Constraint::Min(0),
                     ])
                     .split(area);
 
@@ -1885,7 +1853,6 @@ impl App {
                     .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                     .split(chunks[2]);
 
-                // Cache rects for mouse hit-testing (tools=left, list=right)
                 self.cached_rects.detail = Some(chunks[0]);
                 self.cached_rects.activity = Some(chunks[1]);
                 self.cached_rects.tools = Some(bottom_chunks[0]);
@@ -1904,7 +1871,7 @@ impl App {
                     if tools_hl {
                         border_style
                     } else {
-                        Style::default().fg(Color::DarkGray)
+                        Style::default().fg(colors.border_muted)
                     },
                     tools_hl,
                 );
@@ -1916,7 +1883,7 @@ impl App {
                     if projects_hl {
                         border_style
                     } else {
-                        Style::default().fg(Color::DarkGray)
+                        Style::default().fg(colors.border_muted)
                     },
                     projects_hl,
                 );
@@ -1927,7 +1894,6 @@ impl App {
                     .constraints([Constraint::Length(10), Constraint::Min(0)])
                     .split(area);
 
-                // Cache right panel rects for Days view
                 self.cached_rects.detail = Some(chunks[0]);
                 self.cached_rects.activity = None;
                 self.cached_rects.list = Some(chunks[1]);
@@ -1940,7 +1906,7 @@ impl App {
                     if detail_highlighted {
                         border_style
                     } else {
-                        Style::default().fg(Color::DarkGray)
+                        Style::default().fg(colors.border_muted)
                     },
                     detail_highlighted,
                 );
@@ -1952,7 +1918,7 @@ impl App {
                     if list_highlighted {
                         border_style
                     } else {
-                        Style::default().fg(Color::DarkGray)
+                        Style::default().fg(colors.border_muted)
                     },
                     list_highlighted,
                     self.is_active,

@@ -1,22 +1,19 @@
-//! MODEL USAGE panel rendering
-//!
-//! Contains the model list panel (left side) and its associated right panels:
-//! - MODEL INFO
-//! - TOOLS USED
-//! - MODEL RANKING
+//! Model usage panel rendering.
 
 use super::helpers::{truncate_with_ellipsis, usage_list_row, UsageRowFormat};
+use crate::cost::estimate_cost;
 use crate::stats::{format_number, format_number_full};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, HighlightSpacing, List, ListItem, Paragraph},
     Frame,
 };
+use rustc_hash::FxHashMap;
 
 impl super::App {
-    /// Render the MODEL USAGE left panel (model list)
+    /// MODEL USAGE left panel.
     pub fn render_model_list(
         &mut self,
         frame: &mut Frame,
@@ -30,11 +27,13 @@ impl super::App {
             self.rebuild_model_list_cache(inner_width);
         }
 
+        let colors = self.theme.colors();
         let title_color = if is_highlighted {
-            Color::Cyan
+            colors.border_focus
         } else {
-            Color::DarkGray
+            colors.border_default
         };
+
         let list = List::new(self.cached_model_items.clone())
             .block(
                 Block::default()
@@ -42,7 +41,7 @@ impl super::App {
                     .border_style(if is_highlighted {
                         border_style
                     } else {
-                        Style::default().fg(Color::DarkGray)
+                        Style::default().fg(colors.border_default)
                     })
                     .title(
                         Line::from(Span::styled(
@@ -60,14 +59,14 @@ impl super::App {
                             } else {
                                 " "
                             },
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(colors.text_muted),
                         ))
                         .alignment(Alignment::Center),
                     ),
             )
             .highlight_style(if is_active {
                 Style::default()
-                    .bg(Color::Rgb(60, 60, 90))
+                    .bg(colors.bg_highlight)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -78,39 +77,36 @@ impl super::App {
         frame.render_stateful_widget(list, area, &mut self.model_list_state);
     }
 
-    /// Rebuild the cached model list items
+    /// Rebuild cached model list items.
     pub fn rebuild_model_list_cache(&mut self, width: u16) {
+        let colors = self.theme.colors();
         self.cached_model_width = width;
         let cost_width = self.max_cost_width();
-        let sess_width = 4usize;
-        let fixed_width = 3 + 7 + 4 + 7 + 4 + 3 + (cost_width + 1) + 3 + (sess_width + 5);
-        let available =
-            width.saturating_sub((fixed_width + 2).min(u16::MAX as usize) as u16) as usize;
-        let name_width = available.max(8);
+        let fixed = 3 + 7 + 4 + 7 + 4 + 3 + (cost_width + 1) + 3 + 9;
+        let name_width = width.saturating_sub((fixed + 2).min(u16::MAX as usize) as u16) as usize;
 
         self.cached_model_items = self
             .model_usage
             .iter()
             .map(|m| {
-                let full_name = m.name.to_string();
                 ListItem::new(usage_list_row(
-                    full_name,
+                    m.name.to_string(),
                     m.tokens.input,
                     m.tokens.output,
                     m.cost,
                     m.sessions.len(),
                     &UsageRowFormat {
-                        name_width,
+                        name_width: name_width.max(8),
                         cost_width,
-                        sess_width,
+                        sess_width: 4,
                     },
+                    &colors,
                 ))
             })
             .collect();
     }
 
-    /// Render the MODEL DETAIL right panel (for Models view)
-    /// Contains MODEL INFO, TOOLS USED, and MODEL RANKING
+    /// MODEL DETAIL right panel.
     pub fn render_model_detail(
         &mut self,
         frame: &mut Frame,
@@ -119,445 +115,439 @@ impl super::App {
         is_highlighted: bool,
         _is_active: bool,
     ) {
-        let selected_model = self
-            .selected_model_index
-            .and_then(|i| self.model_usage.get(i));
+        let colors = self.theme.colors();
 
-        let main_chunks = Layout::default()
+        let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(7), // Info (6 lines content + borders)
-                Constraint::Min(0),    // Bottom section
-            ])
+            .constraints([Constraint::Length(7), Constraint::Min(0)])
             .split(area);
 
-        let bottom_chunks = Layout::default()
+        let bottom = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(50), // Tools
-                Constraint::Percentage(50), // Ranking
-            ])
-            .split(main_chunks[1]);
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[1]);
 
-        // Cache right panel rects for Models view
-        self.cached_rects.detail = Some(main_chunks[0]);
-        self.cached_rects.tools = Some(bottom_chunks[0]);
-        self.cached_rects.list = Some(bottom_chunks[1]);
+        self.cached_rects.detail = Some(chunks[0]);
+        self.cached_rects.tools = Some(bottom[0]);
+        self.cached_rects.list = Some(bottom[1]);
 
-        // --- 1. MODEL INFO ---
+        let selected_data = self.selected_model_index.and_then(|i| {
+            let m = self.model_usage.get(i)?;
+            Some((
+                m.name.to_string(),
+                m.sessions.len(),
+                m.messages,
+                m.cost,
+                m.tokens,
+                m.agents.clone(),
+                m.tools.clone(),
+            ))
+        });
+
+        // MODEL INFO
         let info_focused = is_highlighted && self.right_panel == super::helpers::RightPanel::Detail;
-        let info_title = selected_model
-            .map(|m| format!(" {} ", m.name))
-            .unwrap_or_else(|| " MODEL INFO ".to_string());
+        let title = selected_data
+            .as_ref()
+            .map(|d| format!(" {} ", d.0))
+            .unwrap_or_else(|| " MODEL INFO ".into());
         let info_block = Block::default()
             .borders(Borders::ALL)
             .border_style(if info_focused {
                 border_style
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(colors.border_default)
             })
             .title(
                 Line::from(Span::styled(
-                    info_title,
+                    title,
                     Style::default()
                         .fg(if info_focused {
-                            Color::Cyan
+                            colors.border_focus
                         } else {
-                            Color::DarkGray
+                            colors.border_default
                         })
                         .add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Center),
             );
 
-        let info_inner = info_block.inner(main_chunks[0]);
-        frame.render_widget(info_block, main_chunks[0]);
+        let inner = info_block.inner(chunks[0]);
+        frame.render_widget(info_block, chunks[0]);
 
-        if let Some(model) = selected_model {
-            let mut agent_pairs: Vec<(&Box<str>, &u64)> = model.agents.iter().collect();
-            agent_pairs.sort_unstable_by(|a, b| b.1.cmp(a.1));
+        if let Some((name, sessions, messages, cost, tokens, agents, _)) = &selected_data {
+            self.render_model_info(
+                frame, inner, name, *sessions, *messages, *cost, tokens, agents, &colors,
+            );
+        }
 
-            // Responsive layout for model info
-            let inner_width = info_inner.width;
-            let (show_agents, show_tokens) = if inner_width < 45 {
-                (false, false)
-            } else if inner_width < 80 {
-                (false, true)
+        // TOOLS USED
+        let tools_focused = is_highlighted && self.right_panel == super::helpers::RightPanel::Tools;
+        let tools = selected_data.as_ref().map(|d| &d.6);
+        self.render_tools_panel(
+            frame,
+            bottom[0],
+            border_style,
+            tools,
+            &colors,
+            tools_focused,
+        );
+
+        // MODEL RANKING
+        let rank_focused = is_highlighted && self.right_panel == super::helpers::RightPanel::List;
+        self.render_ranking_panel(
+            frame,
+            bottom[1],
+            border_style,
+            self.selected_model_index,
+            &colors,
+            rank_focused,
+        );
+    }
+
+    fn render_model_info(
+        &self,
+        frame: &mut Frame,
+        inner: Rect,
+        model_name: &str,
+        sessions: usize,
+        messages: u64,
+        cost: f64,
+        tokens: &crate::stats::Tokens,
+        agents: &FxHashMap<Box<str>, u64>,
+        colors: &crate::theme::ThemeColors,
+    ) {
+        let mut agent_vec: Vec<_> = agents.iter().collect();
+        agent_vec.sort_unstable_by(|a, b| b.1.cmp(a.1));
+
+        let (show_agents, show_tokens) = match inner.width {
+            w if w < 45 => (false, false),
+            w if w < 80 => (false, true),
+            _ => (true, true),
+        };
+
+        let constraints = match (show_agents, show_tokens) {
+            (true, true) => vec![
+                Constraint::Percentage(25),
+                Constraint::Percentage(37),
+                Constraint::Percentage(38),
+            ],
+            (false, true) => vec![Constraint::Percentage(45), Constraint::Percentage(55)],
+            _ => vec![Constraint::Percentage(100)],
+        };
+
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(constraints)
+            .split(inner);
+        let muted = Style::default().fg(colors.text_muted);
+        let col_w = cols.get(1).map(|c| c.width as usize).unwrap_or(0);
+
+        let est = estimate_cost(model_name, tokens);
+        let savings = est.map(|e| e - cost);
+
+        let left = vec![
+            Line::from(vec![
+                Span::styled("Sessions  ", muted),
+                Span::styled(
+                    format!("{}", sessions),
+                    Style::default()
+                        .fg(colors.info)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Messages  ", muted),
+                Span::styled(
+                    format!("{}", messages),
+                    Style::default()
+                        .fg(colors.info)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Cost      ", muted),
+                Span::styled(
+                    format!("${:.2}", cost),
+                    Style::default()
+                        .fg(colors.cost())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Est. Cost ", muted),
+                Span::styled(
+                    est.map_or("$0.00".into(), |c| format!("${:.2}", c)),
+                    Style::default()
+                        .fg(est
+                            .filter(|&c| c > 0.0)
+                            .map_or(colors.text_muted, |_| colors.accent_orange))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Savings   ", muted),
+                Span::styled(
+                    savings.map_or("$0.00".into(), |s| format!("${:.2}", s)),
+                    Style::default()
+                        .fg(savings
+                            .filter(|&s| s > 0.0)
+                            .map_or(colors.text_muted, |_| colors.success))
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(left), cols[0]);
+
+        if show_agents {
+            let agent_lines = if agent_vec.is_empty() {
+                vec![Line::from(vec![
+                    Span::styled("Agents: ", muted),
+                    Span::styled("n/a", Style::default().fg(colors.text_muted)),
+                ])]
             } else {
-                (true, true)
+                let mut lines: Vec<Line> = agent_vec
+                    .iter()
+                    .take(5)
+                    .enumerate()
+                    .map(|(i, (a, c))| {
+                        let prefix = if i == 0 { "Agents: " } else { "        " };
+                        let text = format!("{} ({} msg)", a.as_ref(), c);
+                        Line::from(vec![
+                            Span::styled(prefix, muted),
+                            Span::styled(
+                                truncate_with_ellipsis(
+                                    &text,
+                                    col_w.saturating_sub(prefix.len() + 1),
+                                ),
+                                Style::default().fg(colors.accent_magenta),
+                            ),
+                        ])
+                    })
+                    .collect();
+                if agent_vec.len() > 5 {
+                    lines[4] = Line::from(vec![
+                        Span::styled("        ", muted),
+                        Span::styled("...", Style::default().fg(colors.accent_magenta)),
+                    ]);
+                }
+                lines
             };
+            frame.render_widget(Paragraph::new(agent_lines), cols[1]);
+        }
 
-            let constraints = if show_agents && show_tokens {
-                vec![
-                    Constraint::Percentage(25),
-                    Constraint::Percentage(37),
-                    Constraint::Percentage(38),
-                ]
-            } else if show_tokens {
-                vec![Constraint::Percentage(45), Constraint::Percentage(55)]
-            } else {
-                vec![Constraint::Percentage(100)]
-            };
-
-            let info_columns = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(constraints)
-                .split(info_inner);
-
-            let label_color = Style::default().fg(Color::Rgb(180, 180, 180));
-            let col_width = info_columns.get(1).map(|c| c.width).unwrap_or(0) as usize;
-            let name_fit_ellipsis = |label_len: usize, text: &str, max_width: usize| -> String {
-                let avail = max_width.saturating_sub(label_len + 1);
-                truncate_with_ellipsis(text, avail.max(1))
-            };
-
-            let est_cost = crate::cost::estimate_cost(&model.name, &model.tokens);
-            let savings = est_cost.map(|e| e - model.cost);
-
-            let left_lines = vec![
+        if show_tokens {
+            let token_lines = vec![
                 Line::from(vec![
-                    Span::styled("Sessions  ", label_color),
+                    Span::styled("Input         ", Style::default().fg(colors.token_input())),
                     Span::styled(
-                        format!("{}", model.sessions.len()),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
+                        format_number_full(tokens.input),
+                        Style::default().fg(colors.token_input()),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("Messages  ", label_color),
+                    Span::styled("Output        ", Style::default().fg(colors.token_output())),
                     Span::styled(
-                        format!("{}", model.messages),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
+                        format_number_full(tokens.output),
+                        Style::default().fg(colors.token_output()),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("Cost      ", label_color),
+                    Span::styled("Thinking      ", Style::default().fg(colors.thinking())),
                     Span::styled(
-                        format!("${:.2}", model.cost),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
+                        format_number_full(tokens.reasoning),
+                        Style::default().fg(colors.thinking()),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("Est. Cost ", label_color),
+                    Span::styled("Cache Read    ", Style::default().fg(colors.cost())),
                     Span::styled(
-                        match est_cost {
-                            Some(c) => format!("${:.2}", c),
-                            None => "$0.00".to_string(),
-                        },
-                        Style::default()
-                            .fg(match est_cost {
-                                Some(c) if c > 0.0 => Color::Rgb(255, 165, 0),
-                                _ => Color::DarkGray,
-                            })
-                            .add_modifier(Modifier::BOLD),
+                        format_number_full(tokens.cache_read),
+                        Style::default().fg(colors.cost()),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("Savings   ", label_color),
+                    Span::styled("Cache Write   ", Style::default().fg(colors.cost())),
                     Span::styled(
-                        match savings {
-                            Some(s) => format!("${:.2}", s),
-                            None => "$0.00".to_string(),
-                        },
-                        Style::default()
-                            .fg(match savings {
-                                Some(s) if s > 0.0 => Color::Green,
-                                _ => Color::DarkGray,
-                            })
-                            .add_modifier(Modifier::BOLD),
+                        format_number_full(tokens.cache_write),
+                        Style::default().fg(colors.cost()),
                     ),
                 ]),
             ];
-
-            frame.render_widget(Paragraph::new(left_lines), info_columns[0]);
-
-            if show_agents {
-                let mut agent_lines: Vec<Line> = Vec::with_capacity(5);
-                let label = "Agents: ";
-                let indent = "        ";
-                if agent_pairs.is_empty() {
-                    agent_lines.push(Line::from(vec![
-                        Span::styled(label, label_color),
-                        Span::styled("n/a", Style::default().fg(Color::DarkGray)),
-                    ]));
-                } else {
-                    let mut iter = agent_pairs.iter();
-                    if let Some((a, c)) = iter.next() {
-                        let first = format!("{} ({} msg)", a.as_ref(), c);
-                        agent_lines.push(Line::from(vec![
-                            Span::styled(label, label_color),
-                            Span::styled(
-                                name_fit_ellipsis(label.len(), &first, col_width),
-                                Style::default().fg(Color::Magenta),
-                            ),
-                        ]));
-                    }
-                    for (a, c) in iter {
-                        if agent_lines.len() >= 5 {
-                            agent_lines.pop();
-                            agent_lines.push(Line::from(vec![
-                                Span::styled(indent, label_color),
-                                Span::styled("...", Style::default().fg(Color::Magenta)),
-                            ]));
-                            break;
-                        }
-                        let line = format!("{} ({} msg)", a.as_ref(), c);
-                        agent_lines.push(Line::from(vec![
-                            Span::styled(indent, label_color),
-                            Span::styled(
-                                name_fit_ellipsis(indent.len(), &line, col_width),
-                                Style::default().fg(Color::Magenta),
-                            ),
-                        ]));
-                    }
-                }
-                frame.render_widget(Paragraph::new(agent_lines), info_columns[1]);
-            }
-
-            if show_tokens {
-                let right_lines = vec![
-                    Line::from(vec![
-                        Span::styled(
-                            "Input         ",
-                            Style::default().fg(Color::Rgb(180, 180, 180)),
-                        ),
-                        Span::styled(
-                            format_number_full(model.tokens.input),
-                            Style::default().fg(Color::Blue),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(
-                            "Output        ",
-                            Style::default().fg(Color::Rgb(180, 180, 180)),
-                        ),
-                        Span::styled(
-                            format_number_full(model.tokens.output),
-                            Style::default().fg(Color::Magenta),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(
-                            "Thinking      ",
-                            Style::default().fg(Color::Rgb(180, 180, 180)),
-                        ),
-                        Span::styled(
-                            format_number_full(model.tokens.reasoning),
-                            Style::default().fg(Color::Rgb(255, 165, 0)),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(
-                            "Cache Read    ",
-                            Style::default().fg(Color::Rgb(180, 180, 180)),
-                        ),
-                        Span::styled(
-                            format_number_full(model.tokens.cache_read),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(
-                            "Cache Write   ",
-                            Style::default().fg(Color::Rgb(180, 180, 180)),
-                        ),
-                        Span::styled(
-                            format_number_full(model.tokens.cache_write),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                    ]),
-                ];
-                let token_col_idx = if show_agents { 2 } else { 1 };
-                frame.render_widget(Paragraph::new(right_lines), info_columns[token_col_idx]);
-            }
+            frame.render_widget(
+                Paragraph::new(token_lines),
+                cols[if show_agents { 2 } else { 1 }],
+            );
         }
+    }
 
-        // --- 2. TOOLS USED ---
-        let tools_focused = is_highlighted && self.right_panel == super::helpers::RightPanel::Tools;
-        let tools_block = Block::default()
+    fn render_tools_panel(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        border_style: Style,
+        tools: Option<&FxHashMap<Box<str>, u64>>,
+        colors: &crate::theme::ThemeColors,
+        focused: bool,
+    ) {
+        let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(if tools_focused {
+            .border_style(if focused {
                 border_style
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(colors.border_default)
             })
             .title(
                 Line::from(Span::styled(
                     " TOOLS USED ",
                     Style::default()
-                        .fg(if tools_focused {
-                            Color::Cyan
+                        .fg(if focused {
+                            colors.border_focus
                         } else {
-                            Color::DarkGray
+                            colors.border_default
                         })
                         .add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Center),
             );
 
-        let tools_inner = tools_block.inner(bottom_chunks[0]);
-        frame.render_widget(tools_block, bottom_chunks[0]);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
 
-        if let Some(model) = selected_model {
-            if !model.tools.is_empty() {
-                // Optimized: pre-allocate with known capacity for sorting
-                let mut tools: Vec<_> = model.tools.iter().collect();
-                tools.sort_unstable_by(|a, b| b.1.cmp(a.1));
-                let total: u64 = tools.iter().map(|(_, c)| **c).sum();
-                // Fixed layout: 14 (name) + bar + 6 (count)
-                // Fixed layout: " name " (16) + bar + " XXXXX" (6) = 22
-                let bar_max = tools_inner.width.saturating_sub(22) as usize;
+        let Some(tools) = tools else { return };
 
-                self.model_tool_max_scroll =
-                    (tools.len().saturating_sub(tools_inner.height as usize)) as u16;
-                self.model_tool_scroll = self.model_tool_scroll.min(self.model_tool_max_scroll);
-
-                // Soft pink color (not bright magenta)
-                let bar_color = Color::Rgb(220, 100, 160);
-                let empty_color = Color::Rgb(38, 42, 50);
-
-                // Optimized: use single spans for filled and empty portions
-                let lines: Vec<Line> = tools
-                    .into_iter()
-                    .map(|(name, count)| {
-                        let width = ((*count as f64 / total as f64) * bar_max as f64) as usize;
-
-                        let filled_str: String = " ".repeat(width);
-                        let empty_str: String = " ".repeat(bar_max.saturating_sub(width));
-
-                        Line::from(vec![
-                            Span::styled(
-                                format!(" {:<14} ", truncate_with_ellipsis(name, 14)),
-                                Style::default().fg(Color::White),
-                            ),
-                            Span::styled(filled_str, Style::default().bg(bar_color)),
-                            Span::styled(empty_str, Style::default().bg(empty_color)),
-                            Span::styled(
-                                format!(" {:>5}", count),
-                                Style::default()
-                                    .fg(Color::Rgb(220, 100, 160))
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ])
-                    })
-                    .collect();
-                frame.render_widget(
-                    Paragraph::new(lines).scroll((self.model_tool_scroll, 0)),
-                    tools_inner,
-                );
-            } else {
-                let placeholder = "░".repeat(tools_inner.width.saturating_sub(2) as usize);
-                let lines: Vec<Line> = (0..tools_inner.height)
-                    .map(|_| {
-                        Line::styled(
-                            placeholder.clone(),
-                            Style::default().fg(Color::Rgb(30, 30, 40)),
-                        )
-                    })
-                    .collect();
-                frame.render_widget(
-                    Paragraph::new(lines).alignment(Alignment::Center),
-                    tools_inner,
-                );
-            }
+        if tools.is_empty() {
+            let placeholder = "░".repeat(inner.width.saturating_sub(2) as usize);
+            let lines: Vec<Line> = (0..inner.height)
+                .map(|_| Line::styled(placeholder.clone(), Style::default().fg(colors.bg_primary)))
+                .collect();
+            frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
+            return;
         }
 
-        // --- 3. MODEL RANKING ---
-        let ranking_focused =
-            is_highlighted && self.right_panel == super::helpers::RightPanel::List;
-        let ranking_block = Block::default()
+        let mut items: Vec<_> = tools.iter().collect();
+        items.sort_unstable_by(|a, b| b.1.cmp(a.1));
+        let total: u64 = items.iter().map(|(_, c)| **c).sum();
+        let bar_max = inner.width.saturating_sub(22) as usize;
+
+        self.model_tool_max_scroll = items.len().saturating_sub(inner.height as usize) as u16;
+        self.model_tool_scroll = self.model_tool_scroll.min(self.model_tool_max_scroll);
+
+        let lines: Vec<Line> = items
+            .into_iter()
+            .map(|(name, count)| {
+                let w = ((*count as f64 / total as f64) * bar_max as f64) as usize;
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {:<14} ", truncate_with_ellipsis(name, 14)),
+                        Style::default().fg(colors.text_primary),
+                    ),
+                    Span::styled(" ".repeat(w), Style::default().bg(colors.accent_pink)),
+                    Span::styled(
+                        " ".repeat(bar_max.saturating_sub(w)),
+                        Style::default().bg(colors.bg_tertiary),
+                    ),
+                    Span::styled(
+                        format!(" {:>5}", count),
+                        Style::default()
+                            .fg(colors.accent_pink)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            })
+            .collect();
+
+        frame.render_widget(
+            Paragraph::new(lines).scroll((self.model_tool_scroll, 0)),
+            inner,
+        );
+    }
+
+    fn render_ranking_panel(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        border_style: Style,
+        selected_idx: Option<usize>,
+        colors: &crate::theme::ThemeColors,
+        focused: bool,
+    ) {
+        let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(if ranking_focused {
+            .border_style(if focused {
                 border_style
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(colors.border_default)
             })
             .title(
                 Line::from(Span::styled(
                     " MODEL RANKING ",
                     Style::default()
-                        .fg(if ranking_focused {
-                            Color::Cyan
+                        .fg(if focused {
+                            colors.border_focus
                         } else {
-                            Color::DarkGray
+                            colors.border_default
                         })
                         .add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Center),
             );
 
-        let ranking_inner = ranking_block.inner(bottom_chunks[1]);
-        frame.render_widget(ranking_block, bottom_chunks[1]);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
 
-        let mut ranked_models: Vec<_> = self.model_usage.iter().enumerate().collect();
-        ranked_models.sort_unstable_by(|a, b| b.1.tokens.total().cmp(&a.1.tokens.total()));
-        self.ranking_max_scroll = ranked_models
-            .len()
-            .saturating_sub(ranking_inner.height as usize);
+        let mut ranked: Vec<_> = self.model_usage.iter().enumerate().collect();
+        ranked.sort_unstable_by(|a, b| b.1.tokens.total().cmp(&a.1.tokens.total()));
+
+        self.ranking_max_scroll = ranked.len().saturating_sub(inner.height as usize);
         self.ranking_scroll = self.ranking_scroll.min(self.ranking_max_scroll);
 
-        let grand_total: u64 = self.model_usage.iter().map(|m| m.tokens.total()).sum();
-
-        let bar_available_width = ranking_inner.width.saturating_sub(2);
-        let max_token_len = self
+        let grand: u64 = self.model_usage.iter().map(|m| m.tokens.total()).sum();
+        let max_tok_len = self
             .model_usage
             .iter()
             .map(|m| format_number(m.tokens.total()).len())
             .max()
             .unwrap_or(1);
-        let ranking_lines: Vec<Line> = ranked_models
+        let bar_avail = inner.width.saturating_sub(2);
+
+        let lines: Vec<Line> = ranked
             .iter()
-            .map(|(idx, model)| {
-                let is_selected = self.selected_model_index == Some(*idx);
-                let percentage = if grand_total > 0 {
-                    (model.tokens.total() as f64 / grand_total as f64) * 100.0
+            .map(|(idx, m)| {
+                let sel = selected_idx == Some(*idx);
+                let pct = if grand > 0 {
+                    (m.tokens.total() as f64 / grand as f64) * 100.0
                 } else {
                     0.0
                 };
-                let percent_text = format!("{:>5.1}%", percentage);
-                let token_text = format_number(model.tokens.total());
                 let suffix = format!(
-                    " {} ({:>width$})",
-                    percent_text,
-                    token_text,
-                    width = max_token_len
+                    " {:>5.1}% ({:>w$})",
+                    pct,
+                    format_number(m.tokens.total()),
+                    w = max_tok_len
                 );
-                let suffix_len = suffix.chars().count() as u16;
-                let bar_max_width = bar_available_width.saturating_sub(suffix_len) as usize;
-                let bar_width = if grand_total > 0 {
-                    ((model.tokens.total() as f64 / grand_total as f64) * bar_max_width as f64)
-                        as usize
+                let bar_max = bar_avail.saturating_sub(suffix.chars().count() as u16) as usize;
+                let bar_w = if grand > 0 {
+                    ((m.tokens.total() as f64 / grand as f64) * bar_max as f64) as usize
                 } else {
                     0
                 };
 
-                // Build continuous bar with background colors
-                let bar_color = if is_selected {
-                    Color::Rgb(0, 200, 200) // Cyan
-                } else {
-                    Color::Rgb(80, 80, 100) // Dim gray
-                };
-                let empty_color = Color::Rgb(38, 42, 50);
-
-                // Optimized: use single spans for filled and empty portions
-                let filled_str: String = " ".repeat(bar_width.min(bar_max_width));
-                let empty_str: String = " ".repeat(bar_max_width.saturating_sub(bar_width));
-
                 Line::from(vec![
-                    Span::styled(filled_str, Style::default().bg(bar_color)),
-                    Span::styled(empty_str, Style::default().bg(empty_color)),
+                    Span::styled(
+                        " ".repeat(bar_w.min(bar_max)),
+                        Style::default().bg(if sel { colors.info } else { colors.bg_tertiary }),
+                    ),
+                    Span::styled(
+                        " ".repeat(bar_max.saturating_sub(bar_w)),
+                        Style::default().bg(colors.bg_tertiary),
+                    ),
                     Span::styled(
                         suffix,
                         Style::default()
-                            .fg(if is_selected {
-                                Color::Yellow
+                            .fg(if sel {
+                                colors.accent_yellow
                             } else {
-                                Color::DarkGray
+                                colors.text_muted
                             })
                             .add_modifier(Modifier::BOLD),
                     ),
@@ -565,34 +555,21 @@ impl super::App {
             })
             .collect();
 
-        // Auto-scroll to keep selected model visible
-        if let Some(selected_idx) = self.selected_model_index {
-            if let Some(selected_rank) = ranked_models
-                .iter()
-                .position(|(idx, _)| *idx == selected_idx)
-            {
-                let visible_height = ranking_inner.height as usize;
-                if visible_height > 0 {
-                    if selected_rank >= self.ranking_scroll + visible_height
-                        || selected_rank < self.ranking_scroll
-                    {
-                        self.ranking_scroll = selected_rank.saturating_sub(visible_height / 2);
-                    }
-                    self.ranking_scroll = self
-                        .ranking_scroll
-                        .min(ranking_lines.len().saturating_sub(visible_height));
-                } else {
-                    self.ranking_scroll = 0;
+        if let Some(idx) = selected_idx {
+            if let Some(pos) = ranked.iter().position(|(i, _)| *i == idx) {
+                let h = inner.height as usize;
+                if h > 0 && (pos >= self.ranking_scroll + h || pos < self.ranking_scroll) {
+                    self.ranking_scroll =
+                        pos.saturating_sub(h / 2).min(lines.len().saturating_sub(h));
                 }
             }
         }
 
-        let visible_lines: Vec<Line> = ranking_lines
+        let visible: Vec<Line> = lines
             .into_iter()
             .skip(self.ranking_scroll)
-            .take(ranking_inner.height as usize)
+            .take(inner.height as usize)
             .collect();
-
-        frame.render_widget(Paragraph::new(visible_lines), ranking_inner);
+        frame.render_widget(Paragraph::new(visible), inner);
     }
 }
