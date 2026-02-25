@@ -579,7 +579,7 @@ impl SessionModal {
                     ]));
                     lines.push(Line::from(vec![
                         Span::styled(
-                            format!("      {:<9}", "Messages"),
+                            format!("      {:<9}", "Responses"),
                             Style::default().fg(colors.text_muted),
                         ),
                         Span::styled(

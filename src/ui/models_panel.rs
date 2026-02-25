@@ -256,11 +256,11 @@ impl super::App {
                 ),
             ]),
             Line::from(vec![
-                Span::styled("Messages  ", muted),
+                Span::styled("Responses ", muted),
                 Span::styled(
                     format!("{}", messages),
                     Style::default()
-                        .fg(colors.info)
+                        .fg(colors.success)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),

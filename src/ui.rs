@@ -1791,13 +1791,19 @@ impl App {
         };
 
         let stats_height = 6;
-        let model_height = 6.min(self.model_usage.len() as u16 + 2);
+        let remaining = area.height.saturating_sub(stats_height);
+        let model_height = if remaining > 18 {
+            let extra = remaining - 18;
+            (6 + extra / 3).min(self.model_usage.len() as u16 + 2)
+        } else {
+            6.min(self.model_usage.len() as u16 + 2)
+        };
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(stats_height),
-                Constraint::Min(9),
+                Constraint::Min(12),
                 Constraint::Length(model_height),
             ])
             .split(area);
