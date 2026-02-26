@@ -1,11 +1,12 @@
 //! Model usage panel rendering.
 
 use super::helpers::{truncate_with_ellipsis, usage_list_row, UsageRowFormat};
-use crate::cost::estimate_cost;
+use crate::cost::{estimate_cost, lookup_pricing};
 use crate::stats::{format_number, format_number_full};
+use chrono::Datelike;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, HighlightSpacing, List, ListItem, Paragraph},
     Frame,
@@ -119,15 +120,20 @@ impl super::App {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(7), Constraint::Min(0)])
+            .constraints([
+                Constraint::Length(9),
+                Constraint::Min(5),
+                Constraint::Length(10),
+            ])
             .split(area);
 
         let bottom = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(chunks[1]);
+            .split(chunks[2]);
 
         self.cached_rects.detail = Some(chunks[0]);
+        self.cached_rects.activity = Some(chunks[1]);
         self.cached_rects.tools = Some(bottom[0]);
         self.cached_rects.list = Some(bottom[1]);
 
@@ -176,9 +182,22 @@ impl super::App {
 
         if let Some((name, sessions, messages, cost, tokens, agents, _)) = &selected_data {
             self.render_model_info(
-                frame, inner, name, *sessions, *messages, *cost, tokens, agents, &colors,
+                frame,
+                inner,
+                name,
+                *sessions,
+                *messages,
+                *cost,
+                tokens,
+                agents,
+                &colors,
+                info_focused,
             );
         }
+
+        let timeline_focused =
+            is_highlighted && self.right_panel == super::helpers::RightPanel::Activity;
+        self.render_model_timeline(frame, chunks[1], border_style, &colors, timeline_focused);
 
         // TOOLS USED
         let tools_focused = is_highlighted && self.right_panel == super::helpers::RightPanel::Tools;
@@ -215,11 +234,20 @@ impl super::App {
         tokens: &crate::stats::Tokens,
         agents: &FxHashMap<Box<str>, u64>,
         colors: &crate::theme::ThemeColors,
+        focused: bool,
     ) {
+        if inner.height < 3 {
+            return;
+        }
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(2)])
+            .split(inner);
+
         let mut agent_vec: Vec<_> = agents.iter().collect();
         agent_vec.sort_unstable_by(|a, b| b.1.cmp(a.1));
 
-        let (show_agents, show_tokens) = match inner.width {
+        let (show_agents, show_tokens) = match sections[0].width {
             w if w < 45 => (false, false),
             w if w < 80 => (false, true),
             _ => (true, true),
@@ -238,7 +266,7 @@ impl super::App {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(constraints)
-            .split(inner);
+            .split(sections[0]);
         let muted = Style::default().fg(colors.text_muted);
         let col_w = cols.get(1).map(|c| c.width as usize).unwrap_or(0);
 
@@ -378,6 +406,432 @@ impl super::App {
                 cols[if show_agents { 2 } else { 1 }],
             );
         }
+
+        let pricing_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(sections[1]);
+
+        let sep_color = if focused {
+            colors.border_focus
+        } else {
+            colors.text_muted
+        };
+        let label = " OpenRouter Price ";
+        let sep_w = pricing_rows[0].width as usize;
+        let label_len = label.chars().count();
+        let dash_total = sep_w.saturating_sub(label_len);
+        let dash_left = dash_total / 2;
+        let dash_right = dash_total.saturating_sub(dash_left);
+        let sep_style = Style::default().fg(sep_color);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("─".repeat(dash_left), sep_style),
+                Span::styled(
+                    label,
+                    sep_style.add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("─".repeat(dash_right), sep_style),
+            ])),
+            pricing_rows[0],
+        );
+
+        let pricing_line =
+            self.model_price_line(model_name, pricing_rows[1].width as usize, colors);
+        frame.render_widget(
+            Paragraph::new(Line::from(pricing_line)).alignment(Alignment::Center),
+            pricing_rows[1],
+        );
+    }
+
+    fn model_price_line(
+        &self,
+        model_name: &str,
+        width: usize,
+        colors: &crate::theme::ThemeColors,
+    ) -> Vec<Span<'static>> {
+        let muted = Style::default().fg(colors.text_muted);
+        let Some(p) = lookup_pricing(model_name) else {
+            return vec![Span::styled("n/a", Style::default().fg(colors.text_muted))];
+        };
+
+        let mut spans = vec![
+            Span::styled(
+                format!("In ${:.2}/M", p.prompt * 1_000_000.0),
+                Style::default()
+                    .fg(colors.token_input())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" • ", muted),
+            Span::styled(
+                format!("Out ${:.2}/M", p.completion * 1_000_000.0),
+                Style::default()
+                    .fg(colors.token_output())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+
+        let extras = [
+            (
+                "Cache R",
+                p.input_cache_read,
+                Style::default()
+                    .fg(colors.cost())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            (
+                "Cache W",
+                p.input_cache_write,
+                Style::default()
+                    .fg(colors.cost())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            (
+                "Think",
+                p.reasoning,
+                Style::default()
+                    .fg(colors.thinking())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+
+        let mut used = spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum::<usize>();
+        for (name, rate, style) in extras {
+            let part = format!("{} ${:.2}/M", name, rate * 1_000_000.0);
+            let need = 3 + part.chars().count();
+            if used + need > width.saturating_sub(1) {
+                break;
+            }
+            spans.push(Span::styled(" • ", muted));
+            spans.push(Span::styled(part, style));
+            used += need;
+        }
+        spans
+    }
+
+    fn render_model_timeline(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        border_style: Style,
+        colors: &crate::theme::ThemeColors,
+        focused: bool,
+    ) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if focused {
+                border_style
+            } else {
+                Style::default().fg(colors.border_default)
+            })
+            .title(
+                Line::from(Span::styled(
+                    " MODEL TOKEN TIMELINE ",
+                    Style::default()
+                        .fg(if focused {
+                            colors.border_focus
+                        } else {
+                            colors.border_default
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Center),
+            )
+            .title_bottom(
+                Line::from(Span::styled(
+                    if focused {
+                        " Click a bar to inspect usage "
+                    } else {
+                        " "
+                    },
+                    Style::default().fg(colors.text_muted),
+                ))
+                .alignment(Alignment::Center),
+            );
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let Some(idx) = self.selected_model_index else {
+            self.model_timeline_layout = None;
+            return;
+        };
+        let Some(model) = self.model_usage.get(idx) else {
+            self.model_timeline_layout = None;
+            return;
+        };
+        if inner.width < 12 || inner.height < 4 {
+            self.model_timeline_layout = None;
+            return;
+        }
+
+        let mut points: Vec<(chrono::NaiveDate, u64)> = model
+            .daily_tokens
+            .iter()
+            .filter_map(|(d, v)| {
+                chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                    .ok()
+                    .map(|nd| (nd, *v))
+            })
+            .collect();
+        if points.is_empty() {
+            self.model_timeline_layout = None;
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![Span::styled(
+                    "No daily model data available.",
+                    Style::default().fg(colors.text_muted),
+                )]))
+                .alignment(Alignment::Center),
+                inner,
+            );
+            return;
+        }
+        points.sort_unstable_by_key(|(d, _)| *d);
+        let mut global_end = self
+            .per_day
+            .keys()
+            .filter_map(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+            .max()
+            .unwrap_or_else(|| chrono::Local::now().date_naive());
+
+        let month_row_h = if inner.height >= 10 { 1 } else { 0 };
+        let info_h = 2u16;
+        let chart_h = inner.height.saturating_sub(month_row_h + info_h).max(1);
+        let bars = (inner.width / 2).max(1) as usize;
+        let target_window_days = 100i64;
+        let bucket_days = (target_window_days as usize).div_ceil(bars).max(1) as i64;
+        let span_days = (bars as i64) * bucket_days;
+        let mut window_start = global_end - chrono::Duration::days(span_days.saturating_sub(1));
+
+        // If selected model has no activity in the latest global window,
+        // fall back to the model's own latest active window so chart is never empty.
+        if !points
+            .iter()
+            .any(|(d, _)| *d >= window_start && *d <= global_end)
+        {
+            let model_end = points.last().map(|(d, _)| *d).unwrap_or(global_end);
+            global_end = model_end;
+            window_start = global_end - chrono::Duration::days(span_days.saturating_sub(1));
+        }
+        let chart_top = inner.y + month_row_h;
+
+        self.model_timeline_layout = Some(super::helpers::ModelTimelineLayout {
+            inner,
+            chart_y: chart_top,
+            chart_h,
+            bars,
+            bar_w: 2,
+            start_date: window_start,
+            bucket_days,
+        });
+
+        let mut model_sums = vec![0u64; bars];
+        let mut total_sums = vec![0u64; bars];
+        let mut peak_day = vec![window_start; bars];
+        let mut peak_tokens = vec![0u64; bars];
+        let mut hour_weighted = vec![0f64; bars];
+        let mut hour_weight = vec![0u64; bars];
+
+        for (day_str, day_stat) in &self.per_day {
+            let Ok(d) = chrono::NaiveDate::parse_from_str(day_str, "%Y-%m-%d") else {
+                continue;
+            };
+            if d < window_start || d > global_end {
+                continue;
+            }
+            let rel = (d - window_start).num_days().max(0);
+            let b = ((rel / bucket_days) as usize).min(bars - 1);
+            total_sums[b] += day_stat.tokens.total();
+        }
+
+        for (d, t) in &points {
+            if *d < window_start || *d > global_end {
+                continue;
+            }
+            let rel = (*d - window_start).num_days().max(0);
+            let b = ((rel / bucket_days) as usize).min(bars - 1);
+            model_sums[b] += *t;
+            if *t >= peak_tokens[b] {
+                peak_tokens[b] = *t;
+                peak_day[b] = *d;
+            }
+            if let Some(h) = model.daily_last_hour.get(&d.format("%Y-%m-%d").to_string()) {
+                hour_weighted[b] += *h as f64 * *t as f64;
+                hour_weight[b] += *t;
+            }
+        }
+        let max_total = total_sums.iter().copied().max().unwrap_or(0);
+        let max_model = model_sums.iter().copied().max().unwrap_or(0);
+        let max_chart = max_total.max(max_model).max(1);
+
+        let selected_bar = self
+            .model_timeline_selected_day
+            .as_deref()
+            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+            .map(|d| {
+                let rel = (d - window_start).num_days().max(0);
+                ((rel / bucket_days) as usize).min(bars - 1)
+            })
+            .unwrap_or_else(|| {
+                model_sums
+                    .iter()
+                    .rposition(|v| *v > 0)
+                    .unwrap_or(bars.saturating_sub(1))
+            });
+
+        let flash = self.model_timeline_flash_time.map(|t| {
+            (1.0 - (t.elapsed().as_millis() as f64 * std::f64::consts::TAU / 600.0).cos()) * 0.2
+        });
+        let base = match colors.accent_cyan {
+            Color::Rgb(r, g, b) => (r as f64, g as f64, b as f64),
+            _ => (90.0, 210.0, 220.0),
+        };
+        let bg = match colors.bg_tertiary {
+            Color::Rgb(r, g, b) => (r as f64, g as f64, b as f64),
+            _ => (60.0, 60.0, 60.0),
+        };
+
+        let mut lines: Vec<Line> = Vec::new();
+        if month_row_h == 1 {
+            let mut month_spans = Vec::with_capacity(bars);
+            for i in 0..bars {
+                let d = window_start + chrono::Duration::days((i as i64) * bucket_days);
+                let show = i == 0 || d.day() <= bucket_days as u32;
+                let txt = if show {
+                    super::helpers::month_abbr(d.month())
+                } else {
+                    ""
+                };
+                month_spans.push(Span::styled(
+                    format!("{:<2}", txt.chars().take(2).collect::<String>()),
+                    Style::default().fg(colors.text_muted),
+                ));
+            }
+            lines.push(Line::from(month_spans));
+        }
+
+        for row in (0..chart_h).rev() {
+            let mut spans: Vec<Span> = Vec::with_capacity(bars);
+            for i in 0..bars {
+                let total = total_sums[i].max(model_sums[i]);
+                let model_total = model_sums[i];
+                let total_level =
+                    ((total as f64 / max_chart as f64) * chart_h as f64).ceil() as u16;
+                let share = if total > 0 {
+                    model_total as f64 / total as f64
+                } else {
+                    0.0
+                };
+                let model_level = ((total_level as f64) * share).ceil() as u16;
+                let avg_hour = if hour_weight[i] > 0 {
+                    (hour_weighted[i] / hour_weight[i] as f64).clamp(0.0, 23.0)
+                } else {
+                    11.5
+                };
+                let anchor = avg_hour / 23.0;
+                let model_start = if total_level > model_level {
+                    ((total_level - model_level) as f64 * anchor).round() as u16
+                } else {
+                    0
+                };
+                let from_bottom = chart_h.saturating_sub(1).saturating_sub(row);
+                let filled_total = from_bottom < total_level;
+                let filled_model = filled_total
+                    && model_level > 0
+                    && from_bottom >= model_start
+                    && from_bottom < model_start.saturating_add(model_level);
+                let sel = i == selected_bar;
+                let mut c = if filled_model {
+                    let ratio = (model_total as f64 / max_chart as f64).max(0.2);
+                    Color::Rgb(
+                        (bg.0 + (base.0 - bg.0) * ratio) as u8,
+                        (bg.1 + (base.1 - bg.1) * ratio) as u8,
+                        (bg.2 + (base.2 - bg.2) * ratio) as u8,
+                    )
+                } else if filled_total {
+                    Color::Rgb(
+                        (bg.0 + (base.0 - bg.0) * 0.16) as u8,
+                        (bg.1 + (base.1 - bg.1) * 0.16) as u8,
+                        (bg.2 + (base.2 - bg.2) * 0.16) as u8,
+                    )
+                } else {
+                    colors.bg_tertiary
+                };
+                if sel && filled_model {
+                    if let (Some(f), Color::Rgb(r, g, b)) = (flash, c) {
+                        c = Color::Rgb(
+                            (r as f64 + (255.0 - r as f64) * f) as u8,
+                            (g as f64 + (255.0 - g as f64) * f) as u8,
+                            (b as f64 + (255.0 - b as f64) * f) as u8,
+                        );
+                    }
+                }
+                spans.push(Span::styled("  ", Style::default().bg(c)));
+            }
+            lines.push(Line::from(spans));
+        }
+
+        let active_start = points
+            .iter()
+            .filter(|(d, _)| *d >= window_start && *d <= global_end)
+            .map(|(d, _)| *d)
+            .min()
+            .unwrap_or(window_start);
+        let active_end = points
+            .iter()
+            .filter(|(d, _)| *d >= window_start && *d <= global_end)
+            .map(|(d, _)| *d)
+            .max()
+            .unwrap_or(global_end);
+        let active_span_days = (active_end - active_start).num_days().max(0) + 1;
+
+        let sel_day = peak_day[selected_bar];
+        let sel_tokens = peak_tokens[selected_bar];
+        let model_total = model.tokens.total();
+        let sel_pct = if model_total > 0 {
+            (sel_tokens as f64 / model_total as f64) * 100.0
+        } else {
+            0.0
+        };
+        self.model_timeline_selected_day = Some(sel_day.format("%Y-%m-%d").to_string());
+        self.model_timeline_selected_tokens = sel_tokens;
+        self.model_timeline_selected_pct = sel_pct;
+
+        lines.push(Line::from(vec![
+            Span::styled("Active: ", Style::default().fg(colors.text_muted)),
+            Span::styled(
+                format!(
+                    "{} → {} ({} days)",
+                    active_start.format("%Y-%m-%d"),
+                    active_end.format("%Y-%m-%d"),
+                    active_span_days
+                ),
+                Style::default().fg(colors.text_primary),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{}: ", sel_day.format("%Y-%m-%d")),
+                Style::default().fg(colors.text_muted),
+            ),
+            Span::styled(
+                format!("{}", format_compact(sel_tokens)),
+                Style::default()
+                    .fg(colors.success)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" tokens ", Style::default().fg(colors.text_muted)),
+            Span::styled(
+                format!("({:.1}%)", sel_pct),
+                Style::default()
+                    .fg(colors.info)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     fn render_tools_panel(
@@ -571,5 +1025,14 @@ impl super::App {
             .take(inner.height as usize)
             .collect();
         frame.render_widget(Paragraph::new(visible), inner);
+    }
+}
+
+fn format_compact(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{:.1}K", n as f64 / 1_000.0),
+        1_000_000..=999_999_999 => format!("{:.1}M", n as f64 / 1_000_000.0),
+        _ => format!("{:.1}B", n as f64 / 1_000_000_000.0),
     }
 }

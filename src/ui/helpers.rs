@@ -101,6 +101,17 @@ pub struct HeatmapLayout {
     pub grid_pad: u16,
 }
 
+#[derive(Clone, Copy)]
+pub struct ModelTimelineLayout {
+    pub inner: Rect,
+    pub chart_y: u16,
+    pub chart_h: u16,
+    pub bars: usize,
+    pub bar_w: u16,
+    pub start_date: chrono::NaiveDate,
+    pub bucket_days: i64,
+}
+
 /// Stat paragraph with label and value.
 pub fn stat_widget(
     label: &str,

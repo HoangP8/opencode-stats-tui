@@ -1,5 +1,6 @@
 //! Statistics collection from opencode storage.
 
+use chrono::Timelike;
 use rayon::prelude::*;
 use rusqlite::{params, Connection, OpenFlags};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -444,6 +445,10 @@ pub struct ModelUsage {
     pub tokens: Tokens,
     pub tools: FxHashMap<Box<str>, u64>,
     pub agents: FxHashMap<Box<str>, u64>,
+    #[serde(default)]
+    pub daily_tokens: FxHashMap<String, u64>,
+    #[serde(default)]
+    pub daily_last_hour: FxHashMap<String, u8>,
     pub cost: f64,
 }
 
@@ -1550,6 +1555,8 @@ pub fn collect_stats() -> Stats {
                     tokens: Tokens::default(),
                     tools: FxHashMap::default(),
                     agents: FxHashMap::default(),
+                    daily_tokens: FxHashMap::default(),
+                    daily_last_hour: FxHashMap::default(),
                     cost: 0.0,
                 }
             });
@@ -1566,6 +1573,14 @@ pub fn collect_stats() -> Stats {
             model_entry.tokens.reasoning += tokens_from_msg.reasoning;
             model_entry.tokens.cache_read += tokens_from_msg.cache_read;
             model_entry.tokens.cache_write += tokens_from_msg.cache_write;
+            *model_entry.daily_tokens.entry(day.clone()).or_insert(0) += tokens_from_msg.total();
+            if let Some(secs) = ts_val {
+                if let Some(dt) = chrono::DateTime::from_timestamp(secs, 0) {
+                    model_entry
+                        .daily_last_hour
+                        .insert(day.clone(), dt.hour() as u8);
+                }
+            }
             if let Some(agent) = msg
                 .agent
                 .as_ref()

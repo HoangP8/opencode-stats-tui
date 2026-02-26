@@ -1,6 +1,7 @@
 //! Incremental statistics cache with file-based persistence.
 
 use bincode::{deserialize, serialize};
+use chrono::Timelike;
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -15,7 +16,7 @@ use std::{
 type SessionDiffs = FxHashMap<String, FxHashMap<String, crate::stats::FileDiff>>;
 type SessionSortedDays = FxHashMap<String, Vec<String>>;
 
-const CACHE_FORMAT_VERSION: u64 = 11;
+const CACHE_FORMAT_VERSION: u64 = 12;
 
 /// Metadata for file validation
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -770,6 +771,9 @@ impl StatsCache {
                     m.tokens.cache_read = m.tokens.cache_read.saturating_sub(old_tokens.cache_read);
                     m.tokens.cache_write =
                         m.tokens.cache_write.saturating_sub(old_tokens.cache_write);
+                    if let Some(dt) = m.daily_tokens.get_mut(&day) {
+                        *dt = dt.saturating_sub(old_tokens.total());
+                    }
                 }
             }
 
@@ -852,6 +856,12 @@ impl StatsCache {
                 m.tokens.reasoning += tokens_add.reasoning;
                 m.tokens.cache_read += tokens_add.cache_read;
                 m.tokens.cache_write += tokens_add.cache_write;
+                *m.daily_tokens.entry(day.clone()).or_insert(0) += tokens_add.total();
+                if let Some(secs) = ts {
+                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, 0) {
+                        m.daily_last_hour.insert(day.clone(), dt.hour() as u8);
+                    }
+                }
                 m.sessions.insert(session_id.clone().into_boxed_str());
                 if is_new_message {
                     *m.agents.entry(agent_name.clone()).or_insert(0) += 1;
@@ -868,6 +878,14 @@ impl StatsCache {
                 agents.insert(agent_name.clone(), 1);
                 let mut sessions = FxHashSet::default();
                 sessions.insert(session_id.clone().into_boxed_str());
+                let mut daily_tokens = FxHashMap::default();
+                daily_tokens.insert(day.clone(), tokens_add.total());
+                let mut daily_last_hour = FxHashMap::default();
+                if let Some(secs) = ts {
+                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, 0) {
+                        daily_last_hour.insert(day.clone(), dt.hour() as u8);
+                    }
+                }
                 stats.model_usage.push(crate::stats::ModelUsage {
                     name: model_id.clone(),
                     short_name: n.into(),
@@ -878,6 +896,8 @@ impl StatsCache {
                     tokens: tokens_add,
                     tools: FxHashMap::default(),
                     agents,
+                    daily_tokens,
+                    daily_last_hour,
                     cost,
                 });
             }

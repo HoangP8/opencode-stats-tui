@@ -16,7 +16,7 @@ use crossterm::event::{
 };
 use helpers::{
     cache_key, calculate_message_rendered_lines, CachedChat, Focus, HeatmapLayout, LeftPanel,
-    PanelRects, RightPanel,
+    ModelTimelineLayout, PanelRects, RightPanel,
 };
 use parking_lot::Mutex;
 use ratatui::{
@@ -100,6 +100,13 @@ pub struct App {
     overview_heatmap_selected_cost: f64,
     overview_heatmap_selected_active_ms: i64,
     overview_heatmap_flash_time: Option<std::time::Instant>,
+
+    // Models panel timeline data
+    model_timeline_layout: Option<ModelTimelineLayout>,
+    model_timeline_selected_day: Option<String>,
+    model_timeline_selected_tokens: u64,
+    model_timeline_selected_pct: f64,
+    model_timeline_flash_time: Option<std::time::Instant>,
 
     // Live stats: cache and file watching
     stats_cache: Option<StatsCache>,
@@ -256,6 +263,12 @@ impl App {
             overview_heatmap_selected_cost: 0.0,
             overview_heatmap_selected_active_ms: 0,
             overview_heatmap_flash_time: None,
+
+            model_timeline_layout: None,
+            model_timeline_selected_day: None,
+            model_timeline_selected_tokens: 0,
+            model_timeline_selected_pct: 0.0,
+            model_timeline_flash_time: None,
 
             modal: SessionModal::new(),
             theme: Theme,
@@ -889,8 +902,10 @@ impl App {
                 self.last_refresh = Some(std::time::Instant::now());
             }
 
-            let needs_flicker_redraw =
-                self.overview_heatmap_flash_time.is_some() && self.left_panel == LeftPanel::Stats;
+            let needs_flicker_redraw = (self.overview_heatmap_flash_time.is_some()
+                && self.left_panel == LeftPanel::Stats)
+                || (self.model_timeline_flash_time.is_some()
+                    && self.left_panel == LeftPanel::Models);
 
             if self.should_redraw || needs_flicker_redraw {
                 terminal.draw(|frame| self.render(frame))?;
@@ -1056,6 +1071,9 @@ impl App {
                             }
                             LeftPanel::Models => match self.right_panel {
                                 RightPanel::List | RightPanel::Tools => {
+                                    self.right_panel = RightPanel::Activity;
+                                }
+                                RightPanel::Activity => {
                                     self.right_panel = RightPanel::Detail;
                                 }
                                 _ => {}
@@ -1141,11 +1159,15 @@ impl App {
                                     self.right_panel = RightPanel::List;
                                 }
                             }
-                            LeftPanel::Models => {
-                                if self.right_panel == RightPanel::Detail {
+                            LeftPanel::Models => match self.right_panel {
+                                RightPanel::Detail => {
+                                    self.right_panel = RightPanel::Activity;
+                                }
+                                RightPanel::Activity => {
                                     self.right_panel = RightPanel::Tools;
                                 }
-                            }
+                                _ => {}
+                            },
                         },
                     }
                 }
@@ -1405,10 +1427,13 @@ impl App {
                                 {
                                     self.overview_tool_scroll += 1;
                                 }
-                            } else if mouse.kind == MouseEventKind::ScrollUp {
-                                self.model_tool_scroll = self.model_tool_scroll.saturating_sub(1);
-                            } else if self.model_tool_scroll < self.model_tool_max_scroll {
-                                self.model_tool_scroll += 1;
+                            } else if self.left_panel == LeftPanel::Models {
+                                if mouse.kind == MouseEventKind::ScrollUp {
+                                    self.model_tool_scroll =
+                                        self.model_tool_scroll.saturating_sub(1);
+                                } else if self.model_tool_scroll < self.model_tool_max_scroll {
+                                    self.model_tool_scroll += 1;
+                                }
                             }
                         }
                         true
@@ -1532,10 +1557,15 @@ impl App {
                 }
                 "activity" => {
                     self.focus = Focus::Right;
-                    self.left_panel = LeftPanel::Stats;
-                    self.right_panel = RightPanel::Activity;
-                    // Always allow clicking to select a day
-                    self.select_heatmap_day_from_mouse(x, y);
+                    if self.left_panel == LeftPanel::Models {
+                        self.right_panel = RightPanel::Activity;
+                        self.select_model_timeline_day_from_mouse(x, y);
+                    } else {
+                        self.left_panel = LeftPanel::Stats;
+                        self.right_panel = RightPanel::Activity;
+                        // Always allow clicking to select a day
+                        self.select_heatmap_day_from_mouse(x, y);
+                    }
                 }
                 "tools" => {
                     self.focus = Focus::Right;
@@ -1661,6 +1691,28 @@ impl App {
         self.overview_heatmap_selected_cost = cost;
         self.overview_heatmap_selected_active_ms = active_ms;
         self.overview_heatmap_flash_time = Some(std::time::Instant::now());
+    }
+
+    fn select_model_timeline_day_from_mouse(&mut self, x: u16, y: u16) {
+        let Some(layout) = self.model_timeline_layout else {
+            return;
+        };
+        if y < layout.chart_y || y >= layout.chart_y + layout.chart_h {
+            return;
+        }
+        if x < layout.inner.x {
+            return;
+        }
+
+        let rel_x = x - layout.inner.x;
+        let col = (rel_x / layout.bar_w) as usize;
+        if col >= layout.bars {
+            return;
+        }
+
+        let day = layout.start_date + chrono::Duration::days(col as i64 * layout.bucket_days);
+        self.model_timeline_selected_day = Some(day.format("%Y-%m-%d").to_string());
+        self.model_timeline_flash_time = Some(std::time::Instant::now());
     }
 
     fn render(&mut self, frame: &mut Frame) {
