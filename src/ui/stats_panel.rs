@@ -64,8 +64,12 @@ impl super::App {
             ])
             .split(inner);
 
-        // Separators
-        let sep_style = Style::default().fg(colors.text_muted);
+        // Separators - use border_focus when highlighted
+        let sep_style = if is_highlighted {
+            Style::default().fg(colors.border_focus)
+        } else {
+            Style::default().fg(colors.text_muted)
+        };
         for &i in &[1, 4] {
             frame.render_widget(
                 Paragraph::new(vec![
