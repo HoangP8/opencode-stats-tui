@@ -889,7 +889,7 @@ impl super::App {
 
         let mut items: Vec<_> = tools.iter().collect();
         items.sort_unstable_by(|a, b| b.1.cmp(a.1));
-        let total: u64 = items.iter().map(|(_, c)| **c).sum();
+        let max_count = items.iter().map(|(_, c)| **c).max().unwrap_or(0);
         let bar_max = inner.width.saturating_sub(22) as usize;
 
         self.model_tool_max_scroll = items.len().saturating_sub(inner.height as usize) as u16;
@@ -898,10 +898,14 @@ impl super::App {
         let lines: Vec<Line> = items
             .into_iter()
             .map(|(name, count)| {
-                let w = ((*count as f64 / total as f64) * bar_max as f64) as usize;
+                let w = if max_count > 0 {
+                    ((*count as f64 / max_count as f64) * bar_max as f64) as usize
+                } else {
+                    0
+                };
                 Line::from(vec![
                     Span::styled(
-                        format!(" {:<14} ", truncate_with_ellipsis(name, 14)),
+                        format!(" {:<13} ", truncate_with_ellipsis(name, 13)),
                         Style::default().fg(colors.text_primary),
                     ),
                     Span::styled(" ".repeat(w), Style::default().bg(colors.accent_pink)),
@@ -971,6 +975,12 @@ impl super::App {
         self.ranking_max_scroll = ranked.len().saturating_sub(inner.height as usize);
         self.ranking_scroll = self.ranking_scroll.min(self.ranking_max_scroll);
 
+        let max_tok = self
+            .model_usage
+            .iter()
+            .map(|m| m.tokens.total())
+            .max()
+            .unwrap_or(0);
         let grand: u64 = self.model_usage.iter().map(|m| m.tokens.total()).sum();
         let max_tok_len = self
             .model_usage
@@ -983,7 +993,7 @@ impl super::App {
         let suffix_sample = format!(
             " {:>5.1}% ({:>w$})",
             100.0,
-            format_number(grand),
+            format_number(max_tok),
             w = max_tok_len
         );
         let suffix_w = suffix_sample.chars().count();
@@ -1008,8 +1018,8 @@ impl super::App {
                     w = max_tok_len
                 );
                 let bar_max = bar_avail;
-                let bar_w = if grand > 0 {
-                    ((m.tokens.total() as f64 / grand as f64) * bar_max as f64) as usize
+                let bar_w = if max_tok > 0 {
+                    ((m.tokens.total() as f64 / max_tok as f64) * bar_max as f64) as usize
                 } else {
                     0
                 };

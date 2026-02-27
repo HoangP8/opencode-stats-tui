@@ -816,30 +816,33 @@ impl super::App {
             .overview_project_scroll
             .min(self.overview_project_max_scroll);
 
-        let total: u64 = self.overview_projects.iter().map(|(_, c)| *c as u64).sum();
-        let name_w = 14;
-        let bar_max = inner.width.saturating_sub(26) as usize;
+        let max_count = self
+            .overview_projects
+            .iter()
+            .map(|(_, c)| *c)
+            .max()
+            .unwrap_or(0);
+        let name_w = 17;
+        let bar_max = inner.width.saturating_sub(28) as usize;
 
         let lines: Vec<Line> = self
             .overview_projects
             .iter()
-            .enumerate()
             .skip(self.overview_project_scroll)
             .take(visible)
-            .map(|(i, (name, count))| {
-                let pct = if total > 0 {
-                    *count as f64 / total as f64
+            .map(|(name, count)| {
+                let bar = if max_count > 0 {
+                    ((*count as f64 / max_count as f64) * bar_max as f64) as usize
                 } else {
-                    0.0
+                    0
                 };
-                let bar = (pct * bar_max as f64) as usize;
                 Line::from(vec![
                     Span::styled(
-                        format!(" {:>2}. ", i + 1),
-                        Style::default().fg(colors.text_muted),
-                    ),
-                    Span::styled(
-                        format!("{:<1$} ", truncate_with_ellipsis(name, name_w), name_w),
+                        format!(
+                            "{:<1$} ",
+                            truncate_with_ellipsis(name, name_w - 1),
+                            name_w - 1
+                        ),
                         Style::default().fg(colors.text_primary),
                     ),
                     Span::styled(" ".repeat(bar), Style::default().bg(colors.info)),
@@ -848,7 +851,7 @@ impl super::App {
                         Style::default().bg(colors.bg_tertiary),
                     ),
                     Span::styled(
-                        format!(" {:>5}", count),
+                        format!(" {:>5} sess", count),
                         Style::default()
                             .fg(colors.info)
                             .add_modifier(Modifier::BOLD),
@@ -915,7 +918,7 @@ impl super::App {
         self.overview_tool_max_scroll = self.tool_usage.len().saturating_sub(visible);
         self.overview_tool_scroll = self.overview_tool_scroll.min(self.overview_tool_max_scroll);
 
-        let total: u64 = self.tool_usage.iter().map(|t| t.count).sum();
+        let max_count = self.tool_usage.iter().map(|t| t.count).max().unwrap_or(0);
         let name_w = 14;
         let bar_max = inner.width.saturating_sub(22) as usize;
 
@@ -925,18 +928,17 @@ impl super::App {
             .skip(self.overview_tool_scroll)
             .take(visible)
             .map(|tool| {
-                let pct = if total > 0 {
-                    tool.count as f64 / total as f64
+                let bar = if max_count > 0 {
+                    ((tool.count as f64 / max_count as f64) * bar_max as f64) as usize
                 } else {
-                    0.0
+                    0
                 };
-                let bar = (pct * bar_max as f64) as usize;
                 Line::from(vec![
                     Span::styled(
                         format!(
                             " {:<1$} ",
-                            truncate_with_ellipsis(&tool.name, name_w),
-                            name_w
+                            truncate_with_ellipsis(&tool.name, name_w - 1),
+                            name_w - 1
                         ),
                         Style::default().fg(colors.text_primary),
                     ),
