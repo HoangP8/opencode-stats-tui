@@ -148,9 +148,15 @@ pub fn usage_list_row(
     sessions: usize,
     fmt: &UsageRowFormat,
     colors: &ThemeColors,
+    is_active: bool,
 ) -> Line<'static> {
     let name_display: String = name.chars().take(fmt.name_width).collect();
-    let sep = Style::default().fg(colors.text_muted);
+    let sep = if is_active {
+        Style::default().fg(colors.border_focus)
+    } else {
+        Style::default().fg(colors.text_muted)
+    };
+    let label = Style::default().fg(colors.text_muted);
 
     Line::from(vec![
         Span::styled(
@@ -162,12 +168,12 @@ pub fn usage_list_row(
             format!("{:>7}", format_number(input)),
             Style::default().fg(colors.token_input()),
         ),
-        Span::styled(" in ", sep),
+        Span::styled(" in ", label),
         Span::styled(
             format!("{:>7}", format_number(output)),
             Style::default().fg(colors.token_output()),
         ),
-        Span::styled(" out", sep),
+        Span::styled(" out", label),
         Span::styled(" │ ", sep),
         Span::styled(
             format!("${:>1$.2}", cost, fmt.cost_width),

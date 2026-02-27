@@ -44,10 +44,13 @@ pub struct App {
     session_list_state: ListState,
     cached_session_items: Vec<ratatui::widgets::ListItem<'static>>,
     cached_session_width: u16,
+    cached_session_is_active: bool,
     cached_day_items: Vec<ratatui::widgets::ListItem<'static>>,
     cached_day_width: u16,
+    cached_day_is_active: bool,
     cached_model_items: Vec<ratatui::widgets::ListItem<'static>>,
     cached_model_width: u16,
+    cached_model_is_active: bool,
     chat_cache: FxHashMap<String, CachedChat>,
     chat_cache_order: Vec<String>,
     chat_scroll: u16,
@@ -233,10 +236,13 @@ impl App {
             ranking_max_scroll: 0,
             cached_session_items: Vec::new(),
             cached_session_width: 0,
+            cached_session_is_active: false,
             cached_day_items: Vec::new(),
             cached_day_width: 0,
+            cached_day_is_active: false,
             cached_model_items: Vec::new(),
             cached_model_width: 0,
+            cached_model_is_active: false,
             cached_day_strings: FxHashMap::default(),
             chat_cache: FxHashMap::default(),
 
@@ -753,10 +759,13 @@ impl App {
 
         self.cached_session_items.clear();
         self.cached_session_width = 0;
+        self.cached_session_is_active = false;
         self.cached_day_items.clear();
         self.cached_day_width = 0;
+        self.cached_day_is_active = false;
         self.cached_model_items.clear();
         self.cached_model_width = 0;
+        self.cached_model_is_active = false;
     }
 
     /// Refresh the currently open modal with latest data
@@ -1982,7 +1991,7 @@ impl App {
                         Style::default().fg(colors.border_muted)
                     },
                     list_highlighted,
-                    self.is_active,
+                    list_highlighted,
                 );
             }
             LeftPanel::Models => {

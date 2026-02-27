@@ -22,8 +22,11 @@ impl super::App {
         is_active: bool,
     ) {
         let inner_width = area.width.saturating_sub(2);
-        if self.cached_day_items.is_empty() || self.cached_day_width != inner_width {
-            self.rebuild_day_list_cache(inner_width);
+        if self.cached_day_items.is_empty()
+            || self.cached_day_width != inner_width
+            || self.cached_day_is_active != is_active
+        {
+            self.rebuild_day_list_cache(inner_width, is_active);
         }
 
         let colors = self.theme.colors();
@@ -77,9 +80,10 @@ impl super::App {
     }
 
     /// Rebuild cached day list items.
-    pub fn rebuild_day_list_cache(&mut self, width: u16) {
+    pub fn rebuild_day_list_cache(&mut self, width: u16, is_active: bool) {
         let colors = self.theme.colors();
         self.cached_day_width = width;
+        self.cached_day_is_active = is_active;
         let cost_width = self.max_cost_width();
         let fixed = 3 + 7 + 4 + 7 + 4 + 3 + (cost_width + 1) + 3 + 9;
         let name_width = width.saturating_sub((fixed + 2).min(u16::MAX as usize) as u16) as usize;
@@ -125,6 +129,7 @@ impl super::App {
                         sess_width: 4,
                     },
                     &colors,
+                    is_active,
                 ))
             })
             .collect();
@@ -425,8 +430,11 @@ impl super::App {
         is_active: bool,
     ) {
         let inner_width = area.width.saturating_sub(2);
-        if self.cached_session_width != inner_width || self.cached_session_items.is_empty() {
-            self.rebuild_cached_session_items(inner_width);
+        if self.cached_session_width != inner_width
+            || self.cached_session_items.is_empty()
+            || self.cached_session_is_active != is_active
+        {
+            self.rebuild_cached_session_items(inner_width, is_active);
         }
 
         let colors = self.theme.colors();
@@ -476,10 +484,17 @@ impl super::App {
     }
 
     /// Rebuild cached session list items
-    pub fn rebuild_cached_session_items(&mut self, width: u16) {
+    pub fn rebuild_cached_session_items(&mut self, width: u16, is_active: bool) {
         let colors = self.theme.colors();
         let fixed = FixedColors::DEFAULT;
         self.cached_session_width = width;
+        self.cached_session_is_active = is_active;
+
+        let sep_color = if is_active {
+            colors.border_focus
+        } else {
+            colors.text_muted
+        };
 
         let max_cost_len = self
             .session_list
@@ -533,27 +548,27 @@ impl super::App {
                         ),
                         Style::default().fg(title_color),
                     ),
-                    Span::styled(" │ ", Style::default().fg(colors.text_muted)),
+                    Span::styled(" │ ", Style::default().fg(sep_color)),
                     Span::styled(
                         format!("+{:>7}", format_number(s.diffs.additions)),
                         Style::default().fg(fixed.diff_add),
                     ),
-                    Span::styled(" │ ", Style::default().fg(colors.text_muted)),
+                    Span::styled(" │ ", Style::default().fg(sep_color)),
                     Span::styled(
                         format!("-{:>7}", format_number(s.diffs.deletions)),
                         Style::default().fg(fixed.diff_remove),
                     ),
-                    Span::styled(" │ ", Style::default().fg(colors.text_muted)),
+                    Span::styled(" │ ", Style::default().fg(sep_color)),
                     Span::styled(
                         format!("${:>1$.2}", s.display_cost(), max_cost_len),
                         Style::default().fg(colors.cost()),
                     ),
-                    Span::styled(" │ ", Style::default().fg(colors.text_muted)),
+                    Span::styled(" │ ", Style::default().fg(sep_color)),
                     Span::styled(
                         format!("{:>4} msg", s.messages),
                         Style::default().fg(colors.info),
                     ),
-                    Span::styled(" │ ", Style::default().fg(colors.text_muted)),
+                    Span::styled(" │ ", Style::default().fg(sep_color)),
                     Span::styled(
                         format!("{:>1$}", model_text, max_models_len),
                         Style::default().fg(colors.accent_magenta),

@@ -23,8 +23,11 @@ impl super::App {
         is_active: bool,
     ) {
         let inner_width = area.width.saturating_sub(2);
-        if self.cached_model_items.is_empty() || self.cached_model_width != inner_width {
-            self.rebuild_model_list_cache(inner_width);
+        if self.cached_model_items.is_empty()
+            || self.cached_model_width != inner_width
+            || self.cached_model_is_active != is_active
+        {
+            self.rebuild_model_list_cache(inner_width, is_active);
         }
 
         let colors = self.theme.colors();
@@ -78,9 +81,10 @@ impl super::App {
     }
 
     /// Rebuild cached model list items.
-    pub fn rebuild_model_list_cache(&mut self, width: u16) {
+    pub fn rebuild_model_list_cache(&mut self, width: u16, is_active: bool) {
         let colors = self.theme.colors();
         self.cached_model_width = width;
+        self.cached_model_is_active = is_active;
         let cost_width = self.max_cost_width();
         let fixed = 3 + 7 + 4 + 7 + 4 + 3 + (cost_width + 1) + 3 + 9;
         let name_width = width.saturating_sub((fixed + 2).min(u16::MAX as usize) as u16) as usize;
@@ -101,6 +105,7 @@ impl super::App {
                         sess_width: 4,
                     },
                     &colors,
+                    is_active,
                 ))
             })
             .collect();
@@ -601,12 +606,7 @@ impl super::App {
         let chart_h = inner.height;
 
         let stats_area = Rect::new(inner.x, inner.y, stats_col_w, chart_h);
-        let chart_area = Rect::new(
-            inner.x + stats_col_w + sep_w,
-            inner.y,
-            chart_w,
-            chart_h,
-        );
+        let chart_area = Rect::new(inner.x + stats_col_w + sep_w, inner.y, chart_w, chart_h);
 
         // Vertical separator between columns
         let sep_x = inner.x + stats_col_w;
@@ -883,11 +883,7 @@ impl super::App {
             )
             .title_bottom(
                 Line::from(Span::styled(
-                    if focused {
-                        " ↑↓: scroll "
-                    } else {
-                        " "
-                    },
+                    if focused { " ↑↓: scroll " } else { " " },
                     Style::default().fg(colors.text_muted),
                 ))
                 .alignment(Alignment::Center),
@@ -976,11 +972,7 @@ impl super::App {
             )
             .title_bottom(
                 Line::from(Span::styled(
-                    if focused {
-                        " ↑↓: scroll "
-                    } else {
-                        " "
-                    },
+                    if focused { " ↑↓: scroll " } else { " " },
                     Style::default().fg(colors.text_muted),
                 ))
                 .alignment(Alignment::Center),
