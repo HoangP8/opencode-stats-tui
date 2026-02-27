@@ -778,32 +778,16 @@ impl super::App {
             .map(|d| {
                 let rel = (d - window_start).num_days().max(0);
                 ((rel / bucket_days) as usize).min(bars - 1)
-            })
-            .unwrap_or_else(|| {
-                model_sums
-                    .iter()
-                    .rposition(|v| *v > 0)
-                    .unwrap_or(bars.saturating_sub(1))
             });
 
-        // Update selected day info
-        let sel_day = window_start + chrono::Duration::days(selected_bar as i64);
-        let sel_tokens = model_sums[selected_bar];
-        let sel_pct = if total_tokens > 0 {
-            (sel_tokens as f64 / total_tokens as f64) * 100.0
-        } else {
-            0.0
-        };
-        self.model_timeline_selected_day = Some(sel_day.format("%Y-%m-%d").to_string());
-        self.model_timeline_selected_tokens = sel_tokens;
-        self.model_timeline_selected_pct = sel_pct;
-
         // Flash effect
-        let flash = self.model_timeline_flash_time.map(|t| {
-            (1.0 - (t.elapsed().as_millis() as f64 * std::f64::consts::TAU / 600.0).cos()) * 0.2
+        let flash = selected_bar.and_then(|_| {
+            self.model_timeline_flash_time.map(|t| {
+                (1.0 - (t.elapsed().as_millis() as f64 * std::f64::consts::TAU / 600.0).cos()) * 0.2
+            })
         });
 
-        // Bar color (consistent, no gradient)
+        // Bar color
         let bar_color = colors.accent_cyan;
         let empty_color = colors.bg_tertiary;
 
@@ -824,7 +808,7 @@ impl super::App {
                         .max(1.0) as u16
                 };
                 let filled = from_bottom < bar_height;
-                let sel = i == selected_bar;
+                let sel = selected_bar == Some(i);
 
                 let c = if filled {
                     if sel {
@@ -994,7 +978,19 @@ impl super::App {
             .map(|m| format_number(m.tokens.total()).len())
             .max()
             .unwrap_or(1);
-        let bar_avail = inner.width.saturating_sub(2);
+        let total_w = inner.width as usize;
+
+        let suffix_sample = format!(
+            " {:>5.1}% ({:>w$})",
+            100.0,
+            format_number(grand),
+            w = max_tok_len
+        );
+        let suffix_w = suffix_sample.chars().count();
+        let bar_avail = total_w.saturating_sub(suffix_w);
+        let flash = self.model_timeline_flash_time.map(|t| {
+            (1.0 - (t.elapsed().as_millis() as f64 * std::f64::consts::TAU / 600.0).cos()) * 0.2
+        });
 
         let lines: Vec<Line> = ranked
             .iter()
@@ -1011,17 +1007,34 @@ impl super::App {
                     format_number(m.tokens.total()),
                     w = max_tok_len
                 );
-                let bar_max = bar_avail.saturating_sub(suffix.chars().count() as u16) as usize;
+                let bar_max = bar_avail;
                 let bar_w = if grand > 0 {
                     ((m.tokens.total() as f64 / grand as f64) * bar_max as f64) as usize
                 } else {
                     0
                 };
 
-                Line::from(vec![
+                let base_bar_color = colors.info;
+                let selected_bar_color =
+                    if let (Some(f), Color::Rgb(r, g, b)) = (flash, base_bar_color) {
+                        Color::Rgb(
+                            (r as f64 + (255.0 - r as f64) * f) as u8,
+                            (g as f64 + (255.0 - g as f64) * f) as u8,
+                            (b as f64 + (255.0 - b as f64) * f) as u8,
+                        )
+                    } else {
+                        base_bar_color
+                    };
+
+                let mut spans: Vec<Span> = Vec::with_capacity(3);
+                spans.extend([
                     Span::styled(
                         " ".repeat(bar_w.min(bar_max)),
-                        Style::default().bg(if sel { colors.info } else { colors.bg_tertiary }),
+                        Style::default().bg(if sel {
+                            selected_bar_color
+                        } else {
+                            base_bar_color
+                        }),
                     ),
                     Span::styled(
                         " ".repeat(bar_max.saturating_sub(bar_w)),
@@ -1037,7 +1050,9 @@ impl super::App {
                             })
                             .add_modifier(Modifier::BOLD),
                     ),
-                ])
+                ]);
+
+                Line::from(spans)
             })
             .collect();
 

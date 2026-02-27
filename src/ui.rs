@@ -603,12 +603,14 @@ impl App {
         let i = self.model_list_state.selected().unwrap_or(0);
         self.model_list_state
             .select(Some((i + 1).min(self.model_usage.len() - 1)));
+        self.model_timeline_flash_time = Some(std::time::Instant::now());
         self.should_redraw = true;
     }
 
     fn model_previous(&mut self) {
         let i = self.model_list_state.selected().unwrap_or(0);
         self.model_list_state.select(Some(i.saturating_sub(1)));
+        self.model_timeline_flash_time = Some(std::time::Instant::now());
         self.should_redraw = true;
     }
 
@@ -1556,6 +1558,7 @@ impl App {
                             if idx < self.model_usage.len() {
                                 self.model_list_state.select(Some(idx));
                                 self.selected_model_index = Some(idx);
+                                self.model_timeline_flash_time = Some(std::time::Instant::now());
                             }
                         }
                     }
@@ -1722,6 +1725,32 @@ impl App {
         let day = layout.start_date + chrono::Duration::days(col as i64 * layout.bucket_days);
         self.model_timeline_selected_day = Some(day.format("%Y-%m-%d").to_string());
         self.model_timeline_flash_time = Some(std::time::Instant::now());
+
+        // Calculate tokens and percentage for the clicked bucket
+        if let Some(model_idx) = self.selected_model_index {
+            if let Some(model) = self.model_usage.get(model_idx) {
+                let bucket_start = day;
+                let mut bucket_tokens = 0u64;
+
+                for offset in 0..layout.bucket_days {
+                    let d = bucket_start + chrono::Duration::days(offset);
+                    let key = d.format("%Y-%m-%d").to_string();
+                    if let Some(&tokens) = model.daily_tokens.get(&key) {
+                        bucket_tokens += tokens;
+                    }
+                }
+
+                let total_tokens = model.tokens.total();
+                let pct = if total_tokens > 0 {
+                    (bucket_tokens as f64 / total_tokens as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                self.model_timeline_selected_tokens = bucket_tokens;
+                self.model_timeline_selected_pct = pct;
+            }
+        }
     }
 
     fn render(&mut self, frame: &mut Frame) {
