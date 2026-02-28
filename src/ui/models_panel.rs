@@ -1,8 +1,9 @@
 //! Model usage panel rendering.
 
-use super::helpers::{truncate_with_ellipsis, usage_list_row, UsageRowFormat};
+use super::helpers::{month_abbr, truncate_with_ellipsis, usage_list_row, UsageRowFormat};
 use crate::cost::{estimate_cost, lookup_pricing};
 use crate::stats::{format_number, format_number_full};
+use chrono::Datelike;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -126,8 +127,8 @@ impl super::App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(9),
-                Constraint::Length(9),
-                Constraint::Min(5),
+                Constraint::Length(10),
+                Constraint::Min(4),
             ])
             .split(area);
 
@@ -257,21 +258,62 @@ impl super::App {
             _ => (true, true),
         };
 
-        let constraints = match (show_agents, show_tokens) {
-            (true, true) => vec![
-                Constraint::Percentage(25),
-                Constraint::Percentage(37),
-                Constraint::Percentage(38),
-            ],
-            (false, true) => vec![Constraint::Percentage(45), Constraint::Percentage(55)],
-            _ => vec![Constraint::Percentage(100)],
+        let sep_w = 1u16;
+        let available_width = sections[0]
+            .width
+            .saturating_sub(if show_agents && show_tokens {
+                2 * sep_w
+            } else if show_agents || show_tokens {
+                sep_w
+            } else {
+                0
+            });
+
+        let cols = if show_agents && show_tokens {
+            // 3 columns: left (25%), agents (37%), tokens (38%)
+            let col0_w = (available_width as f32 * 0.25) as u16;
+            let col1_w = (available_width as f32 * 0.37) as u16;
+            let col2_w = available_width.saturating_sub(col0_w + col1_w);
+            vec![
+                Rect::new(sections[0].x, sections[0].y, col0_w, sections[0].height),
+                Rect::new(
+                    sections[0].x + col0_w + sep_w,
+                    sections[0].y,
+                    col1_w,
+                    sections[0].height,
+                ),
+                Rect::new(
+                    sections[0].x + col0_w + sep_w + col1_w + sep_w,
+                    sections[0].y,
+                    col2_w,
+                    sections[0].height,
+                ),
+            ]
+        } else if show_tokens {
+            // 2 columns: left (45%), tokens (55%)
+            let col0_w = (available_width as f32 * 0.45) as u16;
+            let col1_w = available_width.saturating_sub(col0_w);
+            vec![
+                Rect::new(sections[0].x, sections[0].y, col0_w, sections[0].height),
+                Rect::new(
+                    sections[0].x + col0_w + sep_w,
+                    sections[0].y,
+                    col1_w,
+                    sections[0].height,
+                ),
+            ]
+        } else {
+            // 1 column: full width
+            vec![sections[0]]
         };
 
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints(constraints)
-            .split(sections[0]);
         let muted = Style::default().fg(colors.text_muted);
+        let sep_color = if focused {
+            colors.border_focus
+        } else {
+            colors.text_muted
+        };
+        let sep_style = Style::default().fg(sep_color);
         let col_w = cols.get(1).map(|c| c.width as usize).unwrap_or(0);
 
         let est = estimate_cost(model_name, tokens);
@@ -408,6 +450,28 @@ impl super::App {
             frame.render_widget(
                 Paragraph::new(token_lines),
                 cols[if show_agents { 2 } else { 1 }],
+            );
+        }
+
+        // Column separator
+        let sep_char = "│";
+        let sep_lines: Vec<Line> = (0..sections[0].height)
+            .map(|_| Line::from(Span::styled(sep_char, sep_style)))
+            .collect();
+
+        if cols.len() > 1 {
+            let sep_x = cols[0].x + cols[0].width;
+            frame.render_widget(
+                Paragraph::new(sep_lines.clone()),
+                Rect::new(sep_x, sections[0].y, 1, sections[0].height),
+            );
+        }
+
+        if cols.len() > 2 {
+            let sep_x = cols[1].x + cols[1].width;
+            frame.render_widget(
+                Paragraph::new(sep_lines),
+                Rect::new(sep_x, sections[0].y, 1, sections[0].height),
             );
         }
 
@@ -600,12 +664,13 @@ impl super::App {
         }
         points.sort_unstable_by_key(|(d, _)| *d);
 
-        let stats_col_w = 36u16;
+        let stats_col_w = 35u16;
         let sep_w = 1u16;
+        let month_row_h = 1u16;
+        let chart_h = inner.height.saturating_sub(month_row_h);
         let chart_w = inner.width.saturating_sub(stats_col_w + sep_w).max(4);
-        let chart_h = inner.height;
 
-        let stats_area = Rect::new(inner.x, inner.y, stats_col_w, chart_h);
+        let stats_area = Rect::new(inner.x, inner.y, stats_col_w, inner.height);
         let chart_area = Rect::new(inner.x + stats_col_w + sep_w, inner.y, chart_w, chart_h);
 
         // Vertical separator between columns
@@ -615,19 +680,19 @@ impl super::App {
         } else {
             colors.text_muted
         };
-        let sep_lines: Vec<Line> = (0..chart_h)
+        let sep_lines: Vec<Line> = (0..inner.height)
             .map(|_| Line::from(Span::styled("│", Style::default().fg(sep_color))))
             .collect();
         frame.render_widget(
             Paragraph::new(sep_lines),
-            Rect::new(sep_x, inner.y, 1, chart_h),
+            Rect::new(sep_x, inner.y, 1, inner.height),
         );
 
         // Left column stats
         let total_tokens = model.tokens.total();
         let num_sessions = model.sessions.len().max(1) as u64;
         let total_cost = model.cost;
-        let active_days = points.len();
+        let active_days = points.len() as u64;
 
         // Last used
         let last_used = points.last().map(|(d, _)| *d);
@@ -650,8 +715,10 @@ impl super::App {
             _ => "—".to_string(),
         };
 
-        // Active days
+        // Active days with avg sessions/day
         let active_days_str = format!("{} days", active_days);
+        let avg_sess_per_day = num_sessions as f64 / active_days.max(1) as f64;
+        let avg_sess_str = format!("{:.1} sess/day", avg_sess_per_day);
 
         // Peak day
         let (peak_date, peak_tokens_val) = points
@@ -671,7 +738,7 @@ impl super::App {
 
         // Avg cost per session
         let avg_cost_per_session = total_cost / num_sessions as f64;
-        let avg_cost_str = format!("{}/sess", format!("${:.2}", avg_cost_per_session));
+        let avg_cost_str = format!("${:.2}/sess", avg_cost_per_session);
 
         // Selected day info
         let sel_day_str = self
@@ -690,31 +757,35 @@ impl super::App {
         // Render stats
         let stats_lines = vec![
             Line::from(vec![
-                Span::styled("Last Used   ", Style::default().fg(colors.text_muted)),
+                Span::styled("Last Used    ", Style::default().fg(colors.text_muted)),
                 Span::styled(&last_used_str, Style::default().fg(colors.text_primary)),
             ]),
             Line::from(vec![
-                Span::styled("Active      ", Style::default().fg(colors.text_muted)),
+                Span::styled("Active       ", Style::default().fg(colors.text_muted)),
                 Span::styled(&range_str, Style::default().fg(colors.text_primary)),
             ]),
             Line::from(vec![
-                Span::styled("Active Days ", Style::default().fg(colors.text_muted)),
+                Span::styled("Active Days  ", Style::default().fg(colors.text_muted)),
                 Span::styled(&active_days_str, Style::default().fg(colors.text_primary)),
             ]),
             Line::from(vec![
-                Span::styled("Peak        ", Style::default().fg(colors.text_muted)),
+                Span::styled("Peak         ", Style::default().fg(colors.text_muted)),
                 Span::styled(&peak_str, Style::default().fg(colors.success)),
             ]),
             Line::from(vec![
-                Span::styled("Avg Token   ", Style::default().fg(colors.text_muted)),
+                Span::styled("Avg Token    ", Style::default().fg(colors.text_muted)),
                 Span::styled(&avg_token_str, Style::default().fg(colors.text_primary)),
             ]),
             Line::from(vec![
-                Span::styled("Avg Cost    ", Style::default().fg(colors.text_muted)),
+                Span::styled("Avg Cost     ", Style::default().fg(colors.text_muted)),
                 Span::styled(&avg_cost_str, Style::default().fg(colors.cost())),
             ]),
             Line::from(vec![
-                Span::styled("Selected    ", Style::default().fg(colors.accent_cyan)),
+                Span::styled("Avg Sess     ", Style::default().fg(colors.text_muted)),
+                Span::styled(&avg_sess_str, Style::default().fg(colors.info)),
+            ]),
+            Line::from(vec![
+                Span::styled("Selected     ", Style::default().fg(colors.accent_cyan)),
                 Span::styled(
                     &sel_day_info,
                     Style::default()
@@ -726,34 +797,20 @@ impl super::App {
         frame.render_widget(Paragraph::new(stats_lines), stats_area);
 
         // Right column: bar chart
-        let mut global_end = self
-            .per_day
-            .keys()
-            .filter_map(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-            .max()
-            .unwrap_or_else(|| chrono::Local::now().date_naive());
+        let global_end = chrono::Local::now().date_naive();
 
-        let bars = (chart_w as usize).max(1);
+        let bar_w = 2usize;
+        let bars = ((chart_w as usize) / bar_w).max(1);
         let bucket_days = 1i64;
         let span_days = (bars as i64) * bucket_days;
-        let mut window_start = global_end - chrono::Duration::days(span_days.saturating_sub(1));
-
-        // Fall back to model's own window if no activity in global window
-        if !points
-            .iter()
-            .any(|(d, _)| *d >= window_start && *d <= global_end)
-        {
-            let model_end = points.last().map(|(d, _)| *d).unwrap_or(global_end);
-            global_end = model_end;
-            window_start = global_end - chrono::Duration::days(span_days.saturating_sub(1));
-        }
+        let window_start = global_end - chrono::Duration::days(span_days.saturating_sub(1));
 
         self.model_timeline_layout = Some(super::helpers::ModelTimelineLayout {
             inner: chart_area,
             chart_y: chart_area.y,
             chart_h,
             bars,
-            bar_w: 1,
+            bar_w: 2,
             start_date: window_start,
             bucket_days,
         });
@@ -828,12 +885,66 @@ impl super::App {
                     empty_color
                 };
 
-                spans.push(Span::styled(" ", Style::default().bg(c)));
+                spans.push(Span::styled("  ", Style::default().bg(c)));
             }
             lines.push(Line::from(spans));
         }
 
         frame.render_widget(Paragraph::new(lines), chart_area);
+
+        // Month labels
+        if chart_h > 0 {
+            let grid_w = bar_w * bars;
+            let mut month_row = vec![' '; grid_w];
+            let mut ranges: Vec<(u32, u16, u16)> = Vec::new();
+            let (mut x, mut cur_m, mut start) = (0u16, None::<u32>, 0u16);
+
+            for b in 0..bars {
+                let date = window_start + chrono::Duration::days((b as i64) * bucket_days);
+                let m = date.month();
+                if let Some(cm) = cur_m {
+                    if cm != m {
+                        ranges.push((cm, start, x));
+                        start = x;
+                    }
+                } else {
+                    start = x;
+                }
+                cur_m = Some(m);
+                x += bar_w as u16;
+            }
+            if let Some(m) = cur_m {
+                ranges.push((m, start, x));
+            }
+
+            // Show month labels
+            let mut next_allowed_end = grid_w as i32;
+            for (m, x0, x1) in ranges.iter().rev() {
+                let name = month_abbr(*m);
+                let span = x1.saturating_sub(*x0) as usize;
+                if span < name.len() {
+                    continue;
+                }
+                let center = (*x0 as usize + *x1 as usize) / 2;
+                let s = center.saturating_sub(name.len() / 2) as i32;
+                let e = s + name.len() as i32 - 1;
+
+                if s < 0 || e >= grid_w as i32 || e >= next_allowed_end {
+                    continue;
+                }
+                for (i, c) in name.chars().enumerate() {
+                    month_row[s as usize + i] = c;
+                }
+                next_allowed_end = s;
+            }
+
+            let month_line = Line::from(vec![Span::styled(
+                month_row.iter().collect::<String>(),
+                Style::default().fg(colors.text_muted),
+            )]);
+            let month_area = Rect::new(chart_area.x, chart_area.y + chart_h, chart_area.width, 1);
+            frame.render_widget(Paragraph::new(month_line), month_area);
+        }
     }
 
     fn render_tools_panel(

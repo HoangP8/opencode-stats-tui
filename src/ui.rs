@@ -604,6 +604,9 @@ impl App {
         self.model_list_state
             .select(Some((i + 1).min(self.model_usage.len() - 1)));
         self.model_timeline_flash_time = Some(std::time::Instant::now());
+        self.model_timeline_selected_day = None;
+        self.model_timeline_selected_tokens = 0;
+        self.model_timeline_selected_pct = 0.0;
         self.should_redraw = true;
     }
 
@@ -611,6 +614,9 @@ impl App {
         let i = self.model_list_state.selected().unwrap_or(0);
         self.model_list_state.select(Some(i.saturating_sub(1)));
         self.model_timeline_flash_time = Some(std::time::Instant::now());
+        self.model_timeline_selected_day = None;
+        self.model_timeline_selected_tokens = 0;
+        self.model_timeline_selected_pct = 0.0;
         self.should_redraw = true;
     }
 
