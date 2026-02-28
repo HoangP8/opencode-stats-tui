@@ -24,6 +24,10 @@ thread_local! {
     static DB_CONN: RefCell<Option<Connection>> = const { RefCell::new(None) };
 }
 
+pub type SessionTitlesMap = FxHashMap<Box<str>, String>;
+pub type SessionParentsMap = FxHashMap<Box<str>, Box<str>>;
+pub type MessageBatch = Vec<(Message, Vec<MessageContent>, bool, Option<Box<str>>)>;
+
 // ============================================================================
 // Path & Database Helpers
 // ============================================================================
@@ -959,7 +963,7 @@ pub(crate) fn list_message_files(root: &Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-fn load_session_titles() -> (FxHashMap<Box<str>, String>, FxHashMap<Box<str>, Box<str>>) {
+fn load_session_titles() -> (SessionTitlesMap, SessionParentsMap) {
     if is_db_mode() {
         return with_opencode_db(|conn| {
             let Ok(mut stmt) = conn.prepare("SELECT id, title, parent_id FROM session") else {
@@ -1357,10 +1361,7 @@ pub fn collect_stats() -> Stats {
             let parts: Vec<PartData> = msg
                 .id
                 .as_ref()
-                .and_then(|id| {
-                    let key: Box<str> = id.0.as_str().into();
-                    all_parts_map.get(&key).cloned()
-                })
+                .and_then(|id| all_parts_map.get(id.0.as_str()).cloned())
                 .unwrap_or_default();
 
             let tools: Vec<Box<str>> = parts
@@ -1507,7 +1508,7 @@ pub fn collect_stats() -> Stats {
             if !reasoning_parts.is_empty() {
                 let reasoning_chars: usize = reasoning_parts
                     .iter()
-                    .filter_map(|p| p.text.as_ref().map(|t| t.chars().count()))
+                    .filter_map(|p| p.text.as_ref().map(|t| t.len()))
                     .sum();
                 if reasoning_chars > 0 {
                     tokens_from_msg.reasoning = (reasoning_chars / 4) as u64;
@@ -2097,10 +2098,7 @@ fn load_session_chat_internal(
                 let parts_vec = msg
                     .id
                     .as_ref()
-                    .and_then(|id| {
-                        let key: Box<str> = id.0.as_str().into();
-                        parts_map.remove(&key)
-                    })
+                    .and_then(|id| parts_map.remove(id.0.as_str()))
                     .map(parts_to_content)
                     .unwrap_or_default();
                 (msg, parts_vec)
@@ -2120,10 +2118,7 @@ fn load_session_chat_internal(
                 let parts_vec = msg
                     .id
                     .as_ref()
-                    .and_then(|id| {
-                        let key: Box<str> = id.0.as_str().into();
-                        parts_map.remove(&key)
-                    })
+                    .and_then(|id| parts_map.remove(id.0.as_str()))
                     .map(parts_to_content)
                     .unwrap_or_default();
                 (msg, parts_vec)
@@ -2373,12 +2368,11 @@ pub fn load_session_details(
             // Estimate reasoning tokens from cached parts if tokens.reasoning is 0
             if tokens.reasoning == 0 && !is_user {
                 if let Some(msg_id) = msg.id.as_ref() {
-                    let key: Box<str> = msg_id.0.as_str().into();
-                    if let Some(parts) = parts_map.get(&key) {
+                    if let Some(parts) = parts_map.get(msg_id.0.as_str()) {
                         let reasoning_chars: usize = parts
                             .iter()
                             .filter(|p| p.part_type.as_deref() == Some("reasoning"))
-                            .filter_map(|p| p.text.as_ref().map(|t| t.chars().count()))
+                            .filter_map(|p| p.text.as_ref().map(|t| t.len()))
                             .sum();
                         if reasoning_chars > 0 {
                             tokens.reasoning = (reasoning_chars / 4) as u64;
@@ -2456,8 +2450,7 @@ pub fn load_combined_session_chat(
     });
 
     // Batch-load parts
-    let all_messages: Vec<(Message, Vec<MessageContent>, bool, Option<Box<str>>)> = if is_db_mode()
-    {
+    let all_messages: MessageBatch = if is_db_mode() {
         let msg_ids: Vec<&str> = filtered_msgs
             .iter()
             .filter_map(|(m, _, _)| m.id.as_ref().map(|id| id.0.as_str()))
@@ -2470,10 +2463,7 @@ pub fn load_combined_session_chat(
                 let parts_vec = msg
                     .id
                     .as_ref()
-                    .and_then(|id| {
-                        let key: Box<str> = id.0.as_str().into();
-                        parts_map.remove(&key)
-                    })
+                    .and_then(|id| parts_map.remove(id.0.as_str()))
                     .map(parts_to_content)
                     .unwrap_or_default();
                 (msg, parts_vec, is_sub, agent_lbl)
@@ -2494,10 +2484,7 @@ pub fn load_combined_session_chat(
                 let parts_vec = msg
                     .id
                     .as_ref()
-                    .and_then(|id| {
-                        let key: Box<str> = id.0.as_str().into();
-                        parts_map.remove(&key)
-                    })
+                    .and_then(|id| parts_map.remove(id.0.as_str()))
                     .map(parts_to_content)
                     .unwrap_or_default();
                 (msg, parts_vec, is_sub, agent_lbl)

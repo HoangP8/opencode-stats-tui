@@ -10,6 +10,7 @@ mod stats;
 mod stats_cache;
 mod theme;
 mod ui;
+mod overview_stats;
 
 /// Restore terminal to normal mode.
 fn cleanup_terminal() {

@@ -855,8 +855,7 @@ impl super::App {
             let mut spans: Vec<Span> = Vec::with_capacity(bars);
             let from_bottom = chart_h - 1 - row;
 
-            for i in 0..bars {
-                let val = model_sums[i];
+            for (i, &val) in model_sums.iter().enumerate().take(bars) {
                 let bar_height = if val == 0 {
                     0
                 } else {

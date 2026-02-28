@@ -6,6 +6,7 @@ mod models_panel;
 mod stats_panel;
 
 use crate::live_watcher::LiveWatcher;
+use crate::overview_stats::OverviewStatsCache;
 use crate::session::SessionModal;
 use crate::stats::{load_session_chat_with_max_ts, DayStat, ModelUsage, ToolUsage, Totals};
 use crate::stats_cache::StatsCache;
@@ -103,6 +104,7 @@ pub struct App {
     overview_heatmap_selected_cost: f64,
     overview_heatmap_selected_active_ms: i64,
     overview_heatmap_flash_time: Option<std::time::Instant>,
+    overview_stats_cache: OverviewStatsCache,
 
     // Models panel timeline data
     model_timeline_layout: Option<ModelTimelineLayout>,
@@ -269,6 +271,7 @@ impl App {
             overview_heatmap_selected_cost: 0.0,
             overview_heatmap_selected_active_ms: 0,
             overview_heatmap_flash_time: None,
+            overview_stats_cache: OverviewStatsCache::new(),
 
             model_timeline_layout: None,
             model_timeline_selected_day: None,
@@ -698,6 +701,7 @@ impl App {
             self.session_message_files = session_message_files;
             self.parent_map = parent_map;
             self.children_map = children_map;
+            self.overview_stats_cache.invalidate();
 
             self.rebuild_day_and_session_lists(is_full_refresh);
             self.update_derived_data();
@@ -2026,7 +2030,7 @@ impl App {
                         Style::default().fg(colors.border_muted)
                     },
                     list_highlighted,
-                    list_highlighted,
+                    self.is_active && list_highlighted,
                 );
             }
             LeftPanel::Models => {

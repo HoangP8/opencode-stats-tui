@@ -72,6 +72,8 @@ impl super::App {
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
+                    .bg(colors.bg_primary)
+                    .remove_modifier(Modifier::REVERSED | Modifier::BOLD)
             })
             .highlight_symbol(if is_active { "▶ " } else { "  " })
             .highlight_spacing(HighlightSpacing::Always);
@@ -476,6 +478,8 @@ impl super::App {
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
+                    .bg(colors.bg_primary)
+                    .remove_modifier(Modifier::REVERSED | Modifier::BOLD)
             })
             .highlight_symbol(if is_active { "▶ " } else { "  " })
             .highlight_spacing(HighlightSpacing::Always);

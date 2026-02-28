@@ -280,35 +280,3 @@ pub fn weekday_abbr(w: chrono::Weekday) -> &'static str {
         chrono::Weekday::Sun => "Sun",
     }
 }
-
-/// Language name from file extension.
-pub fn lang_from_ext(ext: &str) -> Option<&'static str> {
-    Some(match ext {
-        "rs" => "Rust",
-        "py" => "Python",
-        "js" => "JavaScript",
-        "ts" | "tsx" => "TypeScript",
-        "go" => "Go",
-        "java" => "Java",
-        "c" | "h" => "C",
-        "cpp" | "cc" | "cxx" | "hpp" => "C++",
-        "rb" => "Ruby",
-        "swift" => "Swift",
-        "kt" => "Kotlin",
-        "lua" => "Lua",
-        "sh" | "bash" | "zsh" => "Shell",
-        "css" | "scss" | "sass" => "CSS",
-        "html" | "htm" => "HTML",
-        "json" => "JSON",
-        "yaml" | "yml" => "YAML",
-        "toml" => "TOML",
-        "md" | "mdx" => "Markdown",
-        "sql" => "SQL",
-        "svelte" => "Svelte",
-        "vue" => "Vue",
-        "dart" => "Dart",
-        "zig" => "Zig",
-        "ex" | "exs" => "Elixir",
-        _ => return None,
-    })
-}

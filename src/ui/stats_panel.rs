@@ -1,7 +1,7 @@
 //! Stats panel rendering.
 
 use super::helpers::{
-    lang_from_ext, month_abbr, stat_widget, truncate_with_ellipsis, weekday_abbr, HeatmapLayout,
+    month_abbr, stat_widget, truncate_with_ellipsis, weekday_abbr, HeatmapLayout,
 };
 use crate::stats::{format_active_duration, format_number};
 use crate::theme::FixedColors;
@@ -13,7 +13,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use rustc_hash::FxHashMap;
 
 impl super::App {
     /// GENERAL USAGE left panel.
@@ -216,14 +215,21 @@ impl super::App {
         );
     }
 
-    /// OVERVIEW right panel.
+    /// OVERVIEW right panel
     pub fn render_overview_panel(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         border_style: Style,
         is_highlighted: bool,
     ) {
+        // Calculate stats (5s cache)
+        let stats = self.overview_stats_cache.get(
+            &self.per_day,
+            &self.model_usage,
+            self.totals.display_cost(),
+        );
+
         let colors = self.theme.colors();
         let title_color = if is_highlighted {
             colors.border_focus
@@ -251,191 +257,234 @@ impl super::App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let total_sessions = self.totals.sessions.len();
-        let total_days = self.day_list.len();
-        let start_day = self.day_list.last().cloned().unwrap_or_else(|| "—".into());
-        let days_since_start = self
-            .day_list
-            .last()
-            .and_then(|first| {
-                chrono::NaiveDate::parse_from_str(first, "%Y-%m-%d")
-                    .ok()
-                    .map(|d| (chrono::Local::now().date_naive() - d).num_days().max(1) as usize)
-            })
-            .unwrap_or_else(|| total_days.max(1));
-
-        let avg_sess_per_day = if total_days > 0 {
-            total_sessions as f64 / total_days as f64
+        let muted = Style::default().fg(colors.text_muted);
+        let sep_color = if is_highlighted {
+            colors.border_focus
         } else {
-            0.0
+            colors.text_muted
         };
-        let avg_cost_per_sess = if total_sessions > 0 {
-            self.totals.display_cost() / total_sessions as f64
+        let sep_style = Style::default().fg(sep_color);
+
+        const SEP_W: u16 = 1;
+
+        // Calculate actual content widths needed
+        let col0_content_width = 15 + stats.peak_day.len().max(10);
+        let col1_content_width = 15 + stats.avg_sessions.len().max(12);
+        let col2_min_width = 18;
+
+        // Total width needed for all 3 columns
+        let total_3col_needed =
+            col0_content_width + col1_content_width + col2_min_width + 2 * SEP_W as usize;
+
+        // For narrow panels, show compact view
+        if inner.width < 55 {
+            self.render_overview_compact(frame, inner, &stats, &colors, muted);
+            return;
+        }
+
+        // Hide Languages column if content doesn't fit
+        let show_languages = (inner.width as usize) >= total_3col_needed;
+        let num_separators = if show_languages { 2 } else { 1 };
+        let available_width = inner.width.saturating_sub(num_separators * SEP_W);
+
+        let cols = if show_languages {
+            // 3 columns: 37% : 35% : 28%
+            let col0_w = ((available_width as f32 * 0.37) as u16).max(col0_content_width as u16);
+            let col1_w = ((available_width as f32 * 0.35) as u16).max(col1_content_width as u16);
+            let col2_w = available_width
+                .saturating_sub(col0_w + col1_w)
+                .max(col2_min_width as u16);
+            vec![
+                Rect::new(inner.x, inner.y, col0_w, inner.height),
+                Rect::new(inner.x + col0_w + SEP_W, inner.y, col1_w, inner.height),
+                Rect::new(
+                    inner.x + col0_w + SEP_W + col1_w + SEP_W,
+                    inner.y,
+                    col2_w,
+                    inner.height,
+                ),
+            ]
         } else {
-            0.0
+            // 2 columns
+            let col0_w = ((available_width as f32 * 0.52) as u16)
+                .max(col0_content_width as u16)
+                .min(available_width - col1_content_width as u16);
+            let col1_w = available_width.saturating_sub(col0_w);
+            vec![
+                Rect::new(inner.x, inner.y, col0_w, inner.height),
+                Rect::new(inner.x + col0_w + SEP_W, inner.y, col1_w, inner.height),
+            ]
         };
 
-        let (peak_day, peak_count) = self
-            .per_day
-            .iter()
-            .map(|(d, s)| (d.clone(), s.sessions.len()))
-            .max_by_key(|(_, c)| *c)
-            .unwrap_or_else(|| ("—".into(), 0));
-        let peak_display = self
-            .cached_day_strings
-            .get(&peak_day)
-            .cloned()
-            .unwrap_or(peak_day);
+        // ========== Column 1: Core Stats ==========
+        // All labels aligned to "Total Savings" length (13 chars) + 2 spaces indent
+        let col1_lines = vec![
+            Line::from(vec![
+                Span::styled("Peak Day       ", muted),
+                Span::styled(
+                    &stats.peak_day,
+                    Style::default()
+                        .fg(colors.cost())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Start Day      ", muted),
+                Span::styled(&stats.start_day, Style::default().fg(colors.text_primary)),
+            ]),
+            Line::from(vec![
+                Span::styled("Active Days    ", muted),
+                Span::styled(&stats.active_days, Style::default().fg(colors.info)),
+            ]),
+            Line::from(vec![
+                Span::styled("Longest Sess   ", muted),
+                Span::styled(
+                    &stats.longest_session,
+                    Style::default().fg(colors.accent_cyan),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Total Time     ", muted),
+                Span::styled(
+                    &stats.total_active_time,
+                    Style::default()
+                        .fg(colors.success)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Total Savings  ", muted),
+                Span::styled(
+                    &stats.total_savings,
+                    Style::default().fg(colors.accent_green),
+                ),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(col1_lines), cols[0]);
 
-        let longest_ms: i64 = self
-            .per_day
-            .values()
-            .flat_map(|d| d.sessions.values())
-            .map(|s| s.active_duration_ms)
-            .max()
-            .unwrap_or(0);
+        // ========== Column 2: Averages & Patterns ==========
+        let col2_lines = vec![
+            Line::from(vec![
+                Span::styled("Avg Sessions  ", muted),
+                Span::styled(&stats.avg_sessions, Style::default().fg(colors.info)),
+            ]),
+            Line::from(vec![
+                Span::styled("Avg Cost      ", muted),
+                Span::styled(&stats.avg_cost, Style::default().fg(colors.cost())),
+            ]),
+            Line::from(vec![
+                Span::styled("Avg Tokens    ", muted),
+                Span::styled(&stats.avg_tokens, Style::default().fg(colors.token_input())),
+            ]),
+            Line::from(vec![
+                Span::styled("Chronotype    ", muted),
+                Span::styled(
+                    &stats.chronotype,
+                    Style::default()
+                        .fg(colors.accent_orange)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Fav Day       ", muted),
+                Span::styled(&stats.favorite_day, Style::default().fg(colors.accent_pink)),
+            ]),
+            Line::from(vec![
+                Span::styled("Total Models  ", muted),
+                Span::styled(
+                    &stats.total_models,
+                    Style::default().fg(colors.accent_magenta),
+                ),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(col2_lines), cols[1]);
 
-        let total_active_ms: i64 = self
-            .per_day
-            .values()
-            .flat_map(|d| d.sessions.values())
-            .map(|s| s.active_duration_ms)
-            .sum();
+        // Column separator
+        let sep_char = "│";
+        let sep_lines: Vec<Line> = (0..inner.height)
+            .map(|_| Line::from(Span::styled(sep_char, sep_style)))
+            .collect();
 
-        // Find favorite language by diff lines
-        let fav_lang = {
-            let mut counts: FxHashMap<&str, u64> = FxHashMap::default();
-            for day in self.per_day.values() {
-                for sess in day.sessions.values() {
-                    for fd in &sess.file_diffs {
-                        if let Some(ext) = fd.path.rsplit('.').next() {
-                            if let Some(lang) = lang_from_ext(ext) {
-                                *counts.entry(lang).or_default() +=
-                                    (fd.additions + fd.deletions).max(1);
-                            }
-                        }
-                    }
+        // Separator between column 0 and 1
+        let sep0_x = cols[0].x + cols[0].width;
+        frame.render_widget(
+            Paragraph::new(sep_lines.clone()),
+            Rect::new(sep0_x, inner.y, 1, inner.height),
+        );
+
+        // ========== Column 3: Languages ==========
+        if show_languages {
+            // No indent for title, 2 char indent for languages
+            let mut col3_lines: Vec<Line> = vec![Line::from(Span::styled(
+                "Languages",
+                muted.add_modifier(Modifier::BOLD),
+            ))];
+
+            if stats.top_languages.is_empty() {
+                col3_lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled("No data", muted),
+                ]));
+            } else {
+                for (lang, pct) in &stats.top_languages {
+                    col3_lines.push(Line::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled(
+                            format!("{:<12} ", lang),
+                            Style::default().fg(colors.accent_cyan),
+                        ),
+                        Span::styled(format!("{:>5.1}%", pct), muted),
+                    ]));
+                }
+                if stats.has_more_langs {
+                    col3_lines.push(Line::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled("...", muted),
+                    ]));
                 }
             }
-            counts
-                .into_iter()
-                .max_by_key(|(_, c)| *c)
-                .map(|(l, _)| l.to_string())
-                .unwrap_or_else(|| "—".into())
-        };
+            frame.render_widget(Paragraph::new(col3_lines), cols[2]);
 
-        let start_display = chrono::NaiveDate::parse_from_str(&start_day, "%Y-%m-%d")
-            .map(|d| format!("{} {:02}, {}", month_abbr(d.month()), d.day(), d.year()))
-            .unwrap_or(start_day);
-
-        let muted = Style::default().fg(colors.text_muted);
-        let w = 18usize;
-
-        if inner.width < 50 {
+            // Separator between column 1 and 2
+            let sep1_x = cols[1].x + cols[1].width;
             frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(vec![
-                        Span::styled("Peak: ", muted),
-                        Span::styled(peak_display, Style::default().fg(colors.cost())),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Long: ", muted),
-                        Span::styled(
-                            format_active_duration(longest_ms),
-                            Style::default().fg(colors.accent_cyan),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Avg:  ", muted),
-                        Span::styled(
-                            format!("{:.1}", avg_sess_per_day),
-                            Style::default().fg(colors.info),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled("Fav:  ", muted),
-                        Span::styled(fav_lang, Style::default().fg(colors.accent_magenta)),
-                    ]),
-                ]),
-                inner,
-            );
-        } else {
-            let cols = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(inner);
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(vec![
-                        Span::styled(format!("  {:<w$}", "Peak Day", w = w), muted),
-                        Span::styled(
-                            format!("{} ({}s)", peak_display, peak_count),
-                            Style::default()
-                                .fg(colors.cost())
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(format!("  {:<w$}", "Longest Session", w = w), muted),
-                        Span::styled(
-                            format_active_duration(longest_ms),
-                            Style::default().fg(colors.accent_cyan),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(format!("  {:<w$}", "Avg Sessions/Day", w = w), muted),
-                        Span::styled(
-                            format!("{:.1}", avg_sess_per_day),
-                            Style::default()
-                                .fg(colors.info)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(format!("  {:<w$}", "Total Active", w = w), muted),
-                        Span::styled(
-                            format_active_duration(total_active_ms),
-                            Style::default()
-                                .fg(colors.success)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]),
-                ]),
-                cols[0],
-            );
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(vec![
-                        Span::styled(format!("  {:<w$}", "Start Day", w = w), muted),
-                        Span::styled(start_display, Style::default().fg(colors.text_primary)),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(format!("  {:<w$}", "Active Days", w = w), muted),
-                        Span::styled(
-                            format!("{} / {}", total_days, days_since_start),
-                            Style::default().fg(colors.info),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(format!("  {:<w$}", "Avg Cost/Session", w = w), muted),
-                        Span::styled(
-                            format!("${:.2}", avg_cost_per_sess),
-                            Style::default().fg(colors.cost()),
-                        ),
-                    ]),
-                    Line::from(vec![
-                        Span::styled(format!("  {:<w$}", "Fav Language", w = w), muted),
-                        Span::styled(
-                            fav_lang,
-                            Style::default()
-                                .fg(colors.accent_magenta)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]),
-                ]),
-                cols[1],
+                Paragraph::new(sep_lines),
+                Rect::new(sep1_x, inner.y, 1, inner.height),
             );
         }
+    }
+
+    /// Compact view for narrow panels
+    fn render_overview_compact(
+        &self,
+        frame: &mut Frame,
+        inner: Rect,
+        stats: &crate::overview_stats::OverviewStats,
+        colors: &crate::theme::ThemeColors,
+        muted: Style,
+    ) {
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("Peak: ", muted),
+                Span::styled(&stats.peak_day, Style::default().fg(colors.cost())),
+            ]),
+            Line::from(vec![
+                Span::styled("Long: ", muted),
+                Span::styled(
+                    &stats.longest_session,
+                    Style::default().fg(colors.accent_cyan),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Avg:  ", muted),
+                Span::styled(&stats.avg_sessions, Style::default().fg(colors.info)),
+            ]),
+            Line::from(vec![
+                Span::styled("Fav:  ", muted),
+                Span::styled(&stats.favorite_day, Style::default().fg(colors.accent_pink)),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     /// Activity heatmap: last 365 days
