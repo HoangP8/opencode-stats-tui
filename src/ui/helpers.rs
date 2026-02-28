@@ -148,10 +148,10 @@ pub fn usage_list_row(
     sessions: usize,
     fmt: &UsageRowFormat,
     colors: &ThemeColors,
-    is_active: bool,
+    is_highlighted: bool,
 ) -> Line<'static> {
     let name_display: String = name.chars().take(fmt.name_width).collect();
-    let sep = if is_active {
+    let sep = if is_highlighted {
         Style::default().fg(colors.border_focus)
     } else {
         Style::default().fg(colors.text_muted)
@@ -264,19 +264,5 @@ pub fn month_abbr(m: u32) -> &'static str {
         10 => "Oct",
         11 => "Nov",
         _ => "Dec",
-    }
-}
-
-/// Weekday abbreviation.
-#[inline]
-pub fn weekday_abbr(w: chrono::Weekday) -> &'static str {
-    match w {
-        chrono::Weekday::Mon => "Mon",
-        chrono::Weekday::Tue => "Tue",
-        chrono::Weekday::Wed => "Wed",
-        chrono::Weekday::Thu => "Thu",
-        chrono::Weekday::Fri => "Fri",
-        chrono::Weekday::Sat => "Sat",
-        chrono::Weekday::Sun => "Sun",
     }
 }

@@ -4,7 +4,7 @@ use super::helpers::{truncate_host_name, truncate_with_ellipsis, usage_list_row,
 use crate::stats::{format_active_duration, format_number, format_number_full};
 use crate::theme::FixedColors;
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, HighlightSpacing, List, ListItem, Paragraph},
@@ -24,9 +24,10 @@ impl super::App {
         let inner_width = area.width.saturating_sub(2);
         if self.cached_day_items.is_empty()
             || self.cached_day_width != inner_width
+            || self.cached_day_is_highlighted != is_highlighted
             || self.cached_day_is_active != is_active
         {
-            self.rebuild_day_list_cache(inner_width, is_active);
+            self.rebuild_day_list_cache(inner_width, is_highlighted, is_active);
         }
 
         let colors = self.theme.colors();
@@ -82,9 +83,10 @@ impl super::App {
     }
 
     /// Rebuild cached day list items.
-    pub fn rebuild_day_list_cache(&mut self, width: u16, is_active: bool) {
+    pub fn rebuild_day_list_cache(&mut self, width: u16, is_highlighted: bool, is_active: bool) {
         let colors = self.theme.colors();
         self.cached_day_width = width;
+        self.cached_day_is_highlighted = is_highlighted;
         self.cached_day_is_active = is_active;
         let cost_width = self.max_cost_width();
         let fixed = 3 + 7 + 4 + 7 + 4 + 3 + (cost_width + 1) + 3 + 9;
@@ -131,7 +133,7 @@ impl super::App {
                         sess_width: 4,
                     },
                     &colors,
-                    is_active,
+                    is_highlighted,
                 ))
             })
             .collect();
@@ -191,7 +193,7 @@ impl super::App {
         frame.render_widget(block, area);
 
         if let Some(s) = session {
-            self.render_session_info(frame, inner, &s, &colors);
+            self.render_session_info(frame, inner, &s, &colors, is_highlighted);
         }
     }
 
@@ -201,6 +203,7 @@ impl super::App {
         inner: Rect,
         s: &crate::stats::SessionStat,
         colors: &crate::theme::ThemeColors,
+        focused: bool,
     ) {
         let title = self
             .session_titles
@@ -215,10 +218,14 @@ impl super::App {
         };
         let project = project_str.as_ref();
 
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-            .split(inner);
+        let sep_w = 1u16;
+        let available_width = inner.width.saturating_sub(sep_w);
+        let col0_w = (available_width as f32 * 0.62) as u16;
+        let col1_w = available_width.saturating_sub(col0_w);
+        let cols = vec![
+            Rect::new(inner.x, inner.y, col0_w, inner.height),
+            Rect::new(inner.x + col0_w + sep_w, inner.y, col1_w, inner.height),
+        ];
 
         let muted = Style::default().fg(colors.text_muted);
         let left_w = cols[0].width.saturating_sub(14) as usize;
@@ -354,6 +361,23 @@ impl super::App {
 
         frame.render_widget(Paragraph::new(left), cols[0]);
 
+        // Column separator between left and right columns
+        let sep_color = if focused {
+            colors.border_focus
+        } else {
+            colors.text_muted
+        };
+        let sep_style = Style::default().fg(sep_color);
+        let sep_char = "│";
+        let sep_lines: Vec<Line> = (0..cols[0].height)
+            .map(|_| Line::from(Span::styled(sep_char, sep_style)))
+            .collect();
+        let sep_x = cols[0].x + cols[0].width;
+        frame.render_widget(
+            Paragraph::new(sep_lines),
+            Rect::new(sep_x, cols[0].y, 1, cols[0].height),
+        );
+
         // Right: tokens
         let right = vec![
             Line::from(vec![
@@ -434,9 +458,10 @@ impl super::App {
         let inner_width = area.width.saturating_sub(2);
         if self.cached_session_width != inner_width
             || self.cached_session_items.is_empty()
+            || self.cached_session_is_highlighted != is_highlighted
             || self.cached_session_is_active != is_active
         {
-            self.rebuild_cached_session_items(inner_width, is_active);
+            self.rebuild_cached_session_items(inner_width, is_highlighted, is_active);
         }
 
         let colors = self.theme.colors();
@@ -488,13 +513,19 @@ impl super::App {
     }
 
     /// Rebuild cached session list items
-    pub fn rebuild_cached_session_items(&mut self, width: u16, is_active: bool) {
+    pub fn rebuild_cached_session_items(
+        &mut self,
+        width: u16,
+        is_highlighted: bool,
+        is_active: bool,
+    ) {
         let colors = self.theme.colors();
         let fixed = FixedColors::DEFAULT;
         self.cached_session_width = width;
+        self.cached_session_is_highlighted = is_highlighted;
         self.cached_session_is_active = is_active;
 
-        let sep_color = if is_active {
+        let sep_color = if is_highlighted {
             colors.border_focus
         } else {
             colors.text_muted

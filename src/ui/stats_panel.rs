@@ -1,9 +1,7 @@
 //! Stats panel rendering.
 
-use super::helpers::{
-    month_abbr, stat_widget, truncate_with_ellipsis, weekday_abbr, HeatmapLayout,
-};
-use crate::stats::{format_active_duration, format_number};
+use super::helpers::{month_abbr, stat_widget, truncate_with_ellipsis, HeatmapLayout};
+use crate::stats::format_number;
 use crate::theme::FixedColors;
 use chrono::Datelike;
 use ratatui::{
@@ -758,15 +756,7 @@ impl super::App {
                 .cloned()
                 .unwrap_or_else(|| {
                     chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
-                        .map(|d| {
-                            format!(
-                                "{} {:02}, {} {}",
-                                month_abbr(d.month()),
-                                d.day(),
-                                d.year(),
-                                weekday_abbr(d.weekday())
-                            )
-                        })
+                        .map(|d| format!("{} {:02}, {}", month_abbr(d.month()), d.day(), d.year()))
                         .unwrap_or_else(|_| day.clone())
                 });
             let dim = Style::default().fg(colors.text_muted);
@@ -795,12 +785,6 @@ impl super::App {
                 Span::styled(
                     format!("${:.2}", self.overview_heatmap_selected_cost),
                     Style::default().fg(colors.cost()),
-                ),
-                Span::styled(" ╱ ", dim),
-                Span::styled("active:", dim),
-                Span::styled(
-                    format_active_duration(self.overview_heatmap_selected_active_ms),
-                    Style::default().fg(colors.accent_cyan),
                 ),
             ]);
         }

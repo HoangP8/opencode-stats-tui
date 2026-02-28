@@ -45,12 +45,15 @@ pub struct App {
     session_list_state: ListState,
     cached_session_items: Vec<ratatui::widgets::ListItem<'static>>,
     cached_session_width: u16,
+    cached_session_is_highlighted: bool,
     cached_session_is_active: bool,
     cached_day_items: Vec<ratatui::widgets::ListItem<'static>>,
     cached_day_width: u16,
+    cached_day_is_highlighted: bool,
     cached_day_is_active: bool,
     cached_model_items: Vec<ratatui::widgets::ListItem<'static>>,
     cached_model_width: u16,
+    cached_model_is_highlighted: bool,
     cached_model_is_active: bool,
     chat_cache: FxHashMap<String, CachedChat>,
     chat_cache_order: Vec<String>,
@@ -238,12 +241,15 @@ impl App {
             ranking_max_scroll: 0,
             cached_session_items: Vec::new(),
             cached_session_width: 0,
+            cached_session_is_highlighted: false,
             cached_session_is_active: false,
             cached_day_items: Vec::new(),
             cached_day_width: 0,
+            cached_day_is_highlighted: false,
             cached_day_is_active: false,
             cached_model_items: Vec::new(),
             cached_model_width: 0,
+            cached_model_is_highlighted: false,
             cached_model_is_active: false,
             cached_day_strings: FxHashMap::default(),
             chat_cache: FxHashMap::default(),
@@ -1367,7 +1373,8 @@ impl App {
                                     || self.right_panel == RightPanel::Tools
                                 {
                                     self.models_active = true;
-                                    self.model_timeline_flash_time = Some(std::time::Instant::now());
+                                    self.model_timeline_flash_time =
+                                        Some(std::time::Instant::now());
                                 }
                             }
                         },
@@ -1511,7 +1518,7 @@ impl App {
                 if self.is_active || self.models_active {
                     self.is_active = false;
                     self.models_active = false;
-                        self.model_timeline_flash_time = None;
+                    self.model_timeline_flash_time = None;
                 } else {
                     self.exit = true;
                 }
@@ -1535,14 +1542,14 @@ impl App {
                     self.left_panel = LeftPanel::Stats;
                     self.is_active = false;
                     self.models_active = false;
-                        self.model_timeline_flash_time = None;
+                    self.model_timeline_flash_time = None;
                 }
                 "days" => {
                     self.focus = Focus::Left;
                     self.left_panel = LeftPanel::Days;
                     self.is_active = true;
                     self.models_active = false;
-                        self.model_timeline_flash_time = None;
+                    self.model_timeline_flash_time = None;
 
                     if let Some(rect) = self.cached_rects.days {
                         let inner_top = rect.y.saturating_add(1);
