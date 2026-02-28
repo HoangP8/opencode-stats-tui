@@ -75,7 +75,7 @@ impl super::App {
             } else {
                 Style::default()
             })
-            .highlight_symbol(if is_active { "▶ " } else { "  " })
+            .highlight_symbol(if is_active { "● " } else { "  " })
             .highlight_spacing(HighlightSpacing::Always);
 
         frame.render_stateful_widget(list, area, &mut self.model_list_state);
@@ -1108,9 +1108,16 @@ impl super::App {
         );
         let suffix_w = suffix_sample.chars().count();
         let bar_avail = total_w.saturating_sub(suffix_w);
-        let flash = self.model_timeline_flash_time.map(|t| {
-            (1.0 - (t.elapsed().as_millis() as f64 * std::f64::consts::TAU / 600.0).cos()) * 0.2
-        });
+        let in_subpanel = self.models_active
+            || self.right_panel == super::helpers::RightPanel::Tools
+            || self.right_panel == super::helpers::RightPanel::Detail;
+        let flash = if in_subpanel {
+            self.model_timeline_flash_time.map(|t| {
+                (1.0 - (t.elapsed().as_millis() as f64 * std::f64::consts::TAU / 600.0).cos()) * 0.2
+            })
+        } else {
+            None
+        };
 
         let lines: Vec<Line> = ranked
             .iter()

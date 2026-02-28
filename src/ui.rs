@@ -965,6 +965,7 @@ impl App {
                 if self.is_active || self.models_active {
                     self.is_active = false;
                     self.models_active = false;
+                    self.model_timeline_flash_time = None;
                 } else {
                     self.exit = true;
                 }
@@ -1345,6 +1346,7 @@ impl App {
                             LeftPanel::Models => {
                                 self.models_active = true;
                                 self.is_active = false;
+                                self.model_timeline_flash_time = Some(std::time::Instant::now());
                             }
                         },
                         Focus::Right => match self.left_panel {
@@ -1365,6 +1367,7 @@ impl App {
                                     || self.right_panel == RightPanel::Tools
                                 {
                                     self.models_active = true;
+                                    self.model_timeline_flash_time = Some(std::time::Instant::now());
                                 }
                             }
                         },
@@ -1508,6 +1511,7 @@ impl App {
                 if self.is_active || self.models_active {
                     self.is_active = false;
                     self.models_active = false;
+                        self.model_timeline_flash_time = None;
                 } else {
                     self.exit = true;
                 }
@@ -1531,12 +1535,14 @@ impl App {
                     self.left_panel = LeftPanel::Stats;
                     self.is_active = false;
                     self.models_active = false;
+                        self.model_timeline_flash_time = None;
                 }
                 "days" => {
                     self.focus = Focus::Left;
                     self.left_panel = LeftPanel::Days;
                     self.is_active = true;
                     self.models_active = false;
+                        self.model_timeline_flash_time = None;
 
                     if let Some(rect) = self.cached_rects.days {
                         let inner_top = rect.y.saturating_add(1);
@@ -1600,6 +1606,7 @@ impl App {
                     if self.left_panel == LeftPanel::Days {
                         self.is_active = true;
                         self.models_active = false;
+                        self.model_timeline_flash_time = None;
 
                         if let Some(rect) = self.cached_rects.list {
                             let inner_top = rect.y.saturating_add(1);

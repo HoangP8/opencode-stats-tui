@@ -75,7 +75,7 @@ impl super::App {
                     .bg(colors.bg_primary)
                     .remove_modifier(Modifier::REVERSED | Modifier::BOLD)
             })
-            .highlight_symbol(if is_active { "▶ " } else { "  " })
+            .highlight_symbol(if is_active { "● " } else { "  " })
             .highlight_spacing(HighlightSpacing::Always);
 
         frame.render_stateful_widget(list, area, &mut self.day_list_state);
@@ -481,7 +481,7 @@ impl super::App {
                     .bg(colors.bg_primary)
                     .remove_modifier(Modifier::REVERSED | Modifier::BOLD)
             })
-            .highlight_symbol(if is_active { "▶ " } else { "  " })
+            .highlight_symbol(if is_active { "● " } else { "  " })
             .highlight_spacing(HighlightSpacing::Always);
 
         frame.render_stateful_widget(list, area, &mut self.session_list_state);
