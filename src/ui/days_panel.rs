@@ -2,7 +2,7 @@
 
 use super::helpers::{truncate_host_name, truncate_with_ellipsis, usage_list_row, UsageRowFormat};
 use crate::stats::{format_active_duration, format_number, format_number_full};
-use crate::theme::FixedColors;
+
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Modifier, Style},
@@ -62,7 +62,7 @@ impl super::App {
                             } else {
                                 " "
                             },
-                            Style::default().fg(colors.text_muted),
+                            Style::default().fg(colors.text_secondary),
                         ))
                         .alignment(Alignment::Center),
                     ),
@@ -227,7 +227,7 @@ impl super::App {
             Rect::new(inner.x + col0_w + sep_w, inner.y, col1_w, inner.height),
         ];
 
-        let muted = Style::default().fg(colors.text_muted);
+        let muted = Style::default().fg(colors.text_secondary);
         let left_w = cols[0].width.saturating_sub(14) as usize;
         let mut left: Vec<Line> = Vec::with_capacity(8);
 
@@ -244,7 +244,7 @@ impl super::App {
             Span::styled("Project      ", muted),
             Span::styled(
                 truncate_with_ellipsis(project, left_w),
-                Style::default().fg(colors.accent_blue),
+                Style::default().fg(colors.top_projects),
             ),
         ]));
 
@@ -265,9 +265,9 @@ impl super::App {
                     .map(|b| truncate_with_ellipsis(b, left_w))
                     .unwrap_or_else(|| "n/a".into()),
                 Style::default().fg(if branch.is_some() {
-                    colors.info
+                    colors.branch
                 } else {
-                    colors.text_muted
+                    colors.text_secondary
                 }),
             ),
         ]));
@@ -282,7 +282,7 @@ impl super::App {
                             .to_string()
                     })
                     .unwrap_or_else(|| "n/a".into()),
-                Style::default().fg(colors.text_muted),
+                Style::default().fg(colors.text_primary),
             ),
         ]));
 
@@ -290,7 +290,7 @@ impl super::App {
             Span::styled("Duration     ", muted),
             Span::styled(
                 format_active_duration(s.active_duration_ms),
-                Style::default().fg(colors.accent_cyan),
+                Style::default().fg(colors.total_time),
             ),
         ]));
 
@@ -298,7 +298,7 @@ impl super::App {
         if s.agents.is_empty() {
             left.push(Line::from(vec![
                 Span::styled("Agents       ", muted),
-                Span::styled("n/a", Style::default().fg(colors.text_muted)),
+                Span::styled("n/a", Style::default().fg(colors.text_secondary)),
             ]));
         } else {
             let mut agents: Vec<(&str, bool, u64)> = s
@@ -314,7 +314,7 @@ impl super::App {
                 Span::styled(
                     format_list_truncated(&names, left_w),
                     Style::default()
-                        .fg(colors.info)
+                        .fg(colors.agent_general)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
@@ -326,7 +326,7 @@ impl super::App {
         if models.is_empty() {
             left.push(Line::from(vec![
                 Span::styled("Models       ", muted),
-                Span::styled("n/a", Style::default().fg(colors.text_muted)),
+                Span::styled("n/a", Style::default().fg(colors.text_secondary)),
             ]));
         } else {
             left.push(Line::from(vec![
@@ -334,7 +334,7 @@ impl super::App {
                 Span::styled(
                     truncate_with_ellipsis(&format_list_truncated(&models, left_w), left_w),
                     Style::default()
-                        .fg(colors.accent_magenta)
+                        .fg(colors.model)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]));
@@ -342,20 +342,15 @@ impl super::App {
 
         // Host
         let device = crate::device::get_device_info();
-        let type_color = if device.kind == "server" {
-            colors.accent_orange
-        } else {
-            colors.accent_cyan
-        };
         let label = device.display_label();
         let host_w = (cols[0].width as usize).saturating_sub(13 + label.len() + 3 + 1);
         left.push(Line::from(vec![
             Span::styled("Host:        ", muted),
-            Span::styled(label, Style::default().fg(type_color)),
+            Span::styled(label, Style::default().fg(colors.host)),
             Span::raw(" | "),
             Span::styled(
                 truncate_host_name(&device.display_name(), &device.short_name(), host_w),
-                Style::default().fg(type_color),
+                Style::default().fg(colors.host),
             ),
         ]));
 
@@ -381,60 +376,60 @@ impl super::App {
         // Right: tokens
         let right = vec![
             Line::from(vec![
-                Span::styled("Input         ", Style::default().fg(colors.token_input())),
+                Span::styled("Input         ", Style::default().fg(colors.text_secondary)),
                 Span::styled(
                     format_number_full(s.tokens.input),
                     Style::default().fg(colors.token_input()),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("Output        ", Style::default().fg(colors.token_output())),
+                Span::styled("Output        ", Style::default().fg(colors.text_secondary)),
                 Span::styled(
                     format_number_full(s.tokens.output),
                     Style::default().fg(colors.token_output()),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("Thinking      ", Style::default().fg(colors.thinking())),
+                Span::styled("Thinking      ", Style::default().fg(colors.text_secondary)),
                 Span::styled(
                     format_number_full(s.tokens.reasoning),
                     Style::default().fg(colors.thinking()),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("Cache Read    ", Style::default().fg(colors.cost())),
+                Span::styled("Cache Read    ", Style::default().fg(colors.text_secondary)),
                 Span::styled(
                     format_number_full(s.tokens.cache_read),
-                    Style::default().fg(colors.cost()),
+                    Style::default().fg(colors.cache_read),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("Cache Write   ", Style::default().fg(colors.cost())),
+                Span::styled("Cache Write   ", Style::default().fg(colors.text_secondary)),
                 Span::styled(
                     format_number_full(s.tokens.cache_write),
-                    Style::default().fg(colors.cost()),
+                    Style::default().fg(colors.cache_write),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("Prompts       ", Style::default().fg(colors.info)),
+                Span::styled("Prompts       ", Style::default().fg(colors.text_secondary)),
                 Span::styled(
                     format!("{}", s.prompts),
                     Style::default()
-                        .fg(colors.info)
+                        .fg(colors.user)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("Responses     ", Style::default().fg(colors.success)),
+                Span::styled("Responses     ", Style::default().fg(colors.text_secondary)),
                 Span::styled(
                     format!("{}", s.messages.saturating_sub(s.prompts)),
                     Style::default()
-                        .fg(colors.success)
+                        .fg(colors.agent_general)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("Cost          ", Style::default().fg(colors.cost())),
+                Span::styled("Cost          ", Style::default().fg(colors.text_secondary)),
                 Span::styled(
                     format!("${:.2}", s.display_cost()),
                     Style::default()
@@ -492,7 +487,7 @@ impl super::App {
                             } else {
                                 " "
                             },
-                            Style::default().fg(colors.text_muted),
+                            Style::default().fg(colors.text_secondary),
                         ))
                         .alignment(Alignment::Center),
                     ),
@@ -520,7 +515,6 @@ impl super::App {
         is_active: bool,
     ) {
         let colors = self.theme.colors();
-        let fixed = FixedColors::DEFAULT;
         self.cached_session_width = width;
         self.cached_session_is_highlighted = is_highlighted;
         self.cached_session_is_active = is_active;
@@ -569,7 +563,7 @@ impl super::App {
                     format!("{} models", s.models.len())
                 };
                 let title_color = if s.is_continuation {
-                    colors.text_muted
+                    colors.text_secondary
                 } else {
                     colors.text_primary
                 };
@@ -586,12 +580,12 @@ impl super::App {
                     Span::styled(" │ ", Style::default().fg(sep_color)),
                     Span::styled(
                         format!("+{:>7}", format_number(s.diffs.additions)),
-                        Style::default().fg(fixed.diff_add),
+                        Style::default().fg(colors.add_line),
                     ),
                     Span::styled(" │ ", Style::default().fg(sep_color)),
                     Span::styled(
                         format!("-{:>7}", format_number(s.diffs.deletions)),
-                        Style::default().fg(fixed.diff_remove),
+                        Style::default().fg(colors.remove_line),
                     ),
                     Span::styled(" │ ", Style::default().fg(sep_color)),
                     Span::styled(
@@ -601,12 +595,12 @@ impl super::App {
                     Span::styled(" │ ", Style::default().fg(sep_color)),
                     Span::styled(
                         format!("{:>4} msg", s.messages),
-                        Style::default().fg(colors.info),
+                        Style::default().fg(colors.session),
                     ),
                     Span::styled(" │ ", Style::default().fg(sep_color)),
                     Span::styled(
                         format!("{:>1$}", model_text, max_models_len),
-                        Style::default().fg(colors.accent_magenta),
+                        Style::default().fg(colors.model),
                     ),
                 ]))
             })

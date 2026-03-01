@@ -2,7 +2,7 @@
 
 use super::helpers::{month_abbr, stat_widget, truncate_with_ellipsis, HeatmapLayout};
 use crate::stats::format_number;
-use crate::theme::FixedColors;
+
 use chrono::Datelike;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -90,7 +90,7 @@ impl super::App {
             stat_widget(
                 "Sessions",
                 format!("{}", self.totals.sessions.len()),
-                colors.info,
+                colors.session,
                 &colors,
             ),
             c1[0],
@@ -147,7 +147,7 @@ impl super::App {
             stat_widget(
                 "Cache",
                 format_number(self.totals.tokens.cache_read + self.totals.tokens.cache_write),
-                colors.cost(),
+                colors.cache_read,
                 &colors,
             ),
             c3[1],
@@ -158,26 +158,24 @@ impl super::App {
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Length(2)])
             .split(cols[5]);
-        let fixed = FixedColors::DEFAULT;
-
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
                     "Line Changes",
-                    Style::default().fg(colors.text_secondary),
+                    Style::default().fg(colors.text_primary),
                 )),
                 Line::from(vec![
                     Span::styled(
                         format!("+{}", format_number(self.totals.diffs.additions)),
                         Style::default()
-                            .fg(fixed.diff_add)
+                            .fg(colors.add_line)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(" / ", Style::default().fg(colors.text_muted)),
                     Span::styled(
                         format!("-{}", format_number(self.totals.diffs.deletions)),
                         Style::default()
-                            .fg(fixed.diff_remove)
+                            .fg(colors.remove_line)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]),
@@ -190,20 +188,20 @@ impl super::App {
             Paragraph::new(vec![
                 Line::from(Span::styled(
                     "User / Agent Messages",
-                    Style::default().fg(colors.text_secondary),
+                    Style::default().fg(colors.text_primary),
                 )),
                 Line::from(vec![
                     Span::styled(
                         format!("{}", self.totals.prompts),
                         Style::default()
-                            .fg(colors.info)
+                            .fg(colors.user)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(" / ", Style::default().fg(colors.text_muted)),
                     Span::styled(
                         format!("{}", total_responses),
                         Style::default()
-                            .fg(colors.success)
+                            .fg(colors.agent_general)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]),
@@ -255,7 +253,8 @@ impl super::App {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let muted = Style::default().fg(colors.text_muted);
+        let _muted = Style::default().fg(colors.text_muted);
+        let secondary = Style::default().fg(colors.text_secondary);
         let sep_color = if is_highlighted {
             colors.border_focus
         } else {
@@ -273,12 +272,6 @@ impl super::App {
         // Total width needed for all 3 columns
         let total_3col_needed =
             col0_content_width + col1_content_width + col2_min_width + 2 * SEP_W as usize;
-
-        // For narrow panels, show compact view
-        if inner.width < 55 {
-            self.render_overview_compact(frame, inner, &stats, &colors, muted);
-            return;
-        }
 
         // Hide Languages column if content doesn't fit
         let show_languages = (inner.width as usize) >= total_3col_needed;
@@ -318,44 +311,38 @@ impl super::App {
         // All labels aligned to "Total Savings" length (13 chars) + 2 spaces indent
         let col1_lines = vec![
             Line::from(vec![
-                Span::styled("Peak Day       ", muted),
+                Span::styled("Peak Day       ", secondary),
                 Span::styled(
                     &stats.peak_day,
                     Style::default()
-                        .fg(colors.cost())
+                        .fg(colors.day_stats)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("Start Day      ", muted),
-                Span::styled(&stats.start_day, Style::default().fg(colors.text_primary)),
+                Span::styled("Start Day      ", secondary),
+                Span::styled(&stats.start_day, Style::default().fg(colors.day_stats)),
             ]),
             Line::from(vec![
-                Span::styled("Active Days    ", muted),
-                Span::styled(&stats.active_days, Style::default().fg(colors.info)),
+                Span::styled("Active Days    ", secondary),
+                Span::styled(&stats.active_days, Style::default().fg(colors.day_stats)),
             ]),
             Line::from(vec![
-                Span::styled("Longest Sess   ", muted),
-                Span::styled(
-                    &stats.longest_session,
-                    Style::default().fg(colors.accent_cyan),
-                ),
+                Span::styled("Longest Sess   ", secondary),
+                Span::styled(&stats.longest_session, Style::default().fg(colors.session)),
             ]),
             Line::from(vec![
-                Span::styled("Total Time     ", muted),
+                Span::styled("Total Time     ", secondary),
                 Span::styled(
                     &stats.total_active_time,
                     Style::default()
-                        .fg(colors.success)
+                        .fg(colors.total_time)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("Total Savings  ", muted),
-                Span::styled(
-                    &stats.total_savings,
-                    Style::default().fg(colors.accent_green),
-                ),
+                Span::styled("Total Savings  ", secondary),
+                Span::styled(&stats.total_savings, Style::default().fg(colors.savings)),
             ]),
         ];
         frame.render_widget(Paragraph::new(col1_lines), cols[0]);
@@ -363,36 +350,33 @@ impl super::App {
         // ========== Column 2: Averages & Patterns ==========
         let col2_lines = vec![
             Line::from(vec![
-                Span::styled("Avg Sessions  ", muted),
-                Span::styled(&stats.avg_sessions, Style::default().fg(colors.info)),
+                Span::styled("Avg Sessions  ", secondary),
+                Span::styled(&stats.avg_sessions, Style::default().fg(colors.session)),
             ]),
             Line::from(vec![
-                Span::styled("Avg Cost      ", muted),
+                Span::styled("Avg Cost      ", secondary),
                 Span::styled(&stats.avg_cost, Style::default().fg(colors.cost())),
             ]),
             Line::from(vec![
-                Span::styled("Avg Tokens    ", muted),
-                Span::styled(&stats.avg_tokens, Style::default().fg(colors.token_input())),
+                Span::styled("Avg Tokens    ", secondary),
+                Span::styled(&stats.avg_tokens, Style::default().fg(colors.avg_tokens)),
             ]),
             Line::from(vec![
-                Span::styled("Chronotype    ", muted),
+                Span::styled("Chronotype    ", secondary),
                 Span::styled(
                     &stats.chronotype,
                     Style::default()
-                        .fg(colors.accent_orange)
+                        .fg(colors.chronotype)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
-                Span::styled("Fav Day       ", muted),
-                Span::styled(&stats.favorite_day, Style::default().fg(colors.accent_pink)),
+                Span::styled("Fav Day       ", secondary),
+                Span::styled(&stats.favorite_day, Style::default().fg(colors.fav_day)),
             ]),
             Line::from(vec![
-                Span::styled("Total Models  ", muted),
-                Span::styled(
-                    &stats.total_models,
-                    Style::default().fg(colors.accent_magenta),
-                ),
+                Span::styled("Total Models  ", secondary),
+                Span::styled(&stats.total_models, Style::default().fg(colors.model)),
             ]),
         ];
         frame.render_widget(Paragraph::new(col2_lines), cols[1]);
@@ -415,13 +399,13 @@ impl super::App {
             // No indent for title, 2 char indent for languages
             let mut col3_lines: Vec<Line> = vec![Line::from(Span::styled(
                 "Languages",
-                muted.add_modifier(Modifier::BOLD),
+                secondary.add_modifier(Modifier::BOLD),
             ))];
 
             if stats.top_languages.is_empty() {
                 col3_lines.push(Line::from(vec![
                     Span::styled("  ", Style::default()),
-                    Span::styled("No data", muted),
+                    Span::styled("No data", secondary),
                 ]));
             } else {
                 for (lang, pct) in &stats.top_languages {
@@ -429,15 +413,15 @@ impl super::App {
                         Span::styled("  ", Style::default()),
                         Span::styled(
                             format!("{:<12} ", lang),
-                            Style::default().fg(colors.accent_cyan),
+                            Style::default().fg(colors.language),
                         ),
-                        Span::styled(format!("{:>5.1}%", pct), muted),
+                        Span::styled(format!("{:>5.1}%", pct), secondary),
                     ]));
                 }
                 if stats.has_more_langs {
                     col3_lines.push(Line::from(vec![
                         Span::styled("  ", Style::default()),
-                        Span::styled("...", muted),
+                        Span::styled("...", secondary),
                     ]));
                 }
             }
@@ -450,39 +434,6 @@ impl super::App {
                 Rect::new(sep1_x, inner.y, 1, inner.height),
             );
         }
-    }
-
-    /// Compact view for narrow panels
-    fn render_overview_compact(
-        &self,
-        frame: &mut Frame,
-        inner: Rect,
-        stats: &crate::overview_stats::OverviewStats,
-        colors: &crate::theme::ThemeColors,
-        muted: Style,
-    ) {
-        let lines = vec![
-            Line::from(vec![
-                Span::styled("Peak: ", muted),
-                Span::styled(&stats.peak_day, Style::default().fg(colors.cost())),
-            ]),
-            Line::from(vec![
-                Span::styled("Long: ", muted),
-                Span::styled(
-                    &stats.longest_session,
-                    Style::default().fg(colors.accent_cyan),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("Avg:  ", muted),
-                Span::styled(&stats.avg_sessions, Style::default().fg(colors.info)),
-            ]),
-            Line::from(vec![
-                Span::styled("Fav:  ", muted),
-                Span::styled(&stats.favorite_day, Style::default().fg(colors.accent_pink)),
-            ]),
-        ];
-        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     /// Activity heatmap: last 365 days
@@ -660,7 +611,7 @@ impl super::App {
                 Span::styled(format!("{:<1$}", "", label_w as usize), Style::default()),
                 Span::styled(
                     month_row.iter().collect::<String>(),
-                    Style::default().fg(colors.text_muted),
+                    Style::default().fg(colors.text_secondary),
                 ),
             ]));
         }
@@ -668,11 +619,11 @@ impl super::App {
         let flash = self.overview_heatmap_flash_time.map(|t| {
             (1.0 - (t.elapsed().as_millis() as f64 * std::f64::consts::TAU / 600.0).cos()) * 0.2
         });
-        let base_g = match colors.accent_green {
+        let base_g = match colors.general_heatmap {
             Color::Rgb(r, g, b) => (r, g, b),
             _ => (100, 200, 100),
         };
-        let bg_b = match colors.bg_tertiary {
+        let bg_b = match colors.bg_empty {
             Color::Rgb(r, g, b) => (r as f64, g as f64, b as f64),
             _ => (60.0, 60.0, 60.0),
         };
@@ -680,13 +631,13 @@ impl super::App {
         for d in 0..7 {
             let mut spans: Vec<Span> = vec![Span::styled(
                 format!(" {:<1$}", day_labels[d], (label_w - 1) as usize),
-                Style::default().fg(colors.text_muted),
+                Style::default().fg(colors.text_secondary),
             )];
             for (w, week) in grid.iter().enumerate().take(weeks) {
                 let sel = sel_w == Some(w) && sel_d == Some(d);
                 let bg = match week[d] {
-                    None => Color::Rgb(38, 41, 56),
-                    Some(0) => colors.bg_tertiary,
+                    None => colors.bg_empty,
+                    Some(0) => colors.bg_empty,
                     Some(t) => {
                         let i = match t as f64 / max_tokens as f64 {
                             r if r <= 0.15 => 0.25,
@@ -735,8 +686,8 @@ impl super::App {
 
         let mut legend = vec![
             Span::styled(format!("{:<1$}", "", label_w as usize), Style::default()),
-            Span::styled("Less ", Style::default().fg(colors.text_muted)),
-            Span::styled("  ", Style::default().bg(colors.bg_tertiary)),
+            Span::styled("Less ", Style::default().fg(colors.text_secondary)),
+            Span::styled("  ", Style::default().bg(colors.bg_empty)),
         ];
         legend.extend(
             legend_colors
@@ -745,7 +696,7 @@ impl super::App {
         );
         legend.push(Span::styled(
             " More ",
-            Style::default().fg(colors.text_muted),
+            Style::default().fg(colors.text_secondary),
         ));
 
         // Selected day info
@@ -772,13 +723,13 @@ impl super::App {
                 Span::styled("tok:", dim),
                 Span::styled(
                     format_number(self.overview_heatmap_selected_tokens),
-                    Style::default().fg(colors.success),
+                    Style::default().fg(colors.avg_tokens),
                 ),
                 Span::styled(" ╱ ", dim),
                 Span::styled("sess:", dim),
                 Span::styled(
                     format!("{}", self.overview_heatmap_selected_sessions),
-                    Style::default().fg(colors.info),
+                    Style::default().fg(colors.session),
                 ),
                 Span::styled(" ╱ ", dim),
                 Span::styled("cost:", dim),
@@ -837,7 +788,7 @@ impl super::App {
         if self.overview_projects.is_empty() {
             let placeholder = "░".repeat(inner.width.saturating_sub(2) as usize);
             let lines: Vec<Line> = (0..inner.height)
-                .map(|_| Line::styled(placeholder.clone(), Style::default().fg(colors.bg_tertiary)))
+                .map(|_| Line::styled(placeholder.clone(), Style::default().fg(colors.bg_empty)))
                 .collect();
             frame.render_widget(Paragraph::new(lines), inner);
             return;
@@ -878,15 +829,15 @@ impl super::App {
                         ),
                         Style::default().fg(colors.text_primary),
                     ),
-                    Span::styled(" ".repeat(bar), Style::default().bg(colors.info)),
+                    Span::styled(" ".repeat(bar), Style::default().bg(colors.top_projects)),
                     Span::styled(
                         " ".repeat(bar_max.saturating_sub(bar)),
-                        Style::default().bg(colors.bg_tertiary),
+                        Style::default().bg(colors.bg_empty),
                     ),
                     Span::styled(
                         format!(" {:>5} sess", count),
                         Style::default()
-                            .fg(colors.info)
+                            .fg(colors.top_projects)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ])
@@ -941,7 +892,7 @@ impl super::App {
         if self.tool_usage.is_empty() {
             let placeholder = "░".repeat(inner.width.saturating_sub(2) as usize);
             let lines: Vec<Line> = (0..inner.height)
-                .map(|_| Line::styled(placeholder.clone(), Style::default().fg(colors.bg_tertiary)))
+                .map(|_| Line::styled(placeholder.clone(), Style::default().fg(colors.bg_empty)))
                 .collect();
             frame.render_widget(Paragraph::new(lines), inner);
             return;
@@ -975,15 +926,15 @@ impl super::App {
                         ),
                         Style::default().fg(colors.text_primary),
                     ),
-                    Span::styled(" ".repeat(bar), Style::default().bg(colors.accent_pink)),
+                    Span::styled(" ".repeat(bar), Style::default().bg(colors.tools_used)),
                     Span::styled(
                         " ".repeat(bar_max.saturating_sub(bar)),
-                        Style::default().bg(colors.bg_tertiary),
+                        Style::default().bg(colors.bg_empty),
                     ),
                     Span::styled(
                         format!(" {:>5}", tool.count),
                         Style::default()
-                            .fg(colors.accent_pink)
+                            .fg(colors.tools_used)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ])

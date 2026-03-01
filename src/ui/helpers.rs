@@ -122,7 +122,7 @@ pub fn stat_widget(
     Paragraph::new(vec![
         Line::from(Span::styled(
             label.to_string(),
-            Style::default().fg(colors.text_muted),
+            Style::default().fg(colors.text_primary),
         )),
         Line::from(Span::styled(
             value,
@@ -156,7 +156,7 @@ pub fn usage_list_row(
     } else {
         Style::default().fg(colors.text_muted)
     };
-    let label = Style::default().fg(colors.text_muted);
+    let label = Style::default().fg(colors.text_secondary);
 
     Line::from(vec![
         Span::styled(
@@ -182,7 +182,7 @@ pub fn usage_list_row(
         Span::styled(" │ ", sep),
         Span::styled(
             format!("{:>1$} sess", sessions, fmt.sess_width),
-            Style::default().fg(colors.info),
+            Style::default().fg(colors.session),
         ),
     ])
 }

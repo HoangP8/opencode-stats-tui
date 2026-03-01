@@ -64,7 +64,7 @@ impl super::App {
                             } else {
                                 " "
                             },
-                            Style::default().fg(colors.text_muted),
+                            Style::default().fg(colors.text_secondary),
                         ))
                         .alignment(Alignment::Center),
                     ),
@@ -309,7 +309,7 @@ impl super::App {
             vec![sections[0]]
         };
 
-        let muted = Style::default().fg(colors.text_muted);
+        let muted = Style::default().fg(colors.text_secondary);
         let sep_color = if focused {
             colors.border_focus
         } else {
@@ -327,7 +327,7 @@ impl super::App {
                 Span::styled(
                     format!("{}", sessions),
                     Style::default()
-                        .fg(colors.info)
+                        .fg(colors.session)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
@@ -336,7 +336,7 @@ impl super::App {
                 Span::styled(
                     format!("{}", messages),
                     Style::default()
-                        .fg(colors.success)
+                        .fg(colors.agent_general)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
@@ -356,7 +356,7 @@ impl super::App {
                     Style::default()
                         .fg(est
                             .filter(|&c| c > 0.0)
-                            .map_or(colors.text_muted, |_| colors.accent_orange))
+                            .map_or(colors.text_secondary, |_| colors.cost_estimated))
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
@@ -367,7 +367,7 @@ impl super::App {
                     Style::default()
                         .fg(savings
                             .filter(|&s| s > 0.0)
-                            .map_or(colors.text_muted, |_| colors.success))
+                            .map_or(colors.text_secondary, |_| colors.savings))
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
@@ -378,7 +378,7 @@ impl super::App {
             let agent_lines = if agent_vec.is_empty() {
                 vec![Line::from(vec![
                     Span::styled("Agents: ", muted),
-                    Span::styled("n/a", Style::default().fg(colors.text_muted)),
+                    Span::styled("n/a", Style::default().fg(colors.text_secondary)),
                 ])]
             } else {
                 let mut lines: Vec<Line> = agent_vec
@@ -395,7 +395,7 @@ impl super::App {
                                     &text,
                                     col_w.saturating_sub(prefix.len() + 1),
                                 ),
-                                Style::default().fg(colors.accent_magenta),
+                                Style::default().fg(colors.agent_general),
                             ),
                         ])
                     })
@@ -403,7 +403,7 @@ impl super::App {
                 if agent_vec.len() > 5 {
                     lines[4] = Line::from(vec![
                         Span::styled("        ", muted),
-                        Span::styled("...", Style::default().fg(colors.accent_magenta)),
+                        Span::styled("...", Style::default().fg(colors.agent_general)),
                     ]);
                 }
                 lines
@@ -414,38 +414,38 @@ impl super::App {
         if show_tokens {
             let token_lines = vec![
                 Line::from(vec![
-                    Span::styled("Input         ", Style::default().fg(colors.token_input())),
+                    Span::styled("Input         ", Style::default().fg(colors.text_secondary)),
                     Span::styled(
                         format_number_full(tokens.input),
                         Style::default().fg(colors.token_input()),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("Output        ", Style::default().fg(colors.token_output())),
+                    Span::styled("Output        ", Style::default().fg(colors.text_secondary)),
                     Span::styled(
                         format_number_full(tokens.output),
                         Style::default().fg(colors.token_output()),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("Thinking      ", Style::default().fg(colors.thinking())),
+                    Span::styled("Thinking      ", Style::default().fg(colors.text_secondary)),
                     Span::styled(
                         format_number_full(tokens.reasoning),
                         Style::default().fg(colors.thinking()),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("Cache Read    ", Style::default().fg(colors.cost())),
+                    Span::styled("Cache Read    ", Style::default().fg(colors.text_secondary)),
                     Span::styled(
                         format_number_full(tokens.cache_read),
-                        Style::default().fg(colors.cost()),
+                        Style::default().fg(colors.cache_read),
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("Cache Write   ", Style::default().fg(colors.cost())),
+                    Span::styled("Cache Write   ", Style::default().fg(colors.text_secondary)),
                     Span::styled(
                         format_number_full(tokens.cache_write),
-                        Style::default().fg(colors.cost()),
+                        Style::default().fg(colors.cache_write),
                     ),
                 ]),
             ];
@@ -520,9 +520,12 @@ impl super::App {
         width: usize,
         colors: &crate::theme::ThemeColors,
     ) -> Vec<Span<'static>> {
-        let muted = Style::default().fg(colors.text_muted);
+        let muted = Style::default().fg(colors.text_secondary);
         let Some(p) = lookup_pricing(model_name) else {
-            return vec![Span::styled("n/a", Style::default().fg(colors.text_muted))];
+            return vec![Span::styled(
+                "n/a",
+                Style::default().fg(colors.text_secondary),
+            )];
         };
 
         let mut spans = vec![
@@ -546,14 +549,14 @@ impl super::App {
                 "Cache R",
                 p.input_cache_read,
                 Style::default()
-                    .fg(colors.cost())
+                    .fg(colors.cache_read)
                     .add_modifier(Modifier::BOLD),
             ),
             (
                 "Cache W",
                 p.input_cache_write,
                 Style::default()
-                    .fg(colors.cost())
+                    .fg(colors.cache_write)
                     .add_modifier(Modifier::BOLD),
             ),
             (
@@ -622,7 +625,7 @@ impl super::App {
                     } else {
                         " "
                     },
-                    Style::default().fg(colors.text_muted),
+                    Style::default().fg(colors.text_secondary),
                 ))
                 .alignment(Alignment::Center),
             );
@@ -657,7 +660,7 @@ impl super::App {
             frame.render_widget(
                 Paragraph::new(Line::from(vec![Span::styled(
                     "No daily model data available.",
-                    Style::default().fg(colors.text_muted),
+                    Style::default().fg(colors.text_secondary),
                 )]))
                 .alignment(Alignment::Center),
                 inner,
@@ -759,39 +762,39 @@ impl super::App {
         // Render stats
         let stats_lines = vec![
             Line::from(vec![
-                Span::styled("Last Used    ", Style::default().fg(colors.text_muted)),
-                Span::styled(&last_used_str, Style::default().fg(colors.text_primary)),
+                Span::styled("Last Used    ", Style::default().fg(colors.text_secondary)),
+                Span::styled(&last_used_str, Style::default().fg(colors.day_stats)),
             ]),
             Line::from(vec![
-                Span::styled("Active       ", Style::default().fg(colors.text_muted)),
-                Span::styled(&range_str, Style::default().fg(colors.text_primary)),
+                Span::styled("Active       ", Style::default().fg(colors.text_secondary)),
+                Span::styled(&range_str, Style::default().fg(colors.day_stats)),
             ]),
             Line::from(vec![
-                Span::styled("Active Days  ", Style::default().fg(colors.text_muted)),
-                Span::styled(&active_days_str, Style::default().fg(colors.text_primary)),
+                Span::styled("Active Days  ", Style::default().fg(colors.text_secondary)),
+                Span::styled(&active_days_str, Style::default().fg(colors.day_stats)),
             ]),
             Line::from(vec![
-                Span::styled("Peak         ", Style::default().fg(colors.text_muted)),
-                Span::styled(&peak_str, Style::default().fg(colors.success)),
+                Span::styled("Peak         ", Style::default().fg(colors.text_secondary)),
+                Span::styled(&peak_str, Style::default().fg(colors.day_stats)),
             ]),
             Line::from(vec![
-                Span::styled("Avg Token    ", Style::default().fg(colors.text_muted)),
-                Span::styled(&avg_token_str, Style::default().fg(colors.text_primary)),
+                Span::styled("Avg Token    ", Style::default().fg(colors.text_secondary)),
+                Span::styled(&avg_token_str, Style::default().fg(colors.avg_tokens)),
             ]),
             Line::from(vec![
-                Span::styled("Avg Cost     ", Style::default().fg(colors.text_muted)),
+                Span::styled("Avg Cost     ", Style::default().fg(colors.text_secondary)),
                 Span::styled(&avg_cost_str, Style::default().fg(colors.cost())),
             ]),
             Line::from(vec![
-                Span::styled("Avg Sess     ", Style::default().fg(colors.text_muted)),
-                Span::styled(&avg_sess_str, Style::default().fg(colors.info)),
+                Span::styled("Avg Sess     ", Style::default().fg(colors.text_secondary)),
+                Span::styled(&avg_sess_str, Style::default().fg(colors.session)),
             ]),
             Line::from(vec![
-                Span::styled("Selected     ", Style::default().fg(colors.accent_cyan)),
+                Span::styled("Selected     ", Style::default().fg(colors.model)),
                 Span::styled(
                     &sel_day_info,
                     Style::default()
-                        .fg(colors.accent_cyan)
+                        .fg(colors.model)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
@@ -847,8 +850,8 @@ impl super::App {
         });
 
         // Bar color
-        let bar_color = colors.accent_cyan;
-        let empty_color = colors.bg_tertiary;
+        let bar_color = colors.model_heatmap;
+        let empty_color = colors.bg_empty;
 
         // Solid bars with round() for best accuracy at 7 discrete levels
         let mut lines: Vec<Line> = Vec::with_capacity(chart_h as usize);
@@ -941,7 +944,7 @@ impl super::App {
 
             let month_line = Line::from(vec![Span::styled(
                 month_row.iter().collect::<String>(),
-                Style::default().fg(colors.text_muted),
+                Style::default().fg(colors.text_secondary),
             )]);
             let month_area = Rect::new(chart_area.x, chart_area.y + chart_h, chart_area.width, 1);
             frame.render_widget(Paragraph::new(month_line), month_area);
@@ -980,7 +983,7 @@ impl super::App {
             .title_bottom(
                 Line::from(Span::styled(
                     if focused { " ↑↓: scroll " } else { " " },
-                    Style::default().fg(colors.text_muted),
+                    Style::default().fg(colors.text_secondary),
                 ))
                 .alignment(Alignment::Center),
             );
@@ -1020,15 +1023,15 @@ impl super::App {
                         format!(" {:<13} ", truncate_with_ellipsis(name, 13)),
                         Style::default().fg(colors.text_primary),
                     ),
-                    Span::styled(" ".repeat(w), Style::default().bg(colors.accent_pink)),
+                    Span::styled(" ".repeat(w), Style::default().bg(colors.tools_used)),
                     Span::styled(
                         " ".repeat(bar_max.saturating_sub(w)),
-                        Style::default().bg(colors.bg_tertiary),
+                        Style::default().bg(colors.bg_empty),
                     ),
                     Span::styled(
                         format!(" {:>5}", count),
                         Style::default()
-                            .fg(colors.accent_pink)
+                            .fg(colors.tools_used)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ])
@@ -1073,7 +1076,7 @@ impl super::App {
             .title_bottom(
                 Line::from(Span::styled(
                     if focused { " ↑↓: scroll " } else { " " },
-                    Style::default().fg(colors.text_muted),
+                    Style::default().fg(colors.text_secondary),
                 ))
                 .alignment(Alignment::Center),
             );
@@ -1143,7 +1146,7 @@ impl super::App {
                     0
                 };
 
-                let base_bar_color = colors.info;
+                let base_bar_color = colors.model;
                 let selected_bar_color =
                     if let (Some(f), Color::Rgb(r, g, b)) = (flash, base_bar_color) {
                         Color::Rgb(
@@ -1167,15 +1170,15 @@ impl super::App {
                     ),
                     Span::styled(
                         " ".repeat(bar_max.saturating_sub(bar_w)),
-                        Style::default().bg(colors.bg_tertiary),
+                        Style::default().bg(colors.bg_empty),
                     ),
                     Span::styled(
                         suffix,
                         Style::default()
                             .fg(if sel {
-                                colors.accent_yellow
+                                colors.model
                             } else {
-                                colors.text_muted
+                                colors.text_secondary
                             })
                             .add_modifier(Modifier::BOLD),
                     ),

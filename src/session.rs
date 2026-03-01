@@ -5,7 +5,7 @@ use crate::stats::{
     format_active_duration, format_number, load_session_details, ChatMessage, MessageContent,
     SessionDetails, SessionStat,
 };
-use crate::theme::{FixedColors, ThemeColors};
+use crate::theme::ThemeColors;
 use crossterm::event::{KeyCode, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
@@ -160,7 +160,7 @@ impl SessionModal {
         let info_max = self.cached_rects.info_max_scroll;
 
         match key {
-            KeyCode::Char('q') | KeyCode::Esc => {
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                 self.close();
                 true
             }
@@ -371,10 +371,10 @@ impl SessionModal {
                 Style::default()
                     .fg(colors.border_focus)
                     .add_modifier(Modifier::BOLD),
-                Style::default().fg(colors.border_muted),
+                Style::default().fg(colors.border_default),
             ),
             ModalColumn::Chat => (
-                Style::default().fg(colors.border_muted),
+                Style::default().fg(colors.border_default),
                 Style::default()
                     .fg(colors.border_focus)
                     .add_modifier(Modifier::BOLD),
@@ -406,7 +406,6 @@ impl SessionModal {
         border_style: Style,
         colors: ThemeColors,
     ) {
-        let fixed = FixedColors::DEFAULT;
         self.info_click_targets.clear();
         let mut lines = Vec::with_capacity(50);
         let device = crate::device::get_device_info();
@@ -421,7 +420,7 @@ impl SessionModal {
             lines.push(Line::from(vec![Span::styled(
                 "  INFO",
                 Style::default()
-                    .fg(colors.accent_yellow)
+                    .fg(colors.text_primary)
                     .add_modifier(Modifier::BOLD),
             )]));
             let prefix_len: usize = 14;
@@ -432,7 +431,7 @@ impl SessionModal {
             for (i, line) in wrapped_title.into_iter().enumerate() {
                 if i == 0 {
                     lines.push(Line::from(vec![
-                        Span::raw("    Title:    "),
+                        Span::styled("    Title:    ", Style::default().fg(colors.text_secondary)),
                         Span::styled(line, Style::default().fg(colors.text_primary)),
                     ]));
                 } else {
@@ -443,54 +442,49 @@ impl SessionModal {
                 }
             }
             lines.push(Line::from(vec![
-                Span::raw("    Project:  "),
+                Span::styled("    Project:  ", Style::default().fg(colors.text_secondary)),
                 Span::styled(
                     safe_truncate_plain(project, value_width),
-                    Style::default().fg(colors.text_primary),
+                    Style::default().fg(colors.project),
                 ),
             ]));
             if let Some(branch) = detect_git_branch(project) {
                 let branch_display = safe_truncate_plain(&branch, value_width).into_owned();
                 lines.push(Line::from(vec![
-                    Span::raw("    Branch:   "),
-                    Span::styled(branch_display, Style::default().fg(colors.accent_cyan)),
+                    Span::styled("    Branch:   ", Style::default().fg(colors.text_secondary)),
+                    Span::styled(branch_display, Style::default().fg(colors.branch)),
                 ]));
             }
             {
-                let type_color = if device.kind == "server" {
-                    colors.accent_orange
-                } else {
-                    colors.accent_cyan
-                };
                 lines.push(Line::from(vec![
-                    Span::raw("    Host:     "),
-                    Span::styled(device.display_label(), Style::default().fg(type_color)),
-                    Span::raw(" | "),
+                    Span::styled("    Host:     ", Style::default().fg(colors.text_secondary)),
+                    Span::styled(device.display_label(), Style::default().fg(colors.host)),
+                    Span::styled(" | ", Style::default().fg(colors.text_secondary)),
                     Span::styled(
                         safe_truncate_plain(&device_display, value_width),
-                        Style::default().fg(type_color),
+                        Style::default().fg(colors.host),
                     ),
                 ]));
             }
             let active_dur = format_active_duration(session.active_duration_ms);
             lines.push(Line::from(vec![
-                Span::raw("    Duration: "),
-                Span::styled(active_dur, Style::default().fg(colors.accent_cyan)),
+                Span::styled("    Duration: ", Style::default().fg(colors.text_secondary)),
+                Span::styled(active_dur, Style::default().fg(colors.total_time)),
             ]));
             {
                 let mut all_models: Vec<&str> = session.models.iter().map(|m| m.as_ref()).collect();
                 all_models.sort_unstable();
                 for (i, model) in all_models.iter().enumerate() {
-                    let label = if i == 0 {
-                        "    Models:   "
+                    let (label, label_style) = if i == 0 {
+                        ("    Models:   ", Style::default().fg(colors.text_secondary))
                     } else {
-                        "              "
+                        ("              ", Style::default().fg(colors.text_secondary))
                     };
                     lines.push(Line::from(vec![
-                        Span::raw(label),
+                        Span::styled(label, label_style),
                         Span::styled(
                             safe_truncate_plain(model, value_width),
-                            Style::default().fg(colors.accent_magenta),
+                            Style::default().fg(colors.model),
                         ),
                     ]));
                 }
@@ -499,22 +493,22 @@ impl SessionModal {
         }
         lines.push(Line::from(vec![Span::styled(
             "─".repeat((area.width - 2) as usize),
-            Style::default().fg(colors.border_muted),
+            Style::default().fg(colors.border_default),
         )]));
         lines.push(Line::from(""));
         if !session.agents.is_empty() {
             lines.push(Line::from(vec![Span::styled(
                 format!("  AGENTS ({})", session.agents.len()),
                 Style::default()
-                    .fg(colors.accent_yellow)
+                    .fg(colors.text_primary)
                     .add_modifier(Modifier::BOLD),
             )]));
             lines.push(Line::from(""));
             for agent in &session.agents {
                 let name_color = if agent.is_main {
-                    colors.accent_cyan
+                    colors.main_agent
                 } else {
-                    colors.accent_orange
+                    colors.sub_agent
                 };
                 let is_expanded = self.expanded_info_agents.contains(&agent.name);
                 let toggle_label = if is_expanded {
@@ -524,24 +518,18 @@ impl SessionModal {
                 };
                 let mut model_list: Vec<&str> = agent.models.iter().map(|m| m.as_ref()).collect();
                 model_list.sort_unstable();
-                let model_suffix = if !model_list.is_empty() {
-                    format!(" ({})", model_list.join(", "))
-                } else {
-                    String::new()
-                };
                 let prefix_len = 6; // "    ● "
                 let toggle_len = toggle_label.chars().count();
                 let max_content =
                     (area.width.saturating_sub(2) as usize).saturating_sub(prefix_len + toggle_len);
                 let agent_name = &agent.name;
-                let full_text = format!("{}{}", agent_name, model_suffix);
-                let display = safe_truncate_plain(&full_text, max_content);
                 let name_len = agent_name.chars().count();
                 self.info_click_targets.push((
                     lines.len() as u16,
                     InfoClickTarget::Agent(agent.name.clone()),
                 ));
-                if display.chars().count() <= name_len {
+                if model_list.is_empty() {
+                    let display = safe_truncate_plain(agent_name, max_content);
                     lines.push(Line::from(vec![
                         Span::raw("    "),
                         Span::styled("● ", Style::default().fg(name_color)),
@@ -549,20 +537,22 @@ impl SessionModal {
                             display.into_owned(),
                             Style::default().fg(name_color).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(toggle_label, Style::default().fg(colors.text_muted)),
+                        Span::styled(toggle_label, Style::default().fg(colors.text_secondary)),
                     ]));
                 } else {
-                    let name_part: String = display.chars().take(name_len).collect();
+                    let model_suffix = format!(" ({})", model_list.join(", "));
+                    let full_text = format!("{}{}", agent_name, model_suffix);
+                    let display = safe_truncate_plain(&full_text, max_content);
                     let suffix_part: String = display.chars().skip(name_len).collect();
                     lines.push(Line::from(vec![
                         Span::raw("    "),
                         Span::styled("● ", Style::default().fg(name_color)),
                         Span::styled(
-                            name_part,
+                            agent_name.to_string(),
                             Style::default().fg(name_color).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(suffix_part, Style::default().fg(colors.accent_magenta)),
-                        Span::styled(toggle_label, Style::default().fg(colors.text_muted)),
+                        Span::styled(suffix_part, Style::default().fg(colors.model)),
+                        Span::styled(toggle_label, Style::default().fg(colors.text_secondary)),
                     ]));
                 }
                 if is_expanded {
@@ -570,21 +560,21 @@ impl SessionModal {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("      {:<9}", "Duration"),
-                            Style::default().fg(colors.text_muted),
+                            Style::default().fg(colors.text_secondary),
                         ),
                         Span::styled(
                             format!("{:>8}", agent_active_dur),
-                            Style::default().fg(colors.accent_cyan),
+                            Style::default().fg(colors.total_time),
                         ),
                     ]));
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("      {:<9}", "Responses"),
-                            Style::default().fg(colors.text_muted),
+                            Style::default().fg(colors.text_secondary),
                         ),
                         Span::styled(
                             format!("{:>8}", agent.messages),
-                            Style::default().fg(colors.text_primary),
+                            Style::default().fg(colors.agent_general),
                         ),
                     ]));
                     let token_rows = [
@@ -618,12 +608,9 @@ impl SessionModal {
                         lines.push(Line::from(vec![
                             Span::styled(
                                 format!("      {:<9}", label),
-                                Style::default().fg(*color),
+                                Style::default().fg(colors.text_secondary),
                             ),
-                            Span::styled(
-                                format!("{:>8}", value),
-                                Style::default().fg(colors.text_primary),
-                            ),
+                            Span::styled(format!("{:>8}", value), Style::default().fg(*color)),
                         ]));
                     }
                 }
@@ -632,7 +619,7 @@ impl SessionModal {
         }
         lines.push(Line::from(vec![Span::styled(
             "─".repeat((area.width - 2) as usize),
-            Style::default().fg(colors.border_muted),
+            Style::default().fg(colors.border_default),
         )]));
         lines.push(Line::from(""));
         let details = self.session_details.as_ref();
@@ -641,7 +628,7 @@ impl SessionModal {
                 lines.push(Line::from(vec![Span::styled(
                     format!("  MODELS ({})", d.model_stats.len()),
                     Style::default()
-                        .fg(colors.accent_yellow)
+                        .fg(colors.text_primary)
                         .add_modifier(Modifier::BOLD),
                 )]));
                 lines.push(Line::from(""));
@@ -654,7 +641,7 @@ impl SessionModal {
                     };
                     let prefix_len = 6; // "    ● "
                     let toggle_len = toggle_label.chars().count();
-                    let model_max = (area.width.saturating_sub(2) as usize)
+                    let _model_max = (area.width.saturating_sub(2) as usize)
                         .saturating_sub(prefix_len + toggle_len);
                     self.info_click_targets.push((
                         lines.len() as u16,
@@ -662,14 +649,14 @@ impl SessionModal {
                     ));
                     lines.push(Line::from(vec![
                         Span::raw("    "),
-                        Span::styled("● ", Style::default().fg(colors.accent_magenta)),
+                        Span::styled("● ", Style::default().fg(colors.model)),
                         Span::styled(
-                            safe_truncate_plain(&model.name, model_max),
+                            model.name.as_ref(),
                             Style::default()
-                                .fg(colors.accent_magenta)
+                                .fg(colors.model)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(toggle_label, Style::default().fg(colors.text_muted)),
+                        Span::styled(toggle_label, Style::default().fg(colors.text_secondary)),
                     ]));
                     if is_expanded {
                         let left_labels = [
@@ -691,12 +678,12 @@ impl SessionModal {
                             (
                                 "Cache R",
                                 format_number(model.tokens.cache_read),
-                                colors.cost(),
+                                colors.cache_read,
                             ),
                             (
                                 "Cache W",
                                 format_number(model.tokens.cache_write),
-                                colors.cost(),
+                                colors.cache_write,
                             ),
                         ];
                         let responses = model.messages.saturating_sub(model.prompts);
@@ -705,17 +692,21 @@ impl SessionModal {
                             estimate_cost(&model.name, &model.tokens).unwrap_or(model_cost);
                         let model_savings = model_est - model_cost;
                         let right_labels = [
-                            ("Prompts", model.prompts.to_string(), colors.info),
-                            ("Responses", responses.to_string(), colors.success),
-                            ("Cost", format!("${:.2}", model_cost), colors.text_primary),
-                            ("Est. Cost", format!("${:.2}", model_est), colors.text_muted),
+                            ("Prompts", model.prompts.to_string(), colors.user),
+                            ("Responses", responses.to_string(), colors.agent_general),
+                            ("Cost", format!("${:.2}", model_cost), colors.cost()),
+                            (
+                                "Est. Cost",
+                                format!("${:.2}", model_est),
+                                colors.cost_estimated,
+                            ),
                             (
                                 "Savings",
                                 format!("${:.2}", model_savings),
                                 if model_savings > 0.0 {
-                                    colors.success
+                                    colors.savings
                                 } else {
-                                    colors.text_muted
+                                    colors.text_secondary
                                 },
                             ),
                         ];
@@ -728,11 +719,11 @@ impl SessionModal {
                                 let (label, value, color) = &left_labels[i];
                                 spans.push(Span::styled(
                                     format!("{:<9}", label),
-                                    Style::default().fg(*color),
+                                    Style::default().fg(colors.text_secondary),
                                 ));
                                 spans.push(Span::styled(
                                     format!("{:>8}", value),
-                                    Style::default().fg(colors.text_primary),
+                                    Style::default().fg(*color),
                                 ));
                             } else if show_right_column {
                                 spans.push(Span::raw(" ".repeat(17)));
@@ -740,17 +731,17 @@ impl SessionModal {
                             if show_right_column {
                                 spans.push(Span::styled(
                                     "   │   ",
-                                    Style::default().fg(colors.border_muted),
+                                    Style::default().fg(colors.border_default),
                                 ));
                                 if i < right_labels.len() {
                                     let (label, value, color) = &right_labels[i];
                                     spans.push(Span::styled(
                                         format!("{:<9}", label),
-                                        Style::default().fg(*color),
+                                        Style::default().fg(colors.text_secondary),
                                     ));
                                     spans.push(Span::styled(
                                         format!("{:>8}", value),
-                                        Style::default().fg(colors.text_primary),
+                                        Style::default().fg(*color),
                                     ));
                                 }
                             }
@@ -763,34 +754,34 @@ impl SessionModal {
         }
         lines.push(Line::from(vec![Span::styled(
             "─".repeat((area.width - 2) as usize),
-            Style::default().fg(colors.border_muted),
+            Style::default().fg(colors.border_default),
         )]));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
             "  TOTAL USAGE",
             Style::default()
-                .fg(colors.accent_yellow)
+                .fg(colors.text_primary)
                 .add_modifier(Modifier::BOLD),
         )]));
         let total_labels: Vec<(&str, String, Color)> = vec![
             (
                 "Tokens",
                 format_number(session.tokens.total()),
-                colors.text_primary,
+                colors.token_input(),
             ),
-            ("Prompts", session.prompts.to_string(), colors.info),
+            ("Prompts", session.prompts.to_string(), colors.user),
             (
                 "Responses",
                 session.messages.saturating_sub(session.prompts).to_string(),
-                colors.success,
+                colors.agent_general,
             ),
-            ("Cost", format!("${:.2}", session.cost), colors.text_primary),
+            ("Cost", format!("${:.2}", session.cost), colors.cost()),
         ];
         for (label, value, color) in &total_labels {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("      {:<9}", label),
-                    Style::default().fg(colors.text_muted),
+                    Style::default().fg(colors.text_secondary),
                 ),
                 Span::styled(
                     format!("{:>8}", value),
@@ -799,7 +790,7 @@ impl SessionModal {
             ]));
         }
         let total_cost = session.cost;
-        // Use OpenRouter pricing for estimated cost (what you would pay at standard rates)
+        // Use OpenRouter pricing for estimated cost
         let est_cost = session
             .models
             .iter()
@@ -808,21 +799,21 @@ impl SessionModal {
             .unwrap_or(total_cost);
         let savings = est_cost - total_cost;
         let (savings_text, savings_color) = if savings < 0.0 {
-            (format!("-${:.2}", savings.abs()), colors.error)
+            (format!("-${:.2}", savings.abs()), colors.neg_savings)
         } else {
             (
                 format!("${:.2}", savings),
                 if savings > 0.0 {
-                    colors.success
+                    colors.pos_savings
                 } else {
-                    colors.text_muted
+                    colors.text_secondary
                 },
             )
         };
         lines.push(Line::from(vec![
             Span::styled(
                 format!("      {:<9}", "Savings"),
-                Style::default().fg(colors.text_muted),
+                Style::default().fg(colors.text_secondary),
             ),
             Span::styled(
                 format!("{:>8}", savings_text),
@@ -834,14 +825,14 @@ impl SessionModal {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
             "─".repeat((area.width - 2) as usize),
-            Style::default().fg(colors.border_muted),
+            Style::default().fg(colors.border_default),
         )]));
         lines.push(Line::from(""));
         if !session.file_diffs.is_empty() {
             lines.push(Line::from(vec![Span::styled(
                 "  FILE CHANGES",
                 Style::default()
-                    .fg(colors.accent_yellow)
+                    .fg(colors.text_primary)
                     .add_modifier(Modifier::BOLD),
             )]));
             let max_val_len = 6usize;
@@ -866,7 +857,7 @@ impl SessionModal {
                     Span::raw("    "),
                     Span::styled(
                         format!("[{}]", status_text),
-                        Style::default().fg(colors.text_muted),
+                        Style::default().fg(colors.text_secondary),
                     ),
                 ];
                 if show_diffs {
@@ -891,16 +882,16 @@ impl SessionModal {
                                 format!("+{}", format_number(f.additions)),
                                 width = max_val_len + 1
                             ),
-                            Style::default().fg(fixed.diff_add),
+                            Style::default().fg(colors.add_line),
                         ),
-                        Span::styled(" │ ", Style::default().fg(colors.border_muted)),
+                        Span::styled(" │ ", Style::default().fg(colors.border_default)),
                         Span::styled(
                             format!(
                                 "{:>width$}",
                                 format!("-{}", format_number(f.deletions)),
                                 width = max_val_len + 1
                             ),
-                            Style::default().fg(fixed.diff_remove),
+                            Style::default().fg(colors.remove_line),
                         ),
                     ]);
                 }
@@ -916,7 +907,7 @@ impl SessionModal {
                             "─".repeat(max_val_len + 1),
                             "─".repeat(max_val_len + 1)
                         ),
-                        Style::default().fg(colors.border_muted),
+                        Style::default().fg(colors.border_default),
                     ),
                 ]));
                 lines.push(Line::from(vec![
@@ -928,10 +919,10 @@ impl SessionModal {
                             width = max_val_len + 1
                         ),
                         Style::default()
-                            .fg(fixed.diff_add)
+                            .fg(colors.add_line)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(" │ ", Style::default().fg(colors.border_muted)),
+                    Span::styled(" │ ", Style::default().fg(colors.border_default)),
                     Span::styled(
                         format!(
                             "{:>width$}",
@@ -939,7 +930,7 @@ impl SessionModal {
                             width = max_val_len + 1
                         ),
                         Style::default()
-                            .fg(fixed.diff_remove)
+                            .fg(colors.remove_line)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
@@ -948,13 +939,13 @@ impl SessionModal {
             lines.push(Line::from(vec![Span::styled(
                 "  FILE CHANGES ",
                 Style::default()
-                    .fg(colors.accent_yellow)
+                    .fg(colors.text_primary)
                     .add_modifier(Modifier::BOLD),
             )]));
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::styled(
                 "    NO FILE CHANGES",
-                Style::default().fg(colors.text_muted),
+                Style::default().fg(colors.text_secondary),
             )]));
         }
         let inner_height = area.height.saturating_sub(2) as usize;
@@ -1081,7 +1072,7 @@ impl SessionModal {
                     lines.push(Line::from(""));
                 }
                 ChatBlock::SubagentGroup(agents) => {
-                    let outer_color = colors.accent_orange;
+                    let outer_color = colors.sub_agent;
                     let header = format!(" SUBAGENTS ({}) ", agents.len());
                     let dash_len = box_w.saturating_sub(header.chars().count() + 2);
                     lines.push(Line::from(vec![
@@ -1090,7 +1081,7 @@ impl SessionModal {
                         Span::styled(
                             header,
                             Style::default()
-                                .fg(colors.accent_yellow)
+                                .fg(colors.sub_agent)
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled("╌".repeat(dash_len), Style::default().fg(outer_color)),
@@ -1132,7 +1123,7 @@ impl SessionModal {
                             Span::styled("╌".repeat(card_dash), Style::default().fg(ag_dim)),
                             Span::styled(
                                 format!(" {}", toggle_label),
-                                Style::default().fg(colors.text_muted),
+                                Style::default().fg(colors.text_secondary),
                             ),
                         ]));
                         if is_expanded {
@@ -1173,7 +1164,10 @@ impl SessionModal {
                                     let tag = if i == 0 { "TASK:" } else { "     " };
                                     lines.push(Line::from(vec![
                                         Span::styled("   ┊ ", Style::default().fg(ag_dim)),
-                                        Span::styled(tag, Style::default().fg(colors.info)),
+                                        Span::styled(
+                                            tag,
+                                            Style::default().fg(colors.text_secondary),
+                                        ),
                                         Span::raw(" "),
                                         Span::styled(
                                             line.clone(),
@@ -1256,7 +1250,10 @@ impl SessionModal {
                                 for line in wrap_text_plain(&preview, card_w.saturating_sub(8)) {
                                     lines.push(Line::from(vec![
                                         Span::styled("   ┊  ", Style::default().fg(ag_dim)),
-                                        Span::styled(line, Style::default().fg(colors.text_muted)),
+                                        Span::styled(
+                                            line,
+                                            Style::default().fg(colors.text_secondary),
+                                        ),
                                     ]));
                                 }
                             }
@@ -1264,7 +1261,7 @@ impl SessionModal {
                                 Span::styled("   ┊  ", Style::default().fg(ag_dim)),
                                 Span::styled(
                                     format!("tools: {}", total_tools),
-                                    Style::default().fg(colors.text_muted),
+                                    Style::default().fg(colors.text_secondary),
                                 ),
                             ]));
                             if total_tools > 0 {
@@ -1339,8 +1336,8 @@ impl SessionModal {
         let k = Style::default()
             .fg(colors.text_secondary)
             .add_modifier(Modifier::BOLD);
-        let t = Style::default().fg(colors.text_muted);
-        let sep = Span::styled(" │ ", Style::default().fg(colors.border_muted));
+        let t = Style::default().fg(colors.text_secondary);
+        let sep = Span::styled(" │ ", Style::default().fg(colors.border_default));
         let instructions = vec![Line::from(vec![
             Span::styled("←→/Click", k),
             Span::styled(" column", t),
@@ -1355,7 +1352,7 @@ impl SessionModal {
             Span::styled(" close", t),
         ])];
         let status_bar = Paragraph::new(instructions)
-            .style(Style::default().bg(colors.bg_tertiary))
+            .style(Style::default().bg(colors.bg_empty))
             .alignment(Alignment::Center);
         frame.render_widget(status_bar, area);
     }
@@ -1411,9 +1408,9 @@ fn render_tool_stats_box<'a>(
     colors: ThemeColors,
 ) {
     let inner_w = card_w.saturating_sub(6);
-    let frame_color = colors.border_muted;
+    let frame_color = colors.border_default;
     let tool_header_color = colors.text_secondary;
-    let tool_text_color = colors.text_muted;
+    let tool_text_color = colors.text_secondary;
     let toggle_label = if is_expanded {
         "▾ collapse"
     } else {
@@ -1444,7 +1441,7 @@ fn render_tool_stats_box<'a>(
         Span::styled(" ".repeat(dash_len), Style::default().fg(frame_color)),
         Span::styled(
             format!(" {}", toggle_label),
-            Style::default().fg(colors.text_muted),
+            Style::default().fg(colors.text_secondary),
         ),
         Span::styled(" │", Style::default().fg(frame_color)),
     ]));
@@ -1757,7 +1754,7 @@ fn render_user_box<'a>(
     user_num: usize,
     colors: ThemeColors,
 ) {
-    let border_color = colors.accent_cyan;
+    let border_color = colors.user;
     let toggle_label = if is_expanded {
         "▾ collapse"
     } else {
@@ -1777,7 +1774,7 @@ fn render_user_box<'a>(
         Span::styled("─".repeat(dash_len), Style::default().fg(border_color)),
         Span::styled(
             format!(" {}", toggle_label),
-            Style::default().fg(colors.text_muted),
+            Style::default().fg(colors.text_secondary),
         ),
     ]));
     let content_w = box_w.saturating_sub(4);
@@ -1798,7 +1795,7 @@ fn render_user_box<'a>(
     if cleaned.is_empty() {
         lines.push(Line::from(vec![
             Span::styled(" │", Style::default().fg(border_color)),
-            Span::styled("  (empty)", Style::default().fg(colors.text_muted)),
+            Span::styled("  (empty)", Style::default().fg(colors.text_secondary)),
         ]));
     } else if is_expanded {
         for line in wrap_text_plain(&cleaned, content_w) {
@@ -1838,7 +1835,7 @@ fn render_agent_box<'a>(
     expanded_tools: &FxHashSet<Box<str>>,
     colors: ThemeColors,
 ) {
-    let border_color = colors.success;
+    let border_color = colors.main_agent;
     let toggle_label = if is_expanded {
         "▾ collapse"
     } else {
@@ -1863,7 +1860,7 @@ fn render_agent_box<'a>(
         Span::styled("═".repeat(dash_len), Style::default().fg(border_color)),
         Span::styled(
             format!(" {}", toggle_label),
-            Style::default().fg(colors.text_muted),
+            Style::default().fg(colors.text_secondary),
         ),
     ]));
     let content_w = box_w.saturating_sub(4);
@@ -1888,7 +1885,7 @@ fn render_agent_box<'a>(
                 lines.push(Line::from(vec![
                     Span::styled(" ║", Style::default().fg(border_color)),
                     Span::raw("  "),
-                    Span::styled(line, Style::default().fg(colors.text_secondary)),
+                    Span::styled(line, Style::default().fg(colors.text_primary)),
                 ]));
             }
         } else {
@@ -1897,7 +1894,7 @@ fn render_agent_box<'a>(
                 lines.push(Line::from(vec![
                     Span::styled(" ║", Style::default().fg(border_color)),
                     Span::raw("  "),
-                    Span::styled(line, Style::default().fg(colors.text_secondary)),
+                    Span::styled(line, Style::default().fg(colors.text_primary)),
                 ]));
             }
         }
@@ -1922,7 +1919,7 @@ fn render_agent_box<'a>(
     if !has_text && total_tools == 0 {
         lines.push(Line::from(vec![
             Span::styled(" ║", Style::default().fg(border_color)),
-            Span::styled("  (empty)", Style::default().fg(colors.text_muted)),
+            Span::styled("  (empty)", Style::default().fg(colors.text_secondary)),
         ]));
     }
     lines.push(Line::from(vec![
@@ -2000,7 +1997,7 @@ fn subagent_color(index: usize, colors: ThemeColors) -> Color {
 fn dim_color(c: Color, colors: &ThemeColors) -> Color {
     match c {
         Color::Rgb(r, g, b) => Color::Rgb(r / 3, g / 3, b / 3),
-        _ => colors.text_muted,
+        _ => colors.text_secondary,
     }
 }
 

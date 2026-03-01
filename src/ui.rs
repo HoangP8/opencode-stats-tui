@@ -950,7 +950,7 @@ impl App {
         term_height: u16,
     ) -> io::Result<()> {
         if (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-            || (key.code == KeyCode::Char('q')
+            || ((key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q'))
                 && !self.is_active
                 && !self.models_active
                 && !self.modal.open)
@@ -967,7 +967,7 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                 if self.is_active || self.models_active {
                     self.is_active = false;
                     self.models_active = false;
@@ -1823,7 +1823,7 @@ impl App {
             .fg(colors.text_secondary)
             .add_modifier(Modifier::BOLD);
         let t = Style::default().fg(colors.text_muted);
-        let sep = Span::styled(" │ ", Style::default().fg(colors.border_muted));
+        let sep = Span::styled(" │ ", Style::default().fg(colors.border_default));
 
         let mut spans: Vec<Span> = Vec::with_capacity(16);
 
@@ -1994,7 +1994,7 @@ impl App {
                     if tools_hl {
                         border_style
                     } else {
-                        Style::default().fg(colors.border_muted)
+                        Style::default().fg(colors.border_default)
                     },
                     tools_hl,
                 );
@@ -2006,7 +2006,7 @@ impl App {
                     if projects_hl {
                         border_style
                     } else {
-                        Style::default().fg(colors.border_muted)
+                        Style::default().fg(colors.border_default)
                     },
                     projects_hl,
                 );
@@ -2029,7 +2029,7 @@ impl App {
                     if detail_highlighted {
                         border_style
                     } else {
-                        Style::default().fg(colors.border_muted)
+                        Style::default().fg(colors.border_default)
                     },
                     detail_highlighted,
                 );
@@ -2041,7 +2041,7 @@ impl App {
                     if list_highlighted {
                         border_style
                     } else {
-                        Style::default().fg(colors.border_muted)
+                        Style::default().fg(colors.border_default)
                     },
                     list_highlighted,
                     self.is_active && list_highlighted,
