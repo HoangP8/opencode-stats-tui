@@ -11,13 +11,13 @@ use crate::session::SessionModal;
 use crate::stats::{load_session_chat_with_max_ts, DayStat, ModelUsage, ToolUsage, Totals};
 use crate::stats_cache::StatsCache;
 use crate::theme::Theme;
-use chrono::Datelike;
+use chrono::{Datelike, Timelike};
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use helpers::{
-    cache_key, calculate_message_rendered_lines, CachedChat, Focus, HeatmapLayout, LeftPanel,
-    ModelTimelineLayout, PanelRects, RightPanel,
+    cache_key, calculate_message_rendered_lines, ActivityView, CachedChat, Focus, HeatmapLayout,
+    LeftPanel, ModelTimelineLayout, PanelRects, RightPanel, WeeklyHeatmapLayout,
 };
 use parking_lot::Mutex;
 use ratatui::{
@@ -108,6 +108,20 @@ pub struct App {
     overview_heatmap_selected_active_ms: i64,
     overview_heatmap_flash_time: Option<std::time::Instant>,
     overview_stats_cache: OverviewStatsCache,
+
+    // Activity view toggle (yearly / weekly)
+    activity_view: ActivityView,
+    weekly_heatmap_tokens: [[u64; 24]; 7],
+    weekly_heatmap_sessions: [[u32; 24]; 7],
+    weekly_heatmap_cost: [[f64; 24]; 7],
+    weekly_heatmap_dates: [Option<chrono::NaiveDate>; 7],
+    weekly_heatmap_layout: Option<WeeklyHeatmapLayout>,
+    weekly_heatmap_selected_weekday: Option<usize>,
+    weekly_heatmap_selected_hour: Option<usize>,
+    weekly_heatmap_selected_tokens: u64,
+    weekly_heatmap_selected_sessions: u32,
+    weekly_heatmap_selected_cost: f64,
+    weekly_heatmap_flash_time: Option<std::time::Instant>,
 
     // Models panel timeline data
     model_timeline_layout: Option<ModelTimelineLayout>,
@@ -282,6 +296,19 @@ impl App {
             overview_heatmap_flash_time: None,
             overview_stats_cache: OverviewStatsCache::new(),
 
+            activity_view: ActivityView::Yearly,
+            weekly_heatmap_tokens: [[0u64; 24]; 7],
+            weekly_heatmap_sessions: [[0u32; 24]; 7],
+            weekly_heatmap_cost: [[0.0f64; 24]; 7],
+            weekly_heatmap_dates: [None; 7],
+            weekly_heatmap_layout: None,
+            weekly_heatmap_selected_weekday: None,
+            weekly_heatmap_selected_hour: None,
+            weekly_heatmap_selected_tokens: 0,
+            weekly_heatmap_selected_sessions: 0,
+            weekly_heatmap_selected_cost: 0.0,
+            weekly_heatmap_flash_time: None,
+
             model_timeline_layout: None,
             model_timeline_selected_day: None,
             model_timeline_selected_tokens: 0,
@@ -355,6 +382,42 @@ impl App {
         let mut projects: Vec<(String, usize)> = project_counts.into_iter().collect();
         projects.sort_unstable_by(|a, b| b.1.cmp(&a.1));
         self.overview_projects = projects;
+
+        // Compute weekly heatmap data: last 7 calendar days x hour bucket.
+        self.weekly_heatmap_tokens = [[0u64; 24]; 7];
+        self.weekly_heatmap_sessions = [[0u32; 24]; 7];
+        self.weekly_heatmap_cost = [[0.0f64; 24]; 7];
+        self.weekly_heatmap_dates = [None; 7];
+
+        let today = self
+            .per_day
+            .keys()
+            .filter_map(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+            .max()
+            .unwrap_or_else(|| chrono::Local::now().date_naive());
+
+        for row in 0..7 {
+            let date = today - chrono::Duration::days((6 - row) as i64);
+            self.weekly_heatmap_dates[row] = Some(date);
+            let key = date.format("%Y-%m-%d").to_string();
+            let Some(day_stat) = self.per_day.get(&key) else {
+                continue;
+            };
+
+            for session in day_stat.sessions.values() {
+                let ts_ms = session.first_activity;
+                if ts_ms <= 0 || ts_ms == i64::MAX {
+                    continue;
+                }
+                if let Some(dt) = chrono::DateTime::from_timestamp(ts_ms / 1000, 0) {
+                    let local = dt.with_timezone(&chrono::Local);
+                    let hour = local.hour() as usize;
+                    self.weekly_heatmap_tokens[row][hour] += session.tokens.total();
+                    self.weekly_heatmap_sessions[row][hour] += 1;
+                    self.weekly_heatmap_cost[row][hour] += session.display_cost();
+                }
+            }
+        }
     }
 
     #[inline]
@@ -932,7 +995,8 @@ impl App {
                 self.last_refresh = Some(std::time::Instant::now());
             }
 
-            let needs_flicker_redraw = (self.overview_heatmap_flash_time.is_some()
+            let needs_flicker_redraw = ((self.overview_heatmap_flash_time.is_some()
+                || self.weekly_heatmap_flash_time.is_some())
                 && self.left_panel == LeftPanel::Stats)
                 || (self.model_timeline_flash_time.is_some()
                     && self.left_panel == LeftPanel::Models);
@@ -980,7 +1044,25 @@ impl App {
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                if self.focus == Focus::Right {
+                if self.is_active
+                    && self.focus == Focus::Right
+                    && self.left_panel == LeftPanel::Stats
+                    && self.right_panel == RightPanel::Activity
+                {
+                    match self.activity_view {
+                        ActivityView::Yearly => {
+                            self.activity_view = ActivityView::Weekly;
+                            self.overview_heatmap_selected_day = None;
+                        }
+                        ActivityView::Weekly => {
+                            self.activity_view = ActivityView::Yearly;
+                            self.weekly_heatmap_selected_weekday = None;
+                            self.weekly_heatmap_selected_hour = None;
+                        }
+                    }
+                    self.weekly_heatmap_flash_time = None;
+                    self.overview_heatmap_flash_time = None;
+                } else if self.focus == Focus::Right {
                     match self.left_panel {
                         LeftPanel::Stats => {
                             // Layout: Tools (LEFT) | List (RIGHT)
@@ -988,6 +1070,7 @@ impl App {
                             if self.right_panel == RightPanel::List {
                                 self.right_panel = RightPanel::Tools;
                             } else {
+                                self.is_active = false;
                                 self.focus = Focus::Left;
                             }
                         }
@@ -1004,7 +1087,25 @@ impl App {
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                if self.focus == Focus::Left {
+                if self.is_active
+                    && self.focus == Focus::Right
+                    && self.left_panel == LeftPanel::Stats
+                    && self.right_panel == RightPanel::Activity
+                {
+                    match self.activity_view {
+                        ActivityView::Yearly => {
+                            self.activity_view = ActivityView::Weekly;
+                            self.overview_heatmap_selected_day = None;
+                        }
+                        ActivityView::Weekly => {
+                            self.activity_view = ActivityView::Yearly;
+                            self.weekly_heatmap_selected_weekday = None;
+                            self.weekly_heatmap_selected_hour = None;
+                        }
+                    }
+                    self.weekly_heatmap_flash_time = None;
+                    self.overview_heatmap_flash_time = None;
+                } else if self.focus == Focus::Left {
                     self.focus = Focus::Right;
                     match self.left_panel {
                         LeftPanel::Stats => self.right_panel = RightPanel::Detail,
@@ -1362,6 +1463,7 @@ impl App {
                             LeftPanel::Stats => {
                                 if self.right_panel == RightPanel::List
                                     || self.right_panel == RightPanel::Tools
+                                    || self.right_panel == RightPanel::Activity
                                 {
                                     self.is_active = true;
                                 }
@@ -1601,8 +1703,11 @@ impl App {
                     } else {
                         self.left_panel = LeftPanel::Stats;
                         self.right_panel = RightPanel::Activity;
-                        // Always allow clicking to select a day
-                        self.select_heatmap_day_from_mouse(x, y);
+                        if self.activity_view == ActivityView::Weekly {
+                            self.select_weekly_cell_from_mouse(x, y);
+                        } else {
+                            self.select_heatmap_day_from_mouse(x, y);
+                        }
                     }
                 }
                 "tools" => {
@@ -1730,6 +1835,62 @@ impl App {
         self.overview_heatmap_selected_cost = cost;
         self.overview_heatmap_selected_active_ms = active_ms;
         self.overview_heatmap_flash_time = Some(std::time::Instant::now());
+    }
+
+    fn select_weekly_cell_from_mouse(&mut self, x: u16, y: u16) {
+        let Some(layout) = self.weekly_heatmap_layout else {
+            return;
+        };
+
+        let has_label_row = layout.inner.height >= 9;
+        let row_offset: u16 = if has_label_row { 1 } else { 0 };
+        if y < layout.inner.y + row_offset {
+            return;
+        }
+        let day_row = (y - layout.inner.y - row_offset) as usize;
+        if day_row >= 7 {
+            return;
+        }
+
+        let start_x = layout.inner.x + layout.label_w + 4;
+        if x < start_x {
+            return;
+        }
+
+        let mut rel_x = x - start_x;
+        let mut col = 0usize;
+        while col < layout.num_periods {
+            let prev = col * layout.extra_cols as usize / layout.num_periods;
+            let next = (col + 1) * layout.extra_cols as usize / layout.num_periods;
+            let w = layout.cell_w + next.saturating_sub(prev) as u16;
+            if rel_x < w {
+                break;
+            }
+            rel_x = rel_x.saturating_sub(w);
+            col += 1;
+        }
+        if col >= layout.num_periods {
+            return;
+        }
+
+        let h_start = col * layout.hours_per_period;
+        let h_end = ((col + 1) * layout.hours_per_period).min(24);
+
+        let mut tokens = 0u64;
+        let mut sessions = 0u32;
+        let mut cost = 0.0f64;
+        for h in h_start..h_end {
+            tokens += self.weekly_heatmap_tokens[day_row][h];
+            sessions += self.weekly_heatmap_sessions[day_row][h];
+            cost += self.weekly_heatmap_cost[day_row][h];
+        }
+
+        self.weekly_heatmap_selected_weekday = Some(day_row);
+        self.weekly_heatmap_selected_hour = Some(h_start);
+        self.weekly_heatmap_selected_tokens = tokens;
+        self.weekly_heatmap_selected_sessions = sessions;
+        self.weekly_heatmap_selected_cost = cost;
+        self.weekly_heatmap_flash_time = Some(std::time::Instant::now());
     }
 
     fn select_model_timeline_day_from_mouse(&mut self, x: u16, y: u16) {

@@ -45,6 +45,12 @@ pub enum RightPanel {
     Tools,
 }
 
+#[derive(PartialEq, Clone, Copy)]
+pub enum ActivityView {
+    Yearly,
+    Weekly,
+}
+
 /// Cached panel rects for mouse hit-testing.
 #[derive(Default, Clone)]
 pub struct PanelRects {
@@ -99,6 +105,16 @@ pub struct HeatmapLayout {
     pub week_w: u16,
     pub extra_cols: u16,
     pub grid_pad: u16,
+}
+
+#[derive(Clone, Copy)]
+pub struct WeeklyHeatmapLayout {
+    pub inner: Rect,
+    pub label_w: u16,
+    pub num_periods: usize,
+    pub hours_per_period: usize,
+    pub cell_w: u16,
+    pub extra_cols: u16,
 }
 
 #[derive(Clone, Copy)]

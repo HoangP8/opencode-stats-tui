@@ -1,6 +1,9 @@
 //! Stats panel rendering.
 
-use super::helpers::{month_abbr, stat_widget, truncate_with_ellipsis, HeatmapLayout};
+use super::helpers::{
+    month_abbr, stat_widget, truncate_with_ellipsis, ActivityView, HeatmapLayout,
+    WeeklyHeatmapLayout,
+};
 use crate::stats::format_number;
 
 use chrono::Datelike;
@@ -444,11 +447,33 @@ impl super::App {
         border_style: Style,
         is_focused: bool,
     ) {
+        // Dispatch to weekly view if selected
+        if self.activity_view == ActivityView::Weekly {
+            self.overview_heatmap_layout = None;
+            return self.render_weekly_heatmap(frame, area, border_style, is_focused);
+        }
+        self.weekly_heatmap_layout = None;
+
         let colors = self.theme.colors();
         let title_color = if is_focused {
             colors.border_focus
         } else {
             colors.border_default
+        };
+
+        let is_view_active = self.is_active
+            && self.focus == super::helpers::Focus::Right
+            && self.left_panel == super::helpers::LeftPanel::Stats
+            && self.right_panel == super::helpers::RightPanel::Activity;
+
+        let bottom_text = if is_focused {
+            if is_view_active {
+                " ←→ change view │ click to select "
+            } else {
+                " click to select "
+            }
+        } else {
+            " "
         };
 
         let block = Block::default()
@@ -460,7 +485,7 @@ impl super::App {
             })
             .title(
                 Line::from(Span::styled(
-                    " ACTIVITY ",
+                    " ACTIVITY · YEARLY ",
                     Style::default()
                         .fg(title_color)
                         .add_modifier(Modifier::BOLD),
@@ -468,14 +493,10 @@ impl super::App {
                 .alignment(Alignment::Center),
             )
             .title_bottom(
-                Line::from(if is_focused {
-                    Span::styled(
-                        " Click a day to see breakdown ",
-                        Style::default().fg(colors.text_muted),
-                    )
-                } else {
-                    Span::styled(" ", Style::default())
-                })
+                Line::from(Span::styled(
+                    if is_focused { bottom_text } else { " " },
+                    Style::default().fg(colors.text_muted),
+                ))
                 .alignment(Alignment::Center),
             );
 
@@ -941,6 +962,331 @@ impl super::App {
             })
             .collect();
 
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// Weekly activity heatmap:
+    pub fn render_weekly_heatmap(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        border_style: Style,
+        is_focused: bool,
+    ) {
+        let colors = self.theme.colors();
+        let title_color = if is_focused {
+            colors.border_focus
+        } else {
+            colors.border_default
+        };
+
+        let is_view_active = self.is_active
+            && self.focus == super::helpers::Focus::Right
+            && self.left_panel == super::helpers::LeftPanel::Stats
+            && self.right_panel == super::helpers::RightPanel::Activity;
+
+        let bottom_text = if is_focused {
+            if is_view_active {
+                " ←→ change view │ click to select "
+            } else {
+                " click to select "
+            }
+        } else {
+            " "
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if is_focused {
+                border_style
+            } else {
+                Style::default().fg(colors.border_default)
+            })
+            .title(
+                Line::from(Span::styled(
+                    " ACTIVITY · WEEKLY ",
+                    Style::default()
+                        .fg(title_color)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Center),
+            )
+            .title_bottom(
+                Line::from(Span::styled(
+                    if is_focused { bottom_text } else { " " },
+                    Style::default().fg(colors.text_muted),
+                ))
+                .alignment(Alignment::Center),
+            );
+
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        if inner.width < 20 || inner.height < 9 {
+            self.weekly_heatmap_layout = None;
+            return;
+        }
+
+        // Determine time period granularity dynamically based on available width
+        let label_w = 2u16;
+        let avail_width = inner.width.saturating_sub(label_w + 1);
+
+        // Slot sizing: prefer 1-hour slots, fallback to 2-hour if width insufficient
+        let min_cell_w = 2u16;
+        let hours_per_period = if avail_width >= 24 * min_cell_w {
+            1
+        } else {
+            2
+        };
+
+        let num_periods = 24 / hours_per_period;
+
+        // Fill full width
+        let cell_w = (avail_width / num_periods as u16).max(2);
+        let used_w = cell_w * num_periods as u16;
+        let extra_cols = avail_width.saturating_sub(used_w);
+
+        let period_extra = |period: usize| -> u16 {
+            let prev = period * extra_cols as usize / num_periods;
+            let next = (period + 1) * extra_cols as usize / num_periods;
+            next.saturating_sub(prev) as u16
+        };
+
+        // Aggregate data by periods
+        let mut period_tokens: Vec<Vec<u64>> = vec![vec![0u64; num_periods]; 7];
+        let mut period_sessions: Vec<Vec<u32>> = vec![vec![0u32; num_periods]; 7];
+        let mut period_cost: Vec<Vec<f64>> = vec![vec![0.0f64; num_periods]; 7];
+        let mut max_tokens: u64 = 1;
+
+        for weekday in 0..7 {
+            for period in 0..num_periods {
+                let h_start = period * hours_per_period;
+                let h_end = ((period + 1) * hours_per_period).min(24);
+                let mut tokens = 0u64;
+                let mut sessions = 0u32;
+                let mut cost = 0.0f64;
+
+                for h in h_start..h_end {
+                    tokens += self.weekly_heatmap_tokens[weekday][h];
+                    sessions += self.weekly_heatmap_sessions[weekday][h];
+                    cost += self.weekly_heatmap_cost[weekday][h];
+                }
+
+                period_tokens[weekday][period] = tokens;
+                period_sessions[weekday][period] = sessions;
+                period_cost[weekday][period] = cost;
+                max_tokens = max_tokens.max(tokens);
+            }
+        }
+
+        // Store layout for mouse interaction
+        self.weekly_heatmap_layout = Some(WeeklyHeatmapLayout {
+            inner,
+            label_w,
+            num_periods,
+            hours_per_period,
+            cell_w,
+            extra_cols,
+        });
+
+        // Get selected cell
+        let (sel_weekday, sel_period) = if let (Some(wd), Some(hour)) = (
+            self.weekly_heatmap_selected_weekday,
+            self.weekly_heatmap_selected_hour,
+        ) {
+            let period = hour / hours_per_period;
+            (Some(wd), Some(period))
+        } else {
+            (None, None)
+        };
+
+        // Flash effect for selection
+        let flash = self.weekly_heatmap_flash_time.map(|t| {
+            (1.0 - (t.elapsed().as_millis() as f64 * std::f64::consts::TAU / 600.0).cos()) * 0.2
+        });
+
+        // Compute sparse time slot labels row
+        let label_interval_hours = if cell_w <= 2 { 6 } else { 3 };
+        let label_every_periods = (label_interval_hours / hours_per_period).max(1);
+        let grid_w = (cell_w as usize * num_periods) + extra_cols as usize;
+        let mut time_label_row = vec![' '; grid_w];
+
+        let mut period_x = vec![0usize; num_periods + 1];
+        for period in 0..num_periods {
+            period_x[period + 1] =
+                period_x[period] + cell_w as usize + period_extra(period) as usize;
+        }
+
+        for period in (0..num_periods).step_by(label_every_periods) {
+            let h_start = period * hours_per_period;
+            let label = format!("{:02}", h_start);
+            let pos = period_x[period];
+            for (i, c) in label.chars().enumerate() {
+                if pos + i < time_label_row.len() {
+                    time_label_row[pos + i] = c;
+                }
+            }
+        }
+
+        let mut lines: Vec<Line> = Vec::with_capacity(10);
+
+        // Render time label row first
+        let has_time_labels = inner.height >= 9;
+        if has_time_labels {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("     {:<1$}", "", (label_w - 1) as usize),
+                    Style::default(),
+                ),
+                Span::styled(
+                    time_label_row.iter().collect::<String>(),
+                    Style::default().fg(colors.text_secondary),
+                ),
+            ]));
+        }
+
+        // Heatmap colors
+        let base_g = match colors.general_heatmap {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => (100, 200, 100),
+        };
+        let bg_b = match colors.bg_empty {
+            Color::Rgb(r, g, b) => (r as f64, g as f64, b as f64),
+            _ => (60.0, 60.0, 60.0),
+        };
+
+        // Day rows
+        for row in 0..7 {
+            let day_label = self.weekly_heatmap_dates[row]
+                .map(|d| d.format("%a").to_string())
+                .unwrap_or_else(|| "---".to_string());
+            let mut spans: Vec<Span> = vec![
+                Span::styled(
+                    format!(" {:<1$}", day_label, (label_w - 1) as usize),
+                    Style::default().fg(colors.text_secondary),
+                ),
+                Span::styled("  ", Style::default()),
+            ];
+
+            for period in 0..num_periods {
+                let sel = sel_weekday == Some(row) && sel_period == Some(period);
+                let tokens = period_tokens[row][period];
+                let w = cell_w + period_extra(period);
+
+                let bg = if tokens == 0 {
+                    colors.bg_empty
+                } else {
+                    let intensity = match tokens as f64 / max_tokens as f64 {
+                        r if r <= 0.15 => 0.25,
+                        r if r <= 0.35 => 0.45,
+                        r if r <= 0.55 => 0.65,
+                        r if r <= 0.75 => 0.82,
+                        _ => 1.0,
+                    };
+                    Color::Rgb(
+                        (bg_b.0 + (base_g.0 as f64 - bg_b.0) * intensity) as u8,
+                        (bg_b.1 + (base_g.1 as f64 - bg_b.1) * intensity) as u8,
+                        (bg_b.2 + (base_g.2 as f64 - bg_b.2) * intensity) as u8,
+                    )
+                };
+
+                let style = if sel {
+                    if let (Some(f), Color::Rgb(r, g, b)) = (flash, bg) {
+                        Style::default().bg(Color::Rgb(
+                            (r as f64 + (255.0 - r as f64) * f) as u8,
+                            (g as f64 + (255.0 - g as f64) * f) as u8,
+                            (b as f64 + (255.0 - b as f64) * f) as u8,
+                        ))
+                    } else {
+                        Style::default().bg(bg)
+                    }
+                } else {
+                    Style::default().bg(bg)
+                };
+
+                // Render cell with proper width (stretches to fill available space)
+                spans.push(Span::styled(" ".repeat(w as usize), style));
+            }
+
+            lines.push(Line::from(spans));
+        }
+
+        // Spacer
+        if inner.height > 10 {
+            lines.push(Line::from(""));
+        }
+
+        // Legend
+        let legend_colors: [Color; 5] = [0.25, 0.45, 0.65, 0.82, 1.0].map(|i| {
+            Color::Rgb(
+                (bg_b.0 + (base_g.0 as f64 - bg_b.0) * i) as u8,
+                (bg_b.1 + (base_g.1 as f64 - bg_b.1) * i) as u8,
+                (bg_b.2 + (base_g.2 as f64 - bg_b.2) * i) as u8,
+            )
+        });
+
+        let mut legend = vec![
+            Span::styled(
+                format!("     {:<1$}", "", (label_w - 1) as usize),
+                Style::default(),
+            ),
+            Span::styled("Less ", Style::default().fg(colors.text_secondary)),
+            Span::styled("  ", Style::default().bg(colors.bg_empty)),
+        ];
+        legend.extend(
+            legend_colors
+                .iter()
+                .map(|c| Span::styled("  ", Style::default().bg(*c))),
+        );
+        legend.push(Span::styled(
+            " More ",
+            Style::default().fg(colors.text_secondary),
+        ));
+
+        // Selected period info
+        if let (Some(row), Some(h_start)) = (
+            self.weekly_heatmap_selected_weekday,
+            self.weekly_heatmap_selected_hour,
+        ) {
+            let h_end = (h_start + hours_per_period).min(24);
+            let time_label = format!("{:02}:00–{:02}:00", h_start, h_end);
+            let date_label = self
+                .weekly_heatmap_dates
+                .get(row)
+                .and_then(|d| *d)
+                .map(|d| d.format("%a (%b %-d)").to_string())
+                .unwrap_or_else(|| "---".to_string());
+            let dim = Style::default().fg(colors.text_muted);
+
+            legend.extend([
+                Span::styled("  ", Style::default()),
+                Span::styled(
+                    format!(" {} · {}", date_label, time_label),
+                    Style::default()
+                        .fg(colors.text_primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" ╱ ", dim),
+                Span::styled("tok:", dim),
+                Span::styled(
+                    format_number(self.weekly_heatmap_selected_tokens),
+                    Style::default().fg(colors.avg_tokens),
+                ),
+                Span::styled(" ╱ ", dim),
+                Span::styled("sess:", dim),
+                Span::styled(
+                    format!("{}", self.weekly_heatmap_selected_sessions),
+                    Style::default().fg(colors.session),
+                ),
+                Span::styled(" ╱ ", dim),
+                Span::styled("cost:", dim),
+                Span::styled(
+                    format!("${:.2}", self.weekly_heatmap_selected_cost),
+                    Style::default().fg(colors.cost()),
+                ),
+            ]);
+        }
+        lines.push(Line::from(legend));
         frame.render_widget(Paragraph::new(lines), inner);
     }
 }

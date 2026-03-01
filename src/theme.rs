@@ -101,12 +101,12 @@ impl ThemeColors {
         cost: hex("#f0a45e"),
         thinking: hex("#38bdf8"),
         cache_read: hex("#e8d59c"),
-        cache_write: hex("#c9a86e"),
+        cache_write: hex("#e8d59c"),
 
         add_line: hex("#4ade80"),
         remove_line: hex("#f87171"),
 
-        user: hex("#347cc4"),
+        user: hex("#d12a2a"),
         agent_general: hex("#a3e635"),
         main_agent: hex("#54c574"),
         sub_agent: hex("#fbbf24"),
