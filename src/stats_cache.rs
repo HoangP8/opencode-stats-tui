@@ -152,25 +152,14 @@ impl StatsCache {
             return false;
         }
 
-        if crate::stats::is_db_mode() {
-            let db = crate::stats::get_opencode_db_path();
-            if !db.exists() {
-                return false;
-            }
+        if crate::stats::is_db_mode() && crate::stats::get_storage_db_paths().is_empty() {
+            return false;
         }
 
         // Optimized: Check a subset of files for changes, but use mtime+size which is very fast
         // We still don't want to check thousands of files every time, so we sample
         // but the sample is now more robust.
         // Also check if the number of files matches.
-        let dirs = ["message", "part", "session", "session_diff"];
-        for dir in dirs {
-            let dp = self._storage_path.join(dir);
-            if !dp.exists() {
-                continue;
-            }
-        }
-
         // More thorough check: sample more files but with cheaper check
         let sample_size = 50.min(cached.file_meta.len());
         let mut checked = 0;
@@ -219,16 +208,18 @@ impl StatsCache {
     ) -> FxHashSet<String> {
         let mut affected_sessions = FxHashSet::default();
 
-        // DB mode: sqlite writes update opencode.db(-wal/-shm), not storage/* files.
+        // DB mode: sqlite writes update *.{db,-wal,-shm}, not storage/* files.
         // Preserve existing logic by doing a full refresh when DB files change.
         if crate::stats::is_db_mode() {
-            let db_path = crate::stats::get_opencode_db_path();
-            let db_s = db_path.to_string_lossy();
+            let db_paths = crate::stats::get_storage_db_paths();
             let touched_db = paths.iter().any(|p| {
-                p == db_s.as_ref()
+                db_paths.iter().any(|db| p == db.to_string_lossy().as_ref())
                     || p.ends_with("opencode.db")
                     || p.ends_with("opencode.db-wal")
                     || p.ends_with("opencode.db-shm")
+                    || p.ends_with("kilo.db")
+                    || p.ends_with("kilo.db-wal")
+                    || p.ends_with("kilo.db-shm")
             });
 
             if touched_db {
@@ -399,7 +390,7 @@ impl StatsCache {
     }
 
     fn list_message_files(&self) -> Vec<PathBuf> {
-        let message_path = self._storage_path.join("message");
+        let message_path = PathBuf::from(crate::stats::get_storage_path("message"));
         crate::stats::list_message_files(Path::new(&message_path))
     }
 
@@ -587,21 +578,22 @@ impl StatsCache {
 
     fn list_all_files(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         if crate::stats::is_db_mode() {
-            let db = crate::stats::get_opencode_db_path();
             let mut files = Vec::new();
-            if let Some(s) = db.to_str() {
-                files.push(s.to_string());
-            }
-            let wal = db.with_extension("db-wal");
-            if wal.exists() {
-                if let Some(s) = wal.to_str() {
+            for db in crate::stats::get_storage_db_paths() {
+                if let Some(s) = db.to_str() {
                     files.push(s.to_string());
                 }
-            }
-            let shm = db.with_extension("db-shm");
-            if shm.exists() {
-                if let Some(s) = shm.to_str() {
-                    files.push(s.to_string());
+                let wal = db.with_extension("db-wal");
+                if wal.exists() {
+                    if let Some(s) = wal.to_str() {
+                        files.push(s.to_string());
+                    }
+                }
+                let shm = db.with_extension("db-shm");
+                if shm.exists() {
+                    if let Some(s) = shm.to_str() {
+                        files.push(s.to_string());
+                    }
                 }
             }
             return Ok(files);
@@ -611,40 +603,43 @@ impl StatsCache {
         let files: Vec<String> = dirs
             .par_iter()
             .flat_map(|dir| {
-                let dp = self._storage_path.join(dir);
-                if !dp.exists() {
-                    return Vec::new();
-                }
+                let mut out = Vec::new();
+                for dp in crate::stats::get_storage_paths(dir) {
+                    if !dp.exists() {
+                        continue;
+                    }
 
-                if let Ok(entries) = fs::read_dir(&dp) {
-                    return entries
-                        .flatten()
-                        .par_bridge()
-                        .flat_map(|entry| {
-                            let p = entry.path();
-                            if p.is_dir() {
-                                if let Ok(sub_entries) = fs::read_dir(&p) {
-                                    let mut local_files = Vec::new();
-                                    for sub_entry in sub_entries.flatten() {
-                                        let sp = sub_entry.path();
-                                        if sp.extension().is_some_and(|e| e == "json") {
-                                            if let Ok(s) = sp.into_os_string().into_string() {
-                                                local_files.push(s);
+                    if let Ok(entries) = fs::read_dir(&dp) {
+                        let mut local: Vec<String> = entries
+                            .flatten()
+                            .par_bridge()
+                            .flat_map(|entry| {
+                                let p = entry.path();
+                                if p.is_dir() {
+                                    if let Ok(sub_entries) = fs::read_dir(&p) {
+                                        let mut local_files = Vec::new();
+                                        for sub_entry in sub_entries.flatten() {
+                                            let sp = sub_entry.path();
+                                            if sp.extension().is_some_and(|e| e == "json") {
+                                                if let Ok(s) = sp.into_os_string().into_string() {
+                                                    local_files.push(s);
+                                                }
                                             }
                                         }
+                                        return local_files;
                                     }
-                                    return local_files;
+                                } else if p.extension().is_some_and(|e| e == "json") {
+                                    if let Ok(s) = p.into_os_string().into_string() {
+                                        return vec![s];
+                                    }
                                 }
-                            } else if p.extension().is_some_and(|e| e == "json") {
-                                if let Ok(s) = p.into_os_string().into_string() {
-                                    return vec![s];
-                                }
-                            }
-                            Vec::new()
-                        })
-                        .collect();
+                                Vec::new()
+                            })
+                            .collect();
+                        out.append(&mut local);
+                    }
                 }
-                Vec::new()
+                out
             })
             .collect();
 

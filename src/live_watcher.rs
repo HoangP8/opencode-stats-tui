@@ -13,7 +13,7 @@ use std::{
 /// Real-time file watcher with coalesced updates.
 pub struct LiveWatcher {
     watcher: RecommendedWatcher,
-    storage_path: PathBuf,
+    watch_paths: Vec<PathBuf>,
     last_flush: Arc<Mutex<Instant>>,
     first_pending: Arc<Mutex<Option<Instant>>>,
     changed_files: Arc<Mutex<FxHashSet<PathBuf>>>,
@@ -22,7 +22,7 @@ pub struct LiveWatcher {
 
 impl LiveWatcher {
     pub fn new(
-        storage_path: PathBuf,
+        watch_paths: Vec<PathBuf>,
         on_change: Arc<dyn Fn(Vec<PathBuf>) + Send + Sync>,
         wake_tx: mpsc::Sender<()>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -53,6 +53,9 @@ impl LiveWatcher {
                                         n == "opencode.db"
                                             || n == "opencode.db-wal"
                                             || n == "opencode.db-shm"
+                                            || n == "kilo.db"
+                                            || n == "kilo.db-wal"
+                                            || n == "kilo.db-shm"
                                     });
 
                                 if is_json || is_sqlite || event.kind.is_remove() {
@@ -76,7 +79,7 @@ impl LiveWatcher {
 
         Ok(Self {
             watcher,
-            storage_path,
+            watch_paths,
             last_flush: Arc::new(Mutex::new(Instant::now() - Duration::from_millis(100))),
             first_pending: Arc::new(Mutex::new(None)),
             changed_files,
@@ -86,12 +89,13 @@ impl LiveWatcher {
 
     /// Start watching the storage directory.
     pub fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.watcher
-            .watch(&self.storage_path, RecursiveMode::Recursive)?;
-        info!(
-            "Watching directory for live updates: {}",
-            self.storage_path.display()
-        );
+        for watch_path in &self.watch_paths {
+            self.watcher.watch(watch_path, RecursiveMode::Recursive)?;
+            info!(
+                "Watching directory for live updates: {}",
+                watch_path.display()
+            );
+        }
         Ok(())
     }
 

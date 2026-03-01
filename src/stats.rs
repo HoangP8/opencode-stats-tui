@@ -1,4 +1,4 @@
-//! Statistics collection from opencode storage.
+//! Statistics collection from opencode/kilo storage.
 
 use chrono::Timelike;
 use rayon::prelude::*;
@@ -16,12 +16,12 @@ const MAX_CHARS_PER_TEXT_PART: usize = 2000;
 const DB_MESSAGE_PREFIX: &str = "db://message/";
 
 static HOME_DIR: OnceLock<String> = OnceLock::new();
-static OPENCODE_ROOT_PATH: OnceLock<PathBuf> = OnceLock::new();
-static OPENCODE_DB_PATH: OnceLock<PathBuf> = OnceLock::new();
+static STORAGE_ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+static STORAGE_DB_PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 static DB_MODE: OnceLock<bool> = OnceLock::new();
 
 thread_local! {
-    static DB_CONN: RefCell<Option<Connection>> = const { RefCell::new(None) };
+    static DB_CONNS: RefCell<Vec<Option<Connection>>> = const { RefCell::new(Vec::new()) };
 }
 
 pub type SessionTitlesMap = FxHashMap<Box<str>, String>;
@@ -38,37 +38,124 @@ fn get_home() -> &'static str {
 }
 
 #[inline]
-pub fn get_storage_path(subdir: &str) -> String {
-    format!("{}/.local/share/opencode/storage/{}", get_home(), subdir)
+fn candidate_roots() -> Vec<PathBuf> {
+    let mut bases = Vec::with_capacity(2);
+    if let Ok(xdg_data_home) = env::var("XDG_DATA_HOME") {
+        bases.push(PathBuf::from(xdg_data_home));
+    }
+    bases.push(PathBuf::from(format!("{}/.local/share", get_home())));
+
+    let mut roots = Vec::with_capacity(4);
+    for base in bases {
+        let opencode = base.join("opencode");
+        if !roots.contains(&opencode) {
+            roots.push(opencode);
+        }
+        let kilo = base.join("kilo");
+        if !roots.contains(&kilo) {
+            roots.push(kilo);
+        }
+    }
+    roots
 }
 
 #[inline]
-pub(crate) fn get_opencode_root_path() -> PathBuf {
-    OPENCODE_ROOT_PATH
+pub(crate) fn get_storage_roots() -> Vec<PathBuf> {
+    STORAGE_ROOTS
         .get_or_init(|| {
-            if let Ok(xdg_data_home) = env::var("XDG_DATA_HOME") {
-                PathBuf::from(xdg_data_home).join("opencode")
-            } else {
-                PathBuf::from(format!("{}/.local/share/opencode", get_home()))
+            let mut roots = Vec::with_capacity(4);
+            for root in candidate_roots() {
+                if root.exists() {
+                    roots.push(root);
+                }
             }
+            if roots.is_empty() {
+                let fallback = candidate_roots();
+                roots.push(fallback.into_iter().next().unwrap_or_else(|| {
+                    PathBuf::from(format!("{}/.local/share/opencode", get_home()))
+                }));
+            }
+            roots
         })
         .clone()
 }
 
 #[inline]
-pub(crate) fn get_opencode_db_path() -> PathBuf {
-    OPENCODE_DB_PATH
-        .get_or_init(|| get_opencode_root_path().join("opencode.db"))
+pub(crate) fn get_storage_paths(subdir: &str) -> Vec<PathBuf> {
+    get_storage_dirs()
+        .into_iter()
+        .map(|storage| storage.join(subdir))
+        .collect()
+}
+
+#[inline]
+pub(crate) fn get_storage_dirs() -> Vec<PathBuf> {
+    get_storage_roots()
+        .into_iter()
+        .map(|root| root.join("storage"))
+        .collect()
+}
+
+#[inline]
+pub(crate) fn get_watch_paths() -> Vec<PathBuf> {
+    if is_db_mode() {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for db in get_storage_db_paths() {
+            if let Some(parent) = db.parent() {
+                let parent = parent.to_path_buf();
+                if !paths.contains(&parent) {
+                    paths.push(parent);
+                }
+            }
+        }
+        if paths.is_empty() {
+            get_storage_roots()
+        } else {
+            paths
+        }
+    } else {
+        get_storage_dirs()
+    }
+}
+
+#[inline]
+pub fn get_storage_path(subdir: &str) -> String {
+    get_storage_paths(subdir)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| {
+            PathBuf::from(format!("{}/.local/share/opencode/storage", get_home())).join(subdir)
+        })
+        .to_string_lossy()
+        .to_string()
+}
+
+#[inline]
+pub(crate) fn get_storage_db_paths() -> Vec<PathBuf> {
+    STORAGE_DB_PATHS
+        .get_or_init(|| {
+            let mut dbs = Vec::with_capacity(2);
+            for root in get_storage_roots() {
+                let opencode_db = root.join("opencode.db");
+                if opencode_db.exists() {
+                    dbs.push(opencode_db);
+                }
+                let kilo_db = root.join("kilo.db");
+                if kilo_db.exists() {
+                    dbs.push(kilo_db);
+                }
+            }
+            dbs
+        })
         .clone()
 }
 
 #[inline]
 pub(crate) fn is_db_mode() -> bool {
-    *DB_MODE.get_or_init(|| get_opencode_db_path().exists())
+    *DB_MODE.get_or_init(|| !get_storage_db_paths().is_empty())
 }
 
-fn open_opencode_db() -> Option<Connection> {
-    let db_path = get_opencode_db_path();
+fn open_db(db_path: &Path) -> Option<Connection> {
     if !db_path.exists() {
         return None;
     }
@@ -81,31 +168,43 @@ fn open_opencode_db() -> Option<Connection> {
     Some(conn)
 }
 
+/// Thread-local cached DB connection by index.
 #[inline]
-fn with_opencode_db<T>(f: impl FnOnce(&Connection) -> Option<T>) -> Option<T> {
-    if !is_db_mode() {
+fn with_cached_db<T>(db_idx: usize, f: impl FnOnce(&Connection) -> Option<T>) -> Option<T> {
+    let db_paths = get_storage_db_paths();
+    if db_idx >= db_paths.len() {
         return None;
     }
-    DB_CONN.with(|slot| {
-        if slot.borrow().is_none() {
-            *slot.borrow_mut() = open_opencode_db();
+    DB_CONNS.with(|slot| {
+        let mut conns = slot.borrow_mut();
+        if conns.len() < db_paths.len() {
+            conns.resize_with(db_paths.len(), || None);
         }
-        let guard = slot.borrow();
-        let conn = guard.as_ref()?;
-        f(conn)
+        if conns[db_idx].is_none() {
+            conns[db_idx] = open_db(&db_paths[db_idx]);
+        }
+        conns[db_idx].as_ref().and_then(f)
     })
 }
 
 #[inline]
-fn db_message_id_from_path(path: &Path) -> Option<String> {
+fn db_message_key_from_path(path: &Path) -> Option<(usize, String)> {
     let p = path.to_str()?;
-    p.strip_prefix(DB_MESSAGE_PREFIX).map(|s| s.to_string())
+    let raw = p.strip_prefix(DB_MESSAGE_PREFIX)?;
+    let mut parts = raw.splitn(3, '/');
+    let db_idx = parts.next()?.parse::<usize>().ok()?;
+    let kind = parts.next()?;
+    if kind != "message" {
+        return None;
+    }
+    let msg_id = parts.next()?.to_string();
+    Some((db_idx, msg_id))
 }
 
 pub(crate) fn load_message_from_path(path: &Path) -> Option<Message> {
-    if let Some(message_id) = db_message_id_from_path(path) {
+    if let Some((db_idx, message_id)) = db_message_key_from_path(path) {
         let (row_id, row_session_id, row_time_created, data): (String, String, i64, String) =
-            with_opencode_db(|conn| {
+            with_cached_db(db_idx, |conn| {
                 let Ok(mut stmt) = conn.prepare_cached(
                     "SELECT id, session_id, time_created, data FROM message WHERE id = ?1",
                 ) else {
@@ -153,9 +252,13 @@ fn batch_load_parts_db(message_ids: &[&str]) -> FxHashMap<Box<str>, Vec<PartData
     if message_ids.is_empty() {
         return FxHashMap::default();
     }
-    with_opencode_db(|conn| {
-        let mut result: FxHashMap<Box<str>, Vec<PartData>> =
-            FxHashMap::with_capacity_and_hasher(message_ids.len(), Default::default());
+    let mut result: FxHashMap<Box<str>, Vec<PartData>> =
+        FxHashMap::with_capacity_and_hasher(message_ids.len(), Default::default());
+
+    for db_path in get_storage_db_paths() {
+        let Some(conn) = open_db(&db_path) else {
+            continue;
+        };
         for chunk in message_ids.chunks(500) {
             let placeholders: String = (0..chunk.len())
                 .map(|i| format!("?{}", i + 1))
@@ -178,26 +281,33 @@ fn batch_load_parts_db(message_ids: &[&str]) -> FxHashMap<Box<str>, Vec<PartData
             }) else {
                 continue;
             };
-            // Track current message_id to avoid re-allocating Box<str> per row
+
             let mut cur_id: Box<str> = "".into();
+            let mut should_insert_for_cur = false;
             for row in rows.flatten() {
+                if *cur_id != row.0 {
+                    cur_id = row.0.into_boxed_str();
+                    should_insert_for_cur = !result.contains_key(cur_id.as_ref());
+                    if should_insert_for_cur {
+                        result.entry(cur_id.clone()).or_default();
+                    }
+                }
+                if !should_insert_for_cur {
+                    continue;
+                }
+
                 let part = match serde_json::from_str::<PartData>(&row.1) {
                     Ok(p) => p,
                     Err(_) => continue,
                 };
-                // Rows ordered by message_id: only allocate key when id changes
-                if *cur_id != row.0 {
-                    cur_id = row.0.into_boxed_str();
-                    result.entry(cur_id.clone()).or_default();
-                }
                 if let Some(vec) = result.get_mut(&cur_id) {
                     vec.push(part);
                 }
             }
         }
-        Some(result)
-    })
-    .unwrap_or_default()
+    }
+
+    result
 }
 
 /// Convert raw parts to MessageContent, skipping reasoning parts
@@ -235,36 +345,61 @@ fn parts_to_content(parts: Vec<PartData>) -> Vec<MessageContent> {
     result
 }
 
-/// Batch-load parts for multiple messages from filesystem in parallel.
-fn batch_load_parts_fs(
+/// Batch-load parts from multiple filesystem roots
+fn batch_load_parts_fs_multi(
     message_ids: &[&str],
-    part_root: &Path,
+    part_roots: &[PathBuf],
 ) -> FxHashMap<Box<str>, Vec<PartData>> {
     if message_ids.is_empty() {
         return FxHashMap::default();
     }
+
     message_ids
         .par_iter()
         .filter_map(|msg_id| {
-            let mut parts = Vec::with_capacity(8);
-            if let Ok(entries) = fs::read_dir(part_root.join(msg_id)) {
-                let mut p_files: Vec<_> = entries.flatten().collect();
-                p_files.sort_by_key(|e| e.path());
-                for e in p_files {
-                    if let Ok(bytes) = fs::read(e.path()) {
-                        if let Ok(part) = serde_json::from_slice::<PartData>(&bytes) {
-                            parts.push(part);
+            for root in part_roots {
+                let p = root.join(msg_id);
+                if !p.exists() {
+                    continue;
+                }
+                let mut parts = Vec::with_capacity(8);
+                if let Ok(entries) = fs::read_dir(&p) {
+                    let mut p_files: Vec<_> = entries.flatten().collect();
+                    p_files.sort_by_key(|e| e.path());
+                    for e in p_files {
+                        if let Ok(bytes) = fs::read(e.path()) {
+                            if let Ok(part) = serde_json::from_slice::<PartData>(&bytes) {
+                                parts.push(part);
+                            }
                         }
                     }
                 }
+                if !parts.is_empty() {
+                    return Some((msg_id.to_string().into_boxed_str(), parts));
+                }
             }
-            if parts.is_empty() {
-                None
-            } else {
-                Some((msg_id.to_string().into_boxed_str(), parts))
-            }
+            None
         })
         .collect()
+}
+
+/// Load parts from all available sources.
+fn batch_load_parts_all(
+    message_ids: &[&str],
+    part_roots: &[PathBuf],
+) -> FxHashMap<Box<str>, Vec<PartData>> {
+    if message_ids.is_empty() {
+        return FxHashMap::default();
+    }
+
+    let (mut db_map, fs_map) = rayon::join(
+        || batch_load_parts_db(message_ids),
+        || batch_load_parts_fs_multi(message_ids, part_roots),
+    );
+    for (k, v) in fs_map {
+        db_map.entry(k).or_insert(v);
+    }
+    db_map
 }
 
 // ============================================================================
@@ -909,65 +1044,79 @@ pub(crate) fn get_model_id(msg: &Message) -> Box<str> {
 }
 
 pub(crate) fn list_message_files(root: &Path) -> Vec<std::path::PathBuf> {
-    if is_db_mode() {
-        return with_opencode_db(|conn| {
-            let Ok(mut stmt) = conn.prepare("SELECT id FROM message") else {
-                return Some(Vec::new());
-            };
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0));
-            let Ok(rows) = rows else {
-                return Some(Vec::new());
-            };
-            Some(
-                rows.filter_map(|row| row.ok())
-                    .map(|id| PathBuf::from(format!("{}{}", DB_MESSAGE_PREFIX, id)))
-                    .collect(),
-            )
-        })
-        .unwrap_or_default();
+    let mut all = Vec::new();
+
+    // DB-backed messages
+    for (db_idx, db_path) in get_storage_db_paths().iter().enumerate() {
+        let Some(conn) = open_db(db_path) else {
+            continue;
+        };
+        let Ok(mut stmt) = conn.prepare("SELECT id FROM message") else {
+            continue;
+        };
+        let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+            continue;
+        };
+        all.extend(
+            rows.filter_map(|row| row.ok())
+                .map(|id| PathBuf::from(format!("{}{}/message/{}", DB_MESSAGE_PREFIX, db_idx, id))),
+        );
     }
 
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
-    };
+    // Filesystem-backed messages
+    let mut message_roots = get_storage_paths("message");
+    if message_roots.is_empty() {
+        message_roots.push(root.to_path_buf());
+    }
 
-    // Collect top-level entries first for better parallelization
-    let top_entries: Vec<_> = entries.flatten().collect();
+    for root in message_roots {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        let top_entries: Vec<_> = entries.flatten().collect();
+        let mut files: Vec<PathBuf> = top_entries
+            .par_iter()
+            .flat_map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    fs::read_dir(&path)
+                        .map(|sub_entries| {
+                            sub_entries
+                                .flatten()
+                                .filter_map(|sub_entry| {
+                                    let sub_path = sub_entry.path();
+                                    if sub_path.extension().is_some_and(|e| e == "json") {
+                                        Some(sub_path)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                } else if path.extension().is_some_and(|e| e == "json") {
+                    vec![path]
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        all.append(&mut files);
+    }
 
-    top_entries
-        .par_iter()
-        .flat_map(|entry| {
-            let path = entry.path();
-            if path.is_dir() {
-                fs::read_dir(&path)
-                    .map(|sub_entries| {
-                        sub_entries
-                            .flatten()
-                            .filter_map(|sub_entry| {
-                                let sub_path = sub_entry.path();
-                                if sub_path.extension().is_some_and(|e| e == "json") {
-                                    Some(sub_path)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            } else if path.extension().is_some_and(|e| e == "json") {
-                vec![path]
-            } else {
-                Vec::new()
-            }
-        })
-        .collect()
+    all
 }
 
 fn load_session_titles() -> (SessionTitlesMap, SessionParentsMap) {
     if is_db_mode() {
-        return with_opencode_db(|conn| {
+        let mut titles = FxHashMap::default();
+        let mut parent_map = FxHashMap::default();
+        for db_path in get_storage_db_paths() {
+            let Some(conn) = open_db(&db_path) else {
+                continue;
+            };
             let Ok(mut stmt) = conn.prepare("SELECT id, title, parent_id FROM session") else {
-                return Some((FxHashMap::default(), FxHashMap::default()));
+                continue;
             };
             let Ok(rows) = stmt.query_map([], |r| {
                 Ok((
@@ -976,69 +1125,72 @@ fn load_session_titles() -> (SessionTitlesMap, SessionParentsMap) {
                     r.get::<_, Option<String>>(2).unwrap_or(None),
                 ))
             }) else {
-                return Some((FxHashMap::default(), FxHashMap::default()));
+                continue;
             };
 
-            let mut titles = FxHashMap::default();
-            let mut parent_map = FxHashMap::default();
             for row in rows.flatten() {
                 let id: Box<str> = row.0.into_boxed_str();
-                titles.insert(id.clone(), row.1);
+                if !titles.contains_key(id.as_ref()) {
+                    titles.insert(id.clone(), row.1);
+                }
                 if let Some(pid) = row.2 {
                     if !pid.is_empty() {
-                        parent_map.insert(id, pid.into_boxed_str());
+                        parent_map.entry(id).or_insert_with(|| pid.into_boxed_str());
                     }
                 }
             }
-            Some((titles, parent_map))
-        })
-        .unwrap_or_else(|| (FxHashMap::default(), FxHashMap::default()));
+        }
+        return (titles, parent_map);
     }
 
-    let session_path = get_storage_path("session");
-    let root = Path::new(&session_path);
-    let Ok(entries) = fs::read_dir(root) else {
-        return (FxHashMap::default(), FxHashMap::default());
-    };
-
-    let top_entries: Vec<_> = entries.flatten().collect();
-
-    let all_sessions: Vec<(Box<str>, String, Option<Box<str>>)> = top_entries
-        .par_iter()
-        .flat_map(|entry| {
-            let path = entry.path();
-            if path.is_dir() {
-                fs::read_dir(&path)
-                    .map(|sub| {
-                        sub.flatten()
-                            .filter_map(|se| {
-                                let bytes = fs::read(se.path()).ok()?;
-                                let session = serde_json::from_slice::<SessionData>(&bytes).ok()?;
-                                let id =
-                                    session.id.map(|s| s.0).unwrap_or_default().into_boxed_str();
-                                let title = session.title.map(|s| s.0).unwrap_or_default();
-                                let parent = session.parent_id.map(|s| s.0.into_boxed_str());
-                                Some((id, title, parent))
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            } else if path.extension().is_some_and(|e| e == "json") {
-                fs::read(&path)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<SessionData>(&bytes).ok())
-                    .map(|session| {
-                        let id = session.id.map(|s| s.0).unwrap_or_default().into_boxed_str();
-                        let title = session.title.map(|s| s.0).unwrap_or_default();
-                        let parent = session.parent_id.map(|s| s.0.into_boxed_str());
-                        vec![(id, title, parent)]
-                    })
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        })
-        .collect();
+    let mut all_sessions: Vec<(Box<str>, String, Option<Box<str>>)> = Vec::new();
+    for root in get_storage_paths("session") {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        let top_entries: Vec<_> = entries.flatten().collect();
+        let mut root_sessions: Vec<(Box<str>, String, Option<Box<str>>)> = top_entries
+            .par_iter()
+            .flat_map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    fs::read_dir(&path)
+                        .map(|sub| {
+                            sub.flatten()
+                                .filter_map(|se| {
+                                    let bytes = fs::read(se.path()).ok()?;
+                                    let session =
+                                        serde_json::from_slice::<SessionData>(&bytes).ok()?;
+                                    let id = session
+                                        .id
+                                        .map(|s| s.0)
+                                        .unwrap_or_default()
+                                        .into_boxed_str();
+                                    let title = session.title.map(|s| s.0).unwrap_or_default();
+                                    let parent = session.parent_id.map(|s| s.0.into_boxed_str());
+                                    Some((id, title, parent))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                } else if path.extension().is_some_and(|e| e == "json") {
+                    fs::read(&path)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<SessionData>(&bytes).ok())
+                        .map(|session| {
+                            let id = session.id.map(|s| s.0).unwrap_or_default().into_boxed_str();
+                            let title = session.title.map(|s| s.0).unwrap_or_default();
+                            let parent = session.parent_id.map(|s| s.0.into_boxed_str());
+                            vec![(id, title, parent)]
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        all_sessions.append(&mut root_sessions);
+    }
 
     let mut titles = FxHashMap::with_capacity_and_hasher(all_sessions.len(), Default::default());
     let mut parent_map = FxHashMap::default();
@@ -1082,12 +1234,13 @@ fn sort_file_diffs(file_diffs: &mut [FileDiff]) {
 }
 
 pub(crate) fn load_session_diff_map() -> FxHashMap<String, Vec<FileDiff>> {
-    let diff_path = get_storage_path("session_diff");
-    let root = Path::new(&diff_path);
-    let mut out: FxHashMap<String, Vec<FileDiff>> = if let Ok(entries) = fs::read_dir(root) {
-        // Collect entries for parallel processing
+    let mut out: FxHashMap<String, Vec<FileDiff>> = FxHashMap::default();
+    for root in get_storage_paths("session_diff") {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
         let all_entries: Vec<_> = entries.flatten().collect();
-        all_entries
+        let rows: Vec<(String, Vec<FileDiff>)> = all_entries
             .par_iter()
             .filter_map(|entry| {
                 let path = entry.path();
@@ -1118,19 +1271,22 @@ pub(crate) fn load_session_diff_map() -> FxHashMap<String, Vec<FileDiff>> {
                 sort_file_diffs(&mut diffs);
                 Some((stem.to_string(), diffs))
             })
-            .collect()
-    } else {
-        FxHashMap::default()
-    };
+            .collect();
+        for (session_id, diffs) in rows {
+            out.entry(session_id).or_insert(diffs);
+        }
+    }
 
-    // DB fallback: if session_diff files are unavailable for a session,
-    // try reading summary_diffs from SQLite.
+    // DB fallback: if session_diff files are unavailable for a session, read summary_diffs from SQLite.
     if is_db_mode() {
-        let db_rows: Vec<(String, String)> = with_opencode_db(|conn| {
+        for db_path in get_storage_db_paths() {
+            let Some(conn) = open_db(&db_path) else {
+                continue;
+            };
             let Ok(mut stmt) = conn.prepare(
                 "SELECT id, summary_diffs FROM session WHERE summary_diffs IS NOT NULL AND summary_diffs <> ''",
             ) else {
-                return Some(Vec::new());
+                continue;
             };
             let Ok(rows) = stmt.query_map([], |r| {
                 Ok((
@@ -1138,38 +1294,36 @@ pub(crate) fn load_session_diff_map() -> FxHashMap<String, Vec<FileDiff>> {
                     r.get::<_, String>(1).unwrap_or_default(),
                 ))
             }) else {
-                return Some(Vec::new());
+                continue;
             };
-            Some(rows.flatten().collect())
-        })
-        .unwrap_or_default();
 
-        for (session_id, json) in db_rows {
-            if out.contains_key(&session_id) {
-                continue;
+            for (session_id, json) in rows.flatten() {
+                if out.contains_key(&session_id) {
+                    continue;
+                }
+                let Ok(entries) = serde_json::from_str::<Vec<SessionDiffEntry>>(&json) else {
+                    continue;
+                };
+                let mut diffs: Vec<FileDiff> = entries
+                    .into_iter()
+                    .map(|item| FileDiff {
+                        path: item
+                            .file
+                            .map(|s| s.0)
+                            .unwrap_or_else(|| "unknown".into())
+                            .into_boxed_str(),
+                        additions: item.additions.map(|v| *v).unwrap_or(0),
+                        deletions: item.deletions.map(|v| *v).unwrap_or(0),
+                        status: item
+                            .status
+                            .map(|s| s.0)
+                            .unwrap_or_else(|| "modified".into())
+                            .into_boxed_str(),
+                    })
+                    .collect();
+                sort_file_diffs(&mut diffs);
+                out.insert(session_id, diffs);
             }
-            let Ok(entries) = serde_json::from_str::<Vec<SessionDiffEntry>>(&json) else {
-                continue;
-            };
-            let mut diffs: Vec<FileDiff> = entries
-                .into_iter()
-                .map(|item| FileDiff {
-                    path: item
-                        .file
-                        .map(|s| s.0)
-                        .unwrap_or_else(|| "unknown".into())
-                        .into_boxed_str(),
-                    additions: item.additions.map(|v| *v).unwrap_or(0),
-                    deletions: item.deletions.map(|v| *v).unwrap_or(0),
-                    status: item
-                        .status
-                        .map(|s| s.0)
-                        .unwrap_or_else(|| "modified".into())
-                        .into_boxed_str(),
-                })
-                .collect();
-            sort_file_diffs(&mut diffs);
-            out.insert(session_id, diffs);
         }
     }
 
@@ -1193,11 +1347,14 @@ pub(crate) fn load_session_diff_totals(
         .collect();
 
     if is_db_mode() {
-        let db_rows: Vec<(String, i64, i64)> = with_opencode_db(|conn| {
+        for db_path in get_storage_db_paths() {
+            let Some(conn) = open_db(&db_path) else {
+                continue;
+            };
             let Ok(mut stmt) = conn.prepare(
                 "SELECT id, COALESCE(summary_additions, 0), COALESCE(summary_deletions, 0) FROM session",
             ) else {
-                return Some(Vec::new());
+                continue;
             };
             let Ok(rows) = stmt.query_map([], |r| {
                 Ok((
@@ -1206,16 +1363,13 @@ pub(crate) fn load_session_diff_totals(
                     r.get::<_, i64>(2).unwrap_or(0),
                 ))
             }) else {
-                return Some(Vec::new());
+                continue;
             };
-            Some(rows.flatten().collect())
-        })
-        .unwrap_or_default();
-
-        for (id, adds, dels) in db_rows {
-            totals
-                .entry(id)
-                .or_insert((adds.max(0) as u64, dels.max(0) as u64));
+            for (id, adds, dels) in rows.flatten() {
+                totals
+                    .entry(id)
+                    .or_insert((adds.max(0) as u64, dels.max(0) as u64));
+            }
         }
     }
 
@@ -1277,14 +1431,24 @@ fn compute_incremental_diffs(current: &[FileDiff], previous: &[FileDiff]) -> Vec
 
 pub fn collect_stats() -> Stats {
     let mut totals = Totals::default();
-    let (session_titles, parent_map) = load_session_titles();
+
+    let message_path = get_storage_path("message");
+    let part_roots = get_storage_paths("part");
+    let ((session_titles, raw_parent_map), (session_diff_map, msg_files)) = rayon::join(
+        || load_session_titles(),
+        || {
+            let diff_map = load_session_diff_map();
+            let files = list_message_files(Path::new(&message_path));
+            (diff_map, files)
+        },
+    );
 
     let mut resolved_parent_map: FxHashMap<Box<str>, Box<str>> =
-        FxHashMap::with_capacity_and_hasher(parent_map.len(), Default::default());
-    for child in parent_map.keys() {
+        FxHashMap::with_capacity_and_hasher(raw_parent_map.len(), Default::default());
+    for child in raw_parent_map.keys() {
         let mut cur = child.clone();
         let mut depth = 0;
-        while let Some(p) = parent_map.get(&cur) {
+        while let Some(p) = raw_parent_map.get(&cur) {
             cur = p.clone();
             depth += 1;
             if depth > 20 {
@@ -1302,12 +1466,6 @@ pub fn collect_stats() -> Stats {
             .or_default()
             .push(child.clone());
     }
-
-    let session_diff_map = load_session_diff_map();
-    let message_path = get_storage_path("message");
-    let part_path_str = get_storage_path("part");
-    let part_root = Path::new(&part_path_str);
-    let msg_files = list_message_files(Path::new(&message_path));
 
     let mut per_day: FxHashMap<String, DayStat> =
         FxHashMap::with_capacity_and_hasher(msg_files.len() / 20, Default::default());
@@ -1348,11 +1506,8 @@ pub fn collect_stats() -> Stats {
         .filter_map(|(msg, _, _)| msg.id.as_ref().map(|id| id.0.as_str()))
         .filter(|id| !id.is_empty())
         .collect();
-    let all_parts_map: FxHashMap<Box<str>, Vec<PartData>> = if is_db_mode() {
-        batch_load_parts_db(&all_msg_ids)
-    } else {
-        batch_load_parts_fs(&all_msg_ids, part_root)
-    };
+    let mut all_parts_map: FxHashMap<Box<str>, Vec<PartData>> =
+        batch_load_parts_all(&all_msg_ids, &part_roots);
 
     // Step 3: Build FullMessageData with cached parts
     let mut processed_data: Vec<FullMessageData> = raw_messages
@@ -1361,7 +1516,7 @@ pub fn collect_stats() -> Stats {
             let parts: Vec<PartData> = msg
                 .id
                 .as_ref()
-                .and_then(|id| all_parts_map.get(id.0.as_str()).cloned())
+                .and_then(|id| all_parts_map.remove(id.0.as_str()))
                 .unwrap_or_default();
 
             let tools: Vec<Box<str>> = parts
@@ -2018,8 +2173,7 @@ fn load_session_chat_internal(
     day_filter: Option<&str>,
     since_ts: Option<i64>,
 ) -> (Vec<ChatMessage>, i64) {
-    let part_path_str = get_storage_path("part");
-    let part_root = Path::new(&part_path_str);
+    let part_roots = get_storage_paths("part");
 
     let mut session_msgs: Vec<Message> = if let Some(f) = files {
         f.par_iter()
@@ -2084,47 +2238,25 @@ fn load_session_chat_internal(
             .unwrap_or(0)
     });
 
-    // Batch-load parts: single DB query instead of N individual queries
-    let session_msgs_with_parts: Vec<(Message, Vec<MessageContent>)> = if is_db_mode() {
-        let msg_ids: Vec<&str> = session_msgs
-            .iter()
-            .filter_map(|m| m.id.as_ref().map(|id| id.0.as_str()))
-            .filter(|id| !id.is_empty())
-            .collect();
-        let mut parts_map = batch_load_parts_db(&msg_ids);
-        session_msgs
-            .into_iter()
-            .map(|msg| {
-                let parts_vec = msg
-                    .id
-                    .as_ref()
-                    .and_then(|id| parts_map.remove(id.0.as_str()))
-                    .map(parts_to_content)
-                    .unwrap_or_default();
-                (msg, parts_vec)
-            })
-            .collect()
-    } else {
-        // Batch-load parts for file mode
-        let msg_ids: Vec<&str> = session_msgs
-            .iter()
-            .filter_map(|m| m.id.as_ref().map(|id| id.0.as_str()))
-            .filter(|id| !id.is_empty())
-            .collect();
-        let mut parts_map = batch_load_parts_fs(&msg_ids, part_root);
-        session_msgs
-            .into_iter()
-            .map(|msg| {
-                let parts_vec = msg
-                    .id
-                    .as_ref()
-                    .and_then(|id| parts_map.remove(id.0.as_str()))
-                    .map(parts_to_content)
-                    .unwrap_or_default();
-                (msg, parts_vec)
-            })
-            .collect()
-    };
+    // Batch-load parts from all sources.
+    let msg_ids: Vec<&str> = session_msgs
+        .iter()
+        .filter_map(|m| m.id.as_ref().map(|id| id.0.as_str()))
+        .filter(|id| !id.is_empty())
+        .collect();
+    let mut parts_map = batch_load_parts_all(&msg_ids, &part_roots);
+    let session_msgs_with_parts: Vec<(Message, Vec<MessageContent>)> = session_msgs
+        .into_iter()
+        .map(|msg| {
+            let parts_vec = msg
+                .id
+                .as_ref()
+                .and_then(|id| parts_map.remove(id.0.as_str()))
+                .map(parts_to_content)
+                .unwrap_or_default();
+            (msg, parts_vec)
+        })
+        .collect();
 
     let mut max_ts = since_ts.unwrap_or(0);
     let mut merged: Vec<ChatMessage> = Vec::with_capacity(session_msgs_with_parts.len());
@@ -2342,13 +2474,8 @@ pub fn load_session_details(
         .filter_map(|m| m.id.as_ref().map(|id| id.0.as_str()))
         .filter(|id| !id.is_empty())
         .collect();
-    let parts_map: FxHashMap<Box<str>, Vec<PartData>> = if is_db_mode() {
-        batch_load_parts_db(&msg_ids)
-    } else {
-        let part_path_str = get_storage_path("part");
-        let part_root = Path::new(&part_path_str);
-        batch_load_parts_fs(&msg_ids, part_root)
-    };
+    let part_roots = get_storage_paths("part");
+    let parts_map: FxHashMap<Box<str>, Vec<PartData>> = batch_load_parts_all(&msg_ids, &part_roots);
 
     // Step 3: Process messages with cached parts
     let model_map: FxHashMap<Box<str>, ModelTokenStats> = messages
@@ -2449,48 +2576,26 @@ pub fn load_combined_session_chat(
             .unwrap_or(0)
     });
 
-    // Batch-load parts
-    let all_messages: MessageBatch = if is_db_mode() {
-        let msg_ids: Vec<&str> = filtered_msgs
-            .iter()
-            .filter_map(|(m, _, _)| m.id.as_ref().map(|id| id.0.as_str()))
-            .filter(|id| !id.is_empty())
-            .collect();
-        let mut parts_map = batch_load_parts_db(&msg_ids);
-        filtered_msgs
-            .into_iter()
-            .map(|(msg, is_sub, agent_lbl)| {
-                let parts_vec = msg
-                    .id
-                    .as_ref()
-                    .and_then(|id| parts_map.remove(id.0.as_str()))
-                    .map(parts_to_content)
-                    .unwrap_or_default();
-                (msg, parts_vec, is_sub, agent_lbl)
-            })
-            .collect()
-    } else {
-        let part_path_str = get_storage_path("part");
-        let part_root = std::path::Path::new(&part_path_str);
-        let msg_ids: Vec<&str> = filtered_msgs
-            .iter()
-            .filter_map(|(m, _, _)| m.id.as_ref().map(|id| id.0.as_str()))
-            .filter(|id| !id.is_empty())
-            .collect();
-        let mut parts_map = batch_load_parts_fs(&msg_ids, part_root);
-        filtered_msgs
-            .into_iter()
-            .map(|(msg, is_sub, agent_lbl)| {
-                let parts_vec = msg
-                    .id
-                    .as_ref()
-                    .and_then(|id| parts_map.remove(id.0.as_str()))
-                    .map(parts_to_content)
-                    .unwrap_or_default();
-                (msg, parts_vec, is_sub, agent_lbl)
-            })
-            .collect()
-    };
+    // Batch-load parts from all sources
+    let part_roots = get_storage_paths("part");
+    let msg_ids: Vec<&str> = filtered_msgs
+        .iter()
+        .filter_map(|(m, _, _)| m.id.as_ref().map(|id| id.0.as_str()))
+        .filter(|id| !id.is_empty())
+        .collect();
+    let mut parts_map = batch_load_parts_all(&msg_ids, &part_roots);
+    let all_messages: MessageBatch = filtered_msgs
+        .into_iter()
+        .map(|(msg, is_sub, agent_lbl)| {
+            let parts_vec = msg
+                .id
+                .as_ref()
+                .and_then(|id| parts_map.remove(id.0.as_str()))
+                .map(parts_to_content)
+                .unwrap_or_default();
+            (msg, parts_vec, is_sub, agent_lbl)
+        })
+        .collect();
 
     let mut max_ts: i64 = 0;
     let mut merged: Vec<ChatMessage> = Vec::with_capacity(all_messages.len());

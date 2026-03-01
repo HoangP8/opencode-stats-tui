@@ -130,14 +130,17 @@ pub struct App {
 /// The main application state.
 impl App {
     pub fn new() -> Self {
-        let storage_path = if crate::stats::is_db_mode() {
-            crate::stats::get_opencode_root_path()
-        } else {
-            let storage_path = std::env::var("XDG_DATA_HOME")
-                .unwrap_or_else(|_| format!("{}/.local/share", std::env::var("HOME").unwrap()))
-                .to_string();
-            PathBuf::from(storage_path).join("opencode").join("storage")
-        };
+        let storage_path = crate::stats::get_storage_dirs()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
+                    format!("{}/.local/share", std::env::var("HOME").unwrap_or_default())
+                }))
+                .join("opencode")
+                .join("storage")
+            });
+        let watch_paths = crate::stats::get_watch_paths();
 
         let stats_cache = StatsCache::new(storage_path.clone()).ok();
         log::info!("Initialized stats cache for: {}", storage_path.display());
@@ -178,7 +181,7 @@ impl App {
         let needs_refresh_clone = needs_refresh.clone();
         let (wake_tx, wake_rx) = mpsc::channel();
         let mut live_watcher = LiveWatcher::new(
-            storage_path.clone(),
+            watch_paths,
             Arc::new(move |files| {
                 needs_refresh_clone.lock().extend(files);
             }),
